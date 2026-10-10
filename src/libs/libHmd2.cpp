@@ -4,11 +4,13 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
+#include "libs/controller.h"
 #include "kernel/pthread.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -304,9 +306,10 @@ static int32_t KYTY_SYSV_ABI VrTracker2GetResult(const void* param, void* result
     auto* const out = reinterpret_cast<uint8_t*>(result);
     const int32_t handle = *reinterpret_cast<const int32_t*>(in + 4);
     const uint32_t param_size = *reinterpret_cast<const uint32_t*>(in);
-    static std::atomic<uint32_t> logs {0};
-    const auto n = logs.fetch_add(1u, std::memory_order_relaxed);
-    if (n < 5u) {
+    static std::array<std::atomic<uint32_t>, 5> result_logs {};
+    const auto log_index = handle >= 0 && handle < 4 ? handle : 4;
+    const auto n = result_logs[static_cast<size_t>(log_index)].fetch_add(1u, std::memory_order_relaxed);
+    if (n < 4u) {
         LOGF("VrTracker2: GetResult handle=%d paramsize=0x%x result=%p first=0x%x\n",
              handle, param_size, result, *reinterpret_cast<const uint32_t*>(out));
     }
@@ -314,9 +317,18 @@ static int32_t KYTY_SYSV_ABI VrTracker2GetResult(const void* param, void* result
     // at +0x70, and per-eye orientation quaternions at +0xb0 and +0xf0.
     // Only these fields are written, avoiding a blind guest-buffer memset.
     *reinterpret_cast<uint32_t*>(out + 4) = 1u;
-    const float head_pos[3] = {0.0f, 1.6f, 0.0f};
-    const float quat[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    std::memcpy(out + 0x60, head_pos, sizeof(head_pos));
+    float head_pos[3] = {};
+    float quat[4] = {};
+    Controller::VirtualHeadGetPose(head_pos, quat);
+    if (handle == 2 || handle == 3) {
+        Controller::VirtualHandGetPose(handle == 2 ? 0 : 1, head_pos, quat);
+    }
+    static std::atomic<uint32_t> pose_logs {0};
+    if (pose_logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+        LOGF("Virtual tracking handle=%d position=(%.2f, %.2f, %.2f) quaternion=(%.2f, %.2f, %.2f, %.2f)\n",
+             handle, head_pos[0], head_pos[1], head_pos[2],
+             quat[0], quat[1], quat[2], quat[3]);
+    }    std::memcpy(out + 0x60, head_pos, sizeof(head_pos));
     std::memcpy(out + 0x70, quat, sizeof(quat));
     std::memcpy(out + 0xb0, quat, sizeof(quat));
     std::memcpy(out + 0xf0, quat, sizeof(quat));

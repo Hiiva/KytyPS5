@@ -14,6 +14,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "libs/hmd2.h"
 
 #include <algorithm>
 #include <array>
@@ -25,6 +26,8 @@
 // IWYU pragma: no_include <intrin.h>
 
 namespace Libs::Graphics {
+std::atomic_bool g_vr_eye_crop {true};
+
 
 struct Presenter::Frame {
 	VulkanImage   image;
@@ -757,6 +760,16 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		region.srcSubresource.baseArrayLayer = 0;
 		region.srcSubresource.layerCount     = 1;
 		region.srcOffsets[1].x               = static_cast<int>(source->image.extent.width);
+		if (Config::VrEnabled() && g_vr_eye_crop.load(std::memory_order_relaxed) &&
+		    source->image.extent.width == Hmd2::PANEL_WIDTH &&
+		    source->image.extent.height == Hmd2::PANEL_HEIGHT) {
+			// A virtual-headset frame contains the stereo panel; center the
+			// left eye in the desktop window rather than scaling both eyes.
+			const int eye_width = static_cast<int>(source->image.extent.width / 2u);
+			const int offset = static_cast<int>(source->image.extent.width / 16u);
+			region.srcOffsets[0].x = offset;
+			region.srcOffsets[1].x = offset + eye_width;
+		}
 		region.srcOffsets[1].y               = static_cast<int>(source->image.extent.height);
 		region.srcOffsets[1].z               = 1;
 		region.dstSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;

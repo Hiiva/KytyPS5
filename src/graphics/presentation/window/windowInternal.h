@@ -15,6 +15,8 @@
 namespace Libs::Graphics {
 
 class Presenter;
+// Desktop view only: crop the HMD output to one eye (F6 toggles).
+extern std::atomic_bool g_vr_eye_crop;
 class RenderContext;
 
 struct SurfaceCapabilities {

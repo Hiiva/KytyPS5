@@ -192,7 +192,122 @@ private:
 };
 
 static GameController* g_controller = nullptr;
+static Common::Mutex g_virtual_head_mutex;
+static float g_virtual_head_yaw   = 0.0f;
+static float g_virtual_head_pitch = 0.0f;
+static uint64_t g_virtual_head_updated_us = 0u;
+static float g_virtual_hand_reach[2] = {0.45f, 0.45f};
 
+void VirtualHeadMouseMotion(float dx, float dy) {
+    if (!Config::VrEnabled()) {
+        return;
+    }
+    constexpr float sensitivity = 0.0025f; // Radians per physical mouse pixel.
+    Common::LockGuard lock(g_virtual_head_mutex);
+    g_virtual_head_yaw   = std::remainder(g_virtual_head_yaw - dx * sensitivity, 6.28318530718f);
+    g_virtual_head_pitch = std::clamp(g_virtual_head_pitch - dy * sensitivity, -1.48353f, 1.48353f);
+}
+
+void VirtualHandAdjustReach(int side, float wheel_steps) {
+    if (!Config::VrEnabled() || side < 0 || side > 1 || !std::isfinite(wheel_steps)) {
+        return;
+    }
+    Common::LockGuard lock(g_virtual_head_mutex);
+    g_virtual_hand_reach[side] = std::clamp(
+        g_virtual_hand_reach[side] + wheel_steps * 0.08f, 0.2f, 1.2f);
+    LOGF("Virtual Sense %s reach=%.2f m\n",
+         side == 0 ? "left" : "right", g_virtual_hand_reach[side]);
+}
+void VirtualHeadResetPose() {
+    Common::LockGuard lock(g_virtual_head_mutex);
+    g_virtual_head_yaw        = 0.0f;
+    g_virtual_head_pitch      = 0.0f;
+    g_virtual_head_updated_us = 0u;
+    g_virtual_hand_reach[0] = 0.45f;
+    g_virtual_hand_reach[1] = 0.45f;
+    LOGF("Virtual PS VR2: headset orientation recentered\n");
+}
+
+void VirtualHeadGetPose(float position[3], float orientation[4]) {
+    if (position == nullptr || orientation == nullptr) {
+        return;
+    }
+
+    // The mapped right thumbstick (keyboard T/F/G/H or physical gamepad) also
+    // provides a way to turn the virtual headset when a mouse is unavailable.
+    float stick_x = 0.0f;
+    float stick_y = 0.0f;
+    if (g_controller != nullptr) {
+        ControllerState state {};
+        bool connected = false;
+        int connected_count = 0;
+        g_controller->ReadState(&state, &connected, &connected_count);
+        const auto stick_axis = [](int value) {
+            const float normalized = std::clamp((static_cast<float>(value) - 127.5f) / 127.5f,
+                                                -1.0f, 1.0f);
+            return std::abs(normalized) < 0.15f ? 0.0f : normalized;
+        };
+        stick_x = stick_axis(state.axes[static_cast<int>(Axis::RightX)]);
+        stick_y = stick_axis(state.axes[static_cast<int>(Axis::RightY)]);
+    }
+
+    const uint64_t now = LibKernel::KernelGetProcessTime();
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    {
+        Common::LockGuard lock(g_virtual_head_mutex);
+        if (g_virtual_head_updated_us != 0u && now >= g_virtual_head_updated_us) {
+            const float dt = std::min((now - g_virtual_head_updated_us) / 1000000.0f, 0.05f);
+            constexpr float turn_rate = 1.8f; // Radians per second at full deflection.
+            g_virtual_head_yaw = std::remainder(
+                g_virtual_head_yaw - stick_x * turn_rate * dt, 6.28318530718f);
+            g_virtual_head_pitch = std::clamp(
+                g_virtual_head_pitch - stick_y * turn_rate * dt, -1.48353f, 1.48353f);
+        }
+        g_virtual_head_updated_us = now;
+        yaw = g_virtual_head_yaw;
+        pitch = g_virtual_head_pitch;
+    }
+
+    const float cy = std::cos(yaw * 0.5f);
+    const float sy = std::sin(yaw * 0.5f);
+    const float cp = std::cos(pitch * 0.5f);
+    const float sp = std::sin(pitch * 0.5f);
+
+    position[0] = 0.0f;
+    position[1] = 1.6f;
+    position[2] = 0.0f;
+    orientation[0] = cy * sp;
+    orientation[1] = sy * cp;
+    orientation[2] = -sy * sp;
+    orientation[3] = cy * cp;
+}
+
+void VirtualHandGetPose(int side, float position[3], float orientation[4]) {
+    if (side < 0 || side > 1 || position == nullptr || orientation == nullptr) {
+        return;
+    }
+    VirtualHeadGetPose(position, orientation);
+    float reach = 0.45f;
+    {
+        Common::LockGuard lock(g_virtual_head_mutex);
+        reach = g_virtual_hand_reach[side];
+    }
+    // Neutral Sense pose: shoulder-width hands below and ahead of the face.
+    // Rotate local offsets by the virtual headset orientation so mouse look
+    // keeps both hands in front of the user, without external tracking.
+    const float local[3] = {side == 0 ? -0.25f : 0.25f, -0.34f, -reach};
+    const float qx = orientation[0];
+    const float qy = orientation[1];
+    const float qz = orientation[2];
+    const float qw = orientation[3];
+    const float tx = 2.0f * (qy * local[2] - qz * local[1]);
+    const float ty = 2.0f * (qz * local[0] - qx * local[2]);
+    const float tz = 2.0f * (qx * local[1] - qy * local[0]);
+    position[0] += local[0] + qw * tx + qy * tz - qz * ty;
+    position[1] += local[1] + qw * ty + qz * tx - qx * tz;
+    position[2] += local[2] + qw * tz + qx * ty - qy * tx;
+}
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
                           int connected_count) {
 	EXIT_IF(data == nullptr);
@@ -1230,12 +1345,23 @@ int KYTY_SYSV_ABI PadVrControllerReadState(int handle, void* state_out) {
     const auto axis_y = side == 0 ? Axis::LeftY : Axis::RightY;
     bytes[4] = static_cast<uint8_t>(state.axes[static_cast<int>(axis_x)]);
     bytes[5] = static_cast<uint8_t>(state.axes[static_cast<int>(axis_y)]);
-    const uint32_t buttons = side == 0
+    const int trigger = state.axes[static_cast<int>(
+        side == 0 ? Axis::TriggerLeft : Axis::TriggerRight)];
+    uint32_t buttons = side == 0
         ? (state.buttons & (PAD_BUTTON_L1 | PAD_BUTTON_L2 | PAD_BUTTON_L3 |
                              PAD_BUTTON_TRIANGLE | PAD_BUTTON_SQUARE | PAD_BUTTON_OPTIONS))
         : (state.buttons & (PAD_BUTTON_R1 | PAD_BUTTON_R2 | PAD_BUTTON_R3 |
                              PAD_BUTTON_CROSS | PAD_BUTTON_CIRCLE | PAD_BUTTON_OPTIONS));
+    if (trigger > 32) {
+        buttons |= side == 0 ? PAD_BUTTON_L2 : PAD_BUTTON_R2;
+    }
     std::memcpy(bytes, &buttons, sizeof(buttons));
+    bytes[6] = static_cast<uint8_t>(std::clamp(trigger, 0, 255));
+    static std::array<std::atomic<uint32_t>, 2> previous_buttons {};
+    if (previous_buttons[static_cast<size_t>(side)].exchange(buttons, std::memory_order_relaxed) != buttons) {
+        LOGF("Virtual Sense %s buttons=0x%08x trigger=%d\n",
+             side == 0 ? "left" : "right", buttons, trigger);
+    }
     bytes[0x40] = 1; // Connected.
     return OK;
 }

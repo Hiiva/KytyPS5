@@ -77,6 +77,7 @@ constexpr std::string_view MOUSE_SENSITIVITY      = "MouseSensitivity=";
 
 struct MouseJoystickState {
 	bool     enabled   = false;
+	bool     head_look = false;
 	bool     output    = false;
 	uint64_t next_poll = 0;
 };
@@ -146,7 +147,10 @@ public:
 			}
 
 			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_F1 ||
-			                      binding.key == SDLK_F7 || binding.key == SDLK_F11;
+                                  binding.key == SDLK_F7 || binding.key == SDLK_F11 ||
+                                  (Config::VrEnabled() &&
+                                   (binding.key == SDLK_F6 || binding.key == SDLK_F8 ||
+                                    binding.key == SDLK_F9));
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				EXIT("Invalid input mapping: %s\n", value.c_str());
@@ -360,7 +364,7 @@ bool SetRelativeMouseMode(bool enabled) {
 	if (SDL_SetWindowRelativeMouseMode(g_mouse_window, enabled)) {
 		return true;
 	}
-	LOGF("Mouse-to-joystick relative mode failed: %s\n", SDL_GetError());
+	LOGF("Relative mouse mode failed: %s\n", SDL_GetError());
 	return false;
 }
 
@@ -373,7 +377,12 @@ int PollMouse(uint64_t now_ms) {
 	float delta_x = 0;
 	float delta_y = 0;
 	SDL_GetRelativeMouseState(&delta_x, &delta_y);
-	if (delta_x == 0 && delta_y == 0) {
+	if (g_mouse.head_look) {
+		if (delta_x != 0.0f || delta_y != 0.0f) {
+			Controller::VirtualHeadMouseMotion(delta_x, delta_y);
+		}
+		CenterMouseStick();
+	} else if (delta_x == 0 && delta_y == 0) {
 		CenterMouseStick();
 	} else {
 		MouseToJoystick(delta_x, delta_y);
@@ -435,25 +444,71 @@ void HostInputMouseButton(uint8_t mouse_button, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom() && mouse_button != 0) {
 		SetControl(map.FindMouseButton(mouse_button), down);
+	} else if (Config::VrEnabled() && !map.Custom()) {
+		// Desktop Sense controls when a real pair of PS VR2 controllers is absent.
+		switch (mouse_button) {
+			case SDL_BUTTON_LEFT:
+				SetButton(Controller::PAD_BUTTON_R2, down);
+				break;
+			case SDL_BUTTON_RIGHT:
+				SetButton(Controller::PAD_BUTTON_R1, down);
+				break;
+			case SDL_BUTTON_MIDDLE:
+				SetButton(Controller::PAD_BUTTON_L2, down);
+				break;
+			default: break;
+		}
 	}
 }
 
 void HostInputToggleMouseToJoystick() {
-	if (g_mouse.enabled) {
+	if (g_mouse.enabled && !g_mouse.head_look) {
 		SetRelativeMouseMode(false);
 		CenterMouseStick();
 		g_mouse = {};
 		LOGF("Mouse to right stick: disabled\n");
 		return;
 	}
-
+	if (g_mouse.enabled && g_mouse.head_look) {
+		g_mouse.head_look = false;
+		g_mouse.next_poll = 0;
+		LOGF("Mouse to right stick: enabled (F7 to release)\n");
+		return;
+	}
 	if (!SetRelativeMouseMode(true)) {
 		return;
 	}
 	g_mouse.enabled = true;
+	g_mouse.head_look = false;
+	g_mouse.next_poll = 0;
 	LOGF("Mouse to right stick: enabled (F7 to release)\n");
 }
 
+void HostInputToggleMouseToHead() {
+	if (!Config::VrEnabled()) {
+		return;
+	}
+	if (g_mouse.enabled && g_mouse.head_look) {
+		SetRelativeMouseMode(false);
+		g_mouse = {};
+		LOGF("Virtual headset mouse look: disabled\n");
+		return;
+	}
+	if (g_mouse.enabled) {
+		CenterMouseStick();
+		g_mouse.head_look = true;
+		g_mouse.next_poll = 0;
+		LOGF("Virtual headset mouse look: enabled (F8 to release; F9 to recenter)\n");
+		return;
+	}
+	if (!SetRelativeMouseMode(true)) {
+		return;
+	}
+	g_mouse.enabled = true;
+	g_mouse.head_look = true;
+	g_mouse.next_poll = 0;
+	LOGF("Virtual headset mouse look: enabled (F8 to release; F9 to recenter)\n");
+}
 bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 	int timeout = -1;
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {

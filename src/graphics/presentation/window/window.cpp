@@ -234,6 +234,10 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 }
 
 static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
+	if (Config::VrEnabled() && mb.wheel && mb.y != 0) {
+		const int side = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0 ? 0 : 1;
+		Controller::VirtualHandAdjustReach(side, static_cast<float>(mb.y));
+	}
 #ifdef KYTY_DBG_INPUT
 	if (mb.wheel) {
 		LOGF("Mouse wheel: time = %.04f, %s[%d, %d]\n", mb.timestamp_seconds,
@@ -462,14 +466,34 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
-	if ((event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) &&
+	if (Config::VrEnabled() &&
+	    (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) &&
+	    event->key.key == SDLK_F6) {
+		if (event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0) {
+			const auto previous = g_vr_eye_crop.load(std::memory_order_relaxed);
+			g_vr_eye_crop.store(!previous, std::memory_order_relaxed);
+			LOGF("Virtual headset desktop mirror: %s\n", previous ? "full stereo" : "left eye");
+		}
+		return;
+	}	if ((event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) &&
 	    event->key.key == SDLK_F7) {
 		if (event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0) {
 			HostInputToggleMouseToJoystick();
 		}
 		return;
 	}
-	if (ProcessSystemOverlayInput(*event)) {
+	if (Config::VrEnabled() &&
+	    (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) &&
+	    (event->key.key == SDLK_F8 || event->key.key == SDLK_F9)) {
+		if (event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0) {
+			if (event->key.key == SDLK_F8) {
+				HostInputToggleMouseToHead();
+			} else {
+				Controller::VirtualHeadResetPose();
+			}
+		}
+		return;
+	}	if (ProcessSystemOverlayInput(*event)) {
 		return;
 	}
 	if (event->type >= SDL_EVENT_WINDOW_FIRST && event->type <= SDL_EVENT_WINDOW_LAST) {

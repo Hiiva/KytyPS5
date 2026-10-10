@@ -75,6 +75,13 @@ void SetTouchPad(int id, int finger, bool down, float x, float y);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ResetInputState();
 int  GetActiveControllerId();
+// Software-only PS VR2 headset pose driven by desktop mouse/right stick.
+// Getter is thread-safe: guest VR polling and SDL input run on different threads.
+void VirtualHeadMouseMotion(float dx, float dy);
+void VirtualHeadResetPose();
+void VirtualHeadGetPose(float position[3], float orientation[4]);
+void VirtualHandGetPose(int side, float position[3], float orientation[4]);
+void VirtualHandAdjustReach(int side, float wheel_steps);
 
 enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };
 
