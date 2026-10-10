@@ -2011,6 +2011,15 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		auto pfunc = g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)];
 
 		if (pfunc == nullptr) {
+			// Temporary boot probe, NOT correct stereo emulation.
+			if (cmd_offset == Pm4::PA_STEREO_CNTL || cmd_offset == Pm4::PA_STATE_STEREO_X) {
+			    static std::atomic<uint32_t> stereo_log_mask {0};
+			    const uint32_t bit = cmd_offset == Pm4::PA_STEREO_CNTL ? 1u : 2u;
+			    if ((stereo_log_mask.fetch_or(bit, std::memory_order_relaxed) & bit) == 0u) {
+			        LOGF("temporary: ignoring stereo CX register 0x%03" PRIx32 ", value = 0x%08" PRIx32 "\n", cmd_offset, value);
+			    }
+			    continue;
+			}
 			if (raw_cmd_offset == 0x24au && value == 0u) {
 				static std::atomic_flag logged = ATOMIC_FLAG_INIT;
 				if (!logged.test_and_set(std::memory_order_relaxed)) {
@@ -3844,6 +3853,15 @@ void GraphicsInitJmpTablesUcIndirect() {
 			cp.GetUcfg().SetFsrControlPoint(1, cmd_offset - Pm4::FSR_CONTROL_POINTS_LEFT_Y, value);
 		};
 	}
+    // The PS VR2 right-eye foveated shading registers follow the left-eye set.
+    for (uint32_t i = 0; i < 4; ++i) {
+        g_hw_uc_indirect_func[Pm4::FSR_CONTROL_POINTS_RIGHT_X + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+            cp.GetUcfg().SetFsrControlPoint(0, 4 + cmd_offset - Pm4::FSR_CONTROL_POINTS_RIGHT_X, value);
+        };
+        g_hw_uc_indirect_func[Pm4::FSR_CONTROL_POINTS_RIGHT_Y + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+            cp.GetUcfg().SetFsrControlPoint(1, 4 + cmd_offset - Pm4::FSR_CONTROL_POINTS_RIGHT_Y, value);
+        };
+    }
 	for (uint32_t i = 0; i < 2; ++i) {
 		g_hw_uc_indirect_func[Pm4::FSR_ALPHA_LEFT_X + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 			cp.GetUcfg().SetFsrAlpha(0, cmd_offset - Pm4::FSR_ALPHA_LEFT_X, value);
@@ -3856,6 +3874,17 @@ void GraphicsInitJmpTablesUcIndirect() {
 		};
 	}
 
+    for (uint32_t i = 0; i < 2; ++i) {
+        g_hw_uc_indirect_func[Pm4::FSR_ALPHA_RIGHT_X + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+            cp.GetUcfg().SetFsrAlpha(0, 2 + cmd_offset - Pm4::FSR_ALPHA_RIGHT_X, value);
+        };
+        g_hw_uc_indirect_func[Pm4::FSR_ALPHA_RIGHT_Y + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+            cp.GetUcfg().SetFsrAlpha(1, 2 + cmd_offset - Pm4::FSR_ALPHA_RIGHT_Y, value);
+        };
+        g_hw_uc_indirect_func[Pm4::FSR_WINDOW_RIGHT + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+            cp.GetUcfg().SetFsrWindow(2 + cmd_offset - Pm4::FSR_WINDOW_RIGHT, value);
+        };
+    }
 	g_hw_uc_indirect_func[Pm4::GE_CNTL] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		HW::GeControl r;
 		r.primitive_group_size = KYTY_PM4_GET(value, GE_CNTL, PRIM_GRP_SIZE);

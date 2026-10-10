@@ -682,7 +682,26 @@ public:
 
 	KYTY_CLASS_NO_COPY(PhysicalMemory);
 
-	static constexpr uint64_t TotalSize() { return static_cast<uint64_t>(13824) * 1024 * 1024; }
+	static uint64_t TotalSize() {
+        static const uint64_t size = [] {
+            constexpr uint64_t default_mb = 13824u;
+            const char* override_mb = std::getenv("KYTY_GUEST_BACKING_MB");
+            if (override_mb == nullptr || *override_mb == '\0') {
+                return default_mb * 1024u * 1024u;
+            }
+            char* end = nullptr;
+            const auto megabytes = std::strtoull(override_mb, &end, 10);
+            // Opt-in for local low-commit Windows testing. Production behavior
+            // stays at the PS5 13.5 GiB size without this environment variable.
+            if (end == override_mb || *end != '\0' ||
+                megabytes < 2048u || megabytes > default_mb) {
+                return default_mb * 1024u * 1024u;
+            }
+            LOGF("Kyty: testing with reduced guest backing=%llu MiB\n", megabytes);
+            return megabytes * 1024u * 1024u;
+        }();
+        return size;
+    }
 	static uint64_t           Size() {
 		EXIT_IF(g_flexible_memory_size >= TotalSize());
 		return TotalSize() - g_flexible_memory_size;

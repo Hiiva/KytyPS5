@@ -940,9 +940,9 @@ private:
 };
 
 struct FsrView {
-	uint32_t control_points[2][4] {};
-	uint32_t alphas[2][2] {};
-	uint32_t window[2] {};
+	uint32_t control_points[2][8] {};
+	uint32_t alphas[2][4] {};
+	uint32_t window[4] {};
 };
 
 class UserConfig {

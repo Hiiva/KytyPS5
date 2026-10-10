@@ -828,6 +828,38 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 			Replace(*source, Value(0u));
 		}
 	}
+    // A few pixel shaders consume the packed ancillary VGPR directly instead
+    // of extracting individual fields. Preserve the supported SampleId (8:11)
+    // and Layer (16:26) fields; unmodeled ancillary bits are zero for now.
+    for (auto* block: blocks) {
+        for (auto it = block->begin(); it != block->end(); ++it) {
+            auto& inst = *it;
+            if (inst.GetOpcode() != ValueOpcode::GetBuiltin ||
+                inst.Arg(0) != Value(static_cast<uint32_t>(StageInputKind::PackedAncillary)) ||
+                !inst.HasUses()) {
+                continue;
+            }
+            const auto sample = block->PrependNewInst(
+                it, ValueOpcode::GetBuiltin,
+                {Value(static_cast<uint32_t>(StageInputKind::SampleId)), Value(0u)});
+            const auto masked_sample = block->PrependNewInst(
+                it, ValueOpcode::BitwiseAnd32, {Value(&*sample), Value(0x0fu)});
+            const auto shifted_sample = block->PrependNewInst(
+                it, ValueOpcode::ShiftLeftLogical32, {Value(&*masked_sample), Value(8u)});
+            const auto layer = block->PrependNewInst(
+                it, ValueOpcode::GetBuiltin,
+                {Value(static_cast<uint32_t>(StageInputKind::Layer)), Value(0u)});
+            const auto masked_layer = block->PrependNewInst(
+                it, ValueOpcode::BitwiseAnd32, {Value(&*layer), Value(0x7ffu)});
+            const auto shifted_layer = block->PrependNewInst(
+                it, ValueOpcode::ShiftLeftLogical32, {Value(&*masked_layer), Value(16u)});
+            const auto packed = block->PrependNewInst(
+                it, ValueOpcode::BitwiseOr32,
+                {Value(&*shifted_sample), Value(&*shifted_layer)});
+            Replace(inst, Value(&*packed));
+        }
+    }
+
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -4,12 +4,15 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
+#include "kernel/pthread.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <new>
 
@@ -135,9 +138,12 @@ static int32_t KYTY_SYSV_ABI Hmd2GetDeviceInformation(SceHmd2DeviceInformation* 
 	} else {
 		info->status = 2; // SCE_HMD2_DEVICE_STATUS_NOT_DETECTED
 	}
-	LOGF("Hmd2: device status=%u panel=%ux%u mounted=%u\n", info->status,
+	static std::atomic<uint32_t> info_logs {0};
+	if (info_logs.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+		LOGF("Hmd2: device status=%u panel=%ux%u mounted=%u\n", info->status,
 	     info->deviceInfo.panelResolution.width, info->deviceInfo.panelResolution.height,
 	     info->hmuMount);
+	}
 	return OK;
 }
 
@@ -157,6 +163,184 @@ static int32_t KYTY_SYSV_ABI Hmd2GetFieldOfViewWithoutHandle(SceHmd2FieldOfView*
 	return OK;
 }
 
+static int32_t KYTY_SYSV_ABI Hmd2Open(int32_t user_id, int32_t type, int32_t index,
+                                      const void* param) {
+    if (!g_initialized.load(std::memory_order_acquire) || !Config::VrEnabled()) {
+        return ERROR_NOT_INITIALIZED;
+    }
+    LOGF("Hmd2: open user=%d type=%d index=%d param=%p\n", user_id, type, index, param);
+    return 0; // First HMD handle.
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2GetFieldOfView(int32_t handle, SceHmd2FieldOfView* fov) {
+    if (handle != 0) {
+        LOGF("Hmd2: unexpected FOV handle=%d\n", handle);
+    }
+    return Hmd2GetFieldOfViewWithoutHandle(fov);
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2GetDeviceInformationByHandle(
+    int32_t handle, SceHmd2DeviceInformation* info) {
+    if (handle != 0) {
+        LOGF("Hmd2: unexpected info handle=%d\n", handle);
+    }
+    return Hmd2GetDeviceInformation(info);
+}
+
+static std::atomic<uint64_t> g_last_virtual_frame {0};
+
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionBeginFrame(uint64_t frame) {
+    if (GetReprojectionState() == nullptr) {
+        return ERROR_REPROJECTION_NOT_INITIALIZED;
+    }
+    g_last_virtual_frame.store(frame, std::memory_order_relaxed);
+    return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionGetPredictedDisplayTime(
+    uint64_t frame, uint64_t* time) {
+    if (time == nullptr) {
+        return ERROR_PARAMETER_NULL;
+    }
+    // Prediction is in the kernel process-clock domain, in microseconds.
+    *time = LibKernel::KernelGetProcessTime() + 11000u;
+    static std::atomic<uint32_t> logs {0};
+    const auto n = logs.fetch_add(1u, std::memory_order_relaxed);
+    if (n < 4u) {
+        LOGF("Hmd2: predicted display frame=%" PRIu64 " time=%" PRIu64 "\n", frame, *time);
+    }
+    return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetParam(
+    uint32_t index, uint64_t frame, const void* param, const void* trace) {
+    if (GetReprojectionState() == nullptr) {
+        return ERROR_REPROJECTION_NOT_INITIALIZED;
+    }
+    static std::atomic<uint32_t> logs {0};
+    if (logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+        LOGF("Hmd2: SetParam index=%u frame=%" PRIu64 " param=%p trace=%p\n",
+             index, frame, param, trace);
+    }
+    return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetRenderConfig(
+    uint64_t half_rate, uint64_t reserved0, uint64_t reserved1) {
+    LOGF("Hmd2: SetRenderConfig rate=%" PRIu64 " reserved=%" PRIu64 ",%" PRIu64 "\n",
+         half_rate, reserved0, reserved1);
+    return OK;
+}
+// Headset mirroring and optional gaze requests have no physical device backing.
+// These preserve the firmware success path without assuming unknown result layouts.
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetMirroringOption(const void* option) {
+    static std::atomic_bool logged = false;
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        LOGF("Hmd2: mirroring option requested: %p\n", option);
+    }
+    return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionEnableMirroring(const void* param) {
+    LOGF("Hmd2: mirroring enabled, param=%p\n", param);
+    return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2GazeGetResultForFoveatedRendering(
+    uint64_t arg0, uint64_t arg1) {
+    static std::atomic<uint32_t> logs {0};
+    if (logs.fetch_add(1, std::memory_order_relaxed) < 3) {
+        LOGF("Hmd2: foveated gaze request arg0=%p arg1=%p (not emulated)\n",
+             reinterpret_cast<void*>(arg0), reinterpret_cast<void*>(arg1));
+    }
+    return OK;
+}
+static std::atomic<bool> g_tracker_initialized {false};
+
+static int32_t KYTY_SYSV_ABI VrTracker2QueryMemory(const void* param, uint32_t* output) {
+    if (param == nullptr || output == nullptr) {
+        return ERROR_PARAMETER_NULL;
+    }
+    // Query result contains a size and alignment in DWORD slots 1 and 2.
+    // The guest will allocate and pass this memory to Initialize.
+    output[0] = 0x20u;
+    output[1] = 0x100000u;
+    output[2] = 0x10000u;
+    LOGF("VrTracker2: QueryMemory size=%u align=%u\n", output[1], output[2]);
+    return OK;
+}
+
+static int32_t KYTY_SYSV_ABI VrTracker2Initialize(const void* param) {
+    if (param == nullptr) {
+        return ERROR_PARAMETER_NULL;
+    }
+    g_tracker_initialized.store(true, std::memory_order_release);
+    LOGF("VrTracker2: Initialize param=%p\n", param);
+    return OK;
+}
+
+static int32_t KYTY_SYSV_ABI VrTracker2RegisterDevice(int32_t type, int32_t handle) {
+    static std::atomic<uint32_t> logs {0};
+    if (logs.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+        LOGF("VrTracker2: RegisterDevice type=%d handle=%d\n", type, handle);
+    }
+    return g_tracker_initialized.load(std::memory_order_acquire) ? OK : ERROR_NOT_INITIALIZED;
+}
+
+static int32_t KYTY_SYSV_ABI VrTracker2SetCoordinateSystem(uint64_t coordinate) {
+    LOGF("VrTracker2: SetCoordinateSystem value=0x%" PRIx64 "\n", coordinate);
+    return OK;
+}
+
+static int32_t KYTY_SYSV_ABI VrTracker2ResetLocalCoordinate() {
+    return OK;
+}
+
+static int32_t KYTY_SYSV_ABI VrTracker2GetResult(const void* param, void* result) {
+    if (param == nullptr || result == nullptr) {
+        return ERROR_PARAMETER_NULL;
+    }
+    auto* const in = reinterpret_cast<const uint8_t*>(param);
+    auto* const out = reinterpret_cast<uint8_t*>(result);
+    const int32_t handle = *reinterpret_cast<const int32_t*>(in + 4);
+    const uint32_t param_size = *reinterpret_cast<const uint32_t*>(in);
+    static std::atomic<uint32_t> logs {0};
+    const auto n = logs.fetch_add(1u, std::memory_order_relaxed);
+    if (n < 5u) {
+        LOGF("VrTracker2: GetResult handle=%d paramsize=0x%x result=%p first=0x%x\n",
+             handle, param_size, result, *reinterpret_cast<const uint32_t*>(out));
+    }
+    // PS VR2 tracker result: status at +4; head position at +0x60, quaternion
+    // at +0x70, and per-eye orientation quaternions at +0xb0 and +0xf0.
+    // Only these fields are written, avoiding a blind guest-buffer memset.
+    *reinterpret_cast<uint32_t*>(out + 4) = 1u;
+    const float head_pos[3] = {0.0f, 1.6f, 0.0f};
+    const float quat[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    std::memcpy(out + 0x60, head_pos, sizeof(head_pos));
+    std::memcpy(out + 0x70, quat, sizeof(quat));
+    std::memcpy(out + 0xb0, quat, sizeof(quat));
+    std::memcpy(out + 0xf0, quat, sizeof(quat));
+    return OK;
+}
+
+static int32_t KYTY_SYSV_ABI VrTracker2Finalize() {
+    g_tracker_initialized.store(false, std::memory_order_release);
+    return OK;
+}
+// Horizon calls these after reprojection initialization. The guest saves RAX/RDX
+// and uses them as size/alignment for two direct-memory allocations. The firmware
+// sizes are unknown; these conservative values are boot probes, not an API contract.
+static Graphics::SizeAlign KYTY_SYSV_ABI Hmd2BootQueryBufferA() {
+    const Graphics::SizeAlign size {0x100000u, 0x10000u};
+    LOGF("Hmd2: provisional buffer A size=%" PRIu64 " align=%zu\n", size.m_size, size.m_align);
+    return size;
+}
+
+static Graphics::SizeAlign KYTY_SYSV_ABI Hmd2BootQueryBufferB() {
+    const Graphics::SizeAlign size {0x100000u, 0x10000u};
+    LOGF("Hmd2: provisional buffer B size=%" PRIu64 " align=%zu\n", size.m_size, size.m_align);
+    return size;
+}
 static Graphics::SizeAlign KYTY_SYSV_ABI Hmd2ReprojectionQueryBufferSizeAlign() {
 	const Graphics::SizeAlign size {sizeof(ReprojectionState), alignof(ReprojectionState)};
 	LOGF("Hmd2: reprojection work size=%" PRIu64 " alignment=%zu\n", size.m_size, size.m_align);
@@ -228,7 +412,18 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetTiming(int32_t timing) {
 
 LIB_DEFINE(InitHmd2_1) {
 	LIB_FUNC("c812oYs7Vsc", Hmd2::Hmd2Initialize);
-	LIB_FUNC("bIi4YUfSRys", Hmd2::Hmd2GetDeviceInformation);
+	LIB_FUNC("f3kPeoTZnIE", Hmd2::Hmd2Open);
+	LIB_FUNC("E+b+c1Idyew", Hmd2::Hmd2GetFieldOfView);
+	LIB_FUNC("+seEJVlljr0", Hmd2::Hmd2ReprojectionSetMirroringOption);
+	LIB_FUNC("Pb1d+j-bBSc", Hmd2::Hmd2BootQueryBufferA);
+	LIB_FUNC("wEO+gMHs9NU", Hmd2::Hmd2BootQueryBufferB);
+    LIB_FUNC("4BlE4IPXP0Q", Hmd2::Hmd2GetDeviceInformationByHandle);
+    LIB_FUNC("Ocf081WpBpA", Hmd2::Hmd2ReprojectionBeginFrame);
+    LIB_FUNC("SVEG+1D7qHA", Hmd2::Hmd2ReprojectionGetPredictedDisplayTime);
+    LIB_FUNC("Qx7SkcgAzok", Hmd2::Hmd2ReprojectionEnableMirroring);
+    LIB_FUNC("retc+-uRMhk", Hmd2::Hmd2GazeGetResultForFoveatedRendering);
+    LIB_FUNC("xMo9ENEu2E0", Hmd2::Hmd2ReprojectionSetParam);
+    LIB_FUNC("hA9LshbSkzw", Hmd2::Hmd2ReprojectionSetRenderConfig);	LIB_FUNC("bIi4YUfSRys", Hmd2::Hmd2GetDeviceInformation);
 	LIB_FUNC("gF8+lvc7GuQ", Hmd2::Hmd2GetFieldOfViewWithoutHandle);
 	LIB_FUNC("U-CnbmeyYaA", Hmd2::Hmd2ReprojectionQueryBufferSizeAlign);
 	LIB_FUNC("-C2nkoEYOnU", Hmd2::Hmd2ReprojectionQueryDisplayBufferSizeAlign);
@@ -236,5 +431,18 @@ LIB_DEFINE(InitHmd2_1) {
 	LIB_FUNC("VVvFh51o20s", Hmd2::Hmd2ReprojectionEnableVrMode);
 	LIB_FUNC("FkQX7rjFomk", Hmd2::Hmd2ReprojectionSetTiming);
 }
+
+namespace VrTracker2Module {
+LIB_VERSION("VrTracker2", 1, "VrTracker2", 1, 1);
+LIB_DEFINE(InitVrTracker2_1) {
+	LIB_FUNC("TwqZnaIjWv4", Hmd2::VrTracker2QueryMemory);
+	LIB_FUNC("6Jy73SRfG-o", Hmd2::VrTracker2Initialize);
+    LIB_FUNC("Dog+g25QYjw", Hmd2::VrTracker2RegisterDevice);
+    LIB_FUNC("J4Vh3VVX0iU", Hmd2::VrTracker2GetResult);
+    LIB_FUNC("IQ3UD6SZbXo", Hmd2::VrTracker2Finalize);
+    LIB_FUNC("UVCMLmS-Eas", Hmd2::VrTracker2SetCoordinateSystem);
+    LIB_FUNC("IdI2f+xHIeA", Hmd2::VrTracker2ResetLocalCoordinate);
+}
+} // namespace VrTracker2Module
 
 } // namespace Libs

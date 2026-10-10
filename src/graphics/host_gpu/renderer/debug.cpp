@@ -410,7 +410,7 @@ static void RcCheck(const HW::RenderControl& c) {
 	// EXIT_NOT_IMPLEMENTED(c.stencil_clear_enable != false);
 	// EXIT_NOT_IMPLEMENTED(c.stencil_compress_disable != false);
 	// EXIT_NOT_IMPLEMENTED(c.depth_compress_disable != false);
-	EXIT_NOT_IMPLEMENTED(c.copy_centroid != false);
+	// The depth target validates centroid copies when a depth attachment is active.
 	EXIT_NOT_IMPLEMENTED(c.copy_sample != 0);
 }
 

@@ -8,6 +8,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -30,6 +31,18 @@ constexpr int PAD_ERROR_ALREADY_OPENED  = -2137915388; /* 0x80920004 */
 constexpr int PAD_ERROR_NOT_INITIALIZED = -2137915387; /* 0x80920005 */
 constexpr int PAD_ERROR_NO_HANDLE       = -2137915384; /* 0x80920008 */
 constexpr int PAD_HANDLE                = 1;
+constexpr int VR_LEFT_PAD_HANDLE  = 2;
+constexpr int VR_RIGHT_PAD_HANDLE = 3;
+static std::array<std::atomic<bool>, 2> g_vr_pad_open {};
+
+static int VirtualPadIndex(int handle) {
+    return handle == VR_LEFT_PAD_HANDLE ? 0 : (handle == VR_RIGHT_PAD_HANDLE ? 1 : -1);
+}
+static bool VirtualPadIsOpen(int handle) {
+    const int index = VirtualPadIndex(handle);
+    return Config::VrEnabled() && index >= 0 &&
+           g_vr_pad_open[static_cast<size_t>(index)].load(std::memory_order_acquire);
+}
 
 constexpr uint32_t RUMBLE_DURATION_MS = 0xffff;
 constexpr uint32_t RELEASE_FLUSH_MS   = 50;
@@ -998,6 +1011,9 @@ int GameController::ClosePort(int handle) {
 }
 
 int PadCheckHandle(int handle) {
+	if (VirtualPadIsOpen(handle)) {
+		return OK;
+	}
 	return g_controller->CheckPortHandle(handle);
 }
 
@@ -1015,7 +1031,19 @@ int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
 	     "\t param   = 0x%016" PRIx64 "\n",
 	     user_id, type, index, reinterpret_cast<uint64_t>(param));
 
-	return g_controller->OpenPort(user_id, type, index);
+	    if (Config::VrEnabled() && user_id == Config::GetUserId() &&
+        index == 0 && (type == 3 || type == 4)) {
+        const int vr_index = type == 3 ? 0 : 1;
+        const int handle = vr_index == 0 ? VR_LEFT_PAD_HANDLE : VR_RIGHT_PAD_HANDLE;
+        bool expected = false;
+        if (!g_vr_pad_open[static_cast<size_t>(vr_index)].compare_exchange_strong(expected, true)) {
+            return PAD_ERROR_ALREADY_OPENED;
+        }
+        LOGF("Pad: virtual Sense %s opened handle=%d\n",
+             vr_index == 0 ? "left" : "right", handle);
+        return handle;
+    }
+    return g_controller->OpenPort(user_id, type, index);
 }
 
 int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
@@ -1026,13 +1054,26 @@ int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
 	     "\t index   = %d\n",
 	     user_id, type, index);
 
-	return g_controller->GetPortHandle(user_id, type, index);
+	    if (Config::VrEnabled() && user_id == Config::GetUserId() &&
+        index == 0 && (type == 3 || type == 4)) {
+        const int handle = type == 3 ? VR_LEFT_PAD_HANDLE : VR_RIGHT_PAD_HANDLE;
+        return VirtualPadIsOpen(handle) ? handle : PAD_ERROR_NO_HANDLE;
+    }
+    return g_controller->GetPortHandle(user_id, type, index);
 }
 
 int KYTY_SYSV_ABI PadClose(int handle) {
 	PRINT_NAME();
 	LOGF("\t handle = %d\n", handle);
-	return g_controller->ClosePort(handle);
+	    if (Config::VrEnabled()) {
+        const int vr_index = VirtualPadIndex(handle);
+        if (vr_index >= 0) {
+            const bool was_open =
+                g_vr_pad_open[static_cast<size_t>(vr_index)].exchange(false);
+            return was_open ? OK : PAD_ERROR_INVALID_HANDLE;
+        }
+    }
+    return g_controller->ClosePort(handle);
 }
 
 int KYTY_SYSV_ABI PadSetMotionSensorState(int handle, bool enable) {
@@ -1168,6 +1209,59 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	return ret_num;
 }
 
+// PS VR2 Sense controller read data is a 0x68-byte record. Only established
+// offsets are populated; controller presence does not require host VR hardware.
+int KYTY_SYSV_ABI PadVrControllerReadState(int handle, void* state_out) {
+    if (!VirtualPadIsOpen(handle)) {
+        return PAD_ERROR_INVALID_HANDLE;
+    }
+    if (state_out == nullptr ||
+        !Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(state_out), 0x68u)) {
+        return PAD_ERROR_INVALID_ARG;
+    }
+    ControllerState state {};
+    bool connected = false;
+    int count = 0;
+    g_controller->ReadState(&state, &connected, &count);
+    auto* bytes = static_cast<uint8_t*>(state_out);
+    std::memset(bytes, 0, 0x68u);
+    const int side = VirtualPadIndex(handle);
+    const auto axis_x = side == 0 ? Axis::LeftX : Axis::RightX;
+    const auto axis_y = side == 0 ? Axis::LeftY : Axis::RightY;
+    bytes[4] = static_cast<uint8_t>(state.axes[static_cast<int>(axis_x)]);
+    bytes[5] = static_cast<uint8_t>(state.axes[static_cast<int>(axis_y)]);
+    const uint32_t buttons = side == 0
+        ? (state.buttons & (PAD_BUTTON_L1 | PAD_BUTTON_L2 | PAD_BUTTON_L3 |
+                             PAD_BUTTON_TRIANGLE | PAD_BUTTON_SQUARE | PAD_BUTTON_OPTIONS))
+        : (state.buttons & (PAD_BUTTON_R1 | PAD_BUTTON_R2 | PAD_BUTTON_R3 |
+                             PAD_BUTTON_CROSS | PAD_BUTTON_CIRCLE | PAD_BUTTON_OPTIONS));
+    std::memcpy(bytes, &buttons, sizeof(buttons));
+    bytes[0x40] = 1; // Connected.
+    return OK;
+}
+
+int KYTY_SYSV_ABI PadVrControllerGetDeviceInformation(int handle, void* info) {
+    if (!VirtualPadIsOpen(handle)) {
+        return PAD_ERROR_INVALID_HANDLE;
+    }
+    if (info == nullptr) {
+        return PAD_ERROR_INVALID_ARG;
+    }
+    // Do not populate unverified firmware-version-dependent fields.
+    return OK;
+}
+
+int KYTY_SYSV_ABI PadVrControllerGetTriggerEffectState(int handle, int trigger, uint32_t* out) {
+    if (!VirtualPadIsOpen(handle)) {
+        return PAD_ERROR_INVALID_HANDLE;
+    }
+    if (out == nullptr ||
+        !Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(out), sizeof(*out))) {
+        return PAD_ERROR_INVALID_ARG;
+    }
+    *out = 0; // Neutral trigger state.
+    return OK;
+}
 int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
 	PRINT_NAME();
 

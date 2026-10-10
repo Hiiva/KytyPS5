@@ -999,6 +999,11 @@ constexpr uint32_t FSR_CONTROL_POINTS_LEFT_X = 0x2C4;
 constexpr uint32_t FSR_CONTROL_POINTS_LEFT_Y = 0x2CC;
 constexpr uint32_t FSR_ALPHA_LEFT_X          = 0x2E4;
 constexpr uint32_t FSR_ALPHA_LEFT_Y          = 0x2E8;
+constexpr uint32_t FSR_WINDOW_RIGHT          = 0x2BE;
+constexpr uint32_t FSR_CONTROL_POINTS_RIGHT_X = 0x2C8;
+constexpr uint32_t FSR_CONTROL_POINTS_RIGHT_Y = 0x2D0;
+constexpr uint32_t FSR_ALPHA_RIGHT_X         = 0x2E6;
+constexpr uint32_t FSR_ALPHA_RIGHT_Y         = 0x2EA;
 
 constexpr uint32_t TA_CS_BC_BASE_ADDR       = 0x380;
 constexpr uint32_t TA_CS_BC_BASE_ADDR_HI    = 0x381;

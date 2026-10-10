@@ -167,6 +167,9 @@ LIB_DEFINE(InitPad_1) {
 
 	LIB_FUNC("hv1luiJrqQM", Controller::PadInit);
 	LIB_FUNC("xk0AcarP3V4", Controller::PadOpen);
+    LIB_FUNC("iA-DdobUen8", Controller::PadVrControllerReadState);
+    LIB_FUNC("mbJHDdjhVeY", Controller::PadVrControllerGetDeviceInformation);
+    LIB_FUNC("OL2CJ2idmhk", Controller::PadVrControllerGetTriggerEffectState);
 	LIB_FUNC("WFIiSfXGUq8", PadOpenExtStub);
 	LIB_FUNC("u1GRHp+oWoY", Controller::PadGetHandle);
 	LIB_FUNC("AcslpN1jHR8", PadDeviceClassGetExtendedInformation);

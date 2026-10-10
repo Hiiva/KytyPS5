@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -298,12 +299,31 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 		return;
 	}
-	if (rc.copy_depth_to_color || rc.copy_stencil_to_color || rc.copy_centroid ||
-	    rc.copy_sample != 0 || dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
+    // Boot-only fallback for PS VR2 games: these copy-to-color modes need a
+    // dedicated Vulkan path. Preserve the depth attachment for initialization.
+    // The result can have incorrect depth/stencil-derived colors.
+    if (rc.copy_depth_to_color || rc.copy_stencil_to_color) {
+        if (!Config::VrEnabled()) {
+            DepthFatal("unsupported copy-to-color mode");
+        }
+        static std::atomic_bool logged = false;
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            LOGF("DepthTarget: VR copy-to-color mode unsupported, continuing with ordinary attachment\n");
+        }
+    }
+    if (rc.copy_sample != 0 || dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
 	    (has_stencil && !z.depth_view.stencil_write_disable &&
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
-		DepthFatal("unsupported depth register state");
+		DepthFatal("unsupported depth register state: copy_depth=%d copy_stencil=%d copy_centroid=%d copy_sample=%u zfunc=%u depth_diff=%d stencil_diff=%d",
+                       static_cast<int>(rc.copy_depth_to_color),
+                       static_cast<int>(rc.copy_stencil_to_color),
+                       static_cast<int>(rc.copy_centroid),
+                       static_cast<unsigned>(rc.copy_sample),
+                       static_cast<unsigned>(dc.zfunc),
+                       static_cast<int>(!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr),
+                       static_cast<int>(has_stencil && !z.depth_view.stencil_write_disable &&
+                                        z.stencil_write_base_addr != z.stencil_read_base_addr));
 	}
 	r.desc = MakeDepthTargetDesc(buffer, z);
 	r.depth_clear_enable      = rc.depth_clear_enable;

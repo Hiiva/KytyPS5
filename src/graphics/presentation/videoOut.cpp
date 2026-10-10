@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -49,6 +50,7 @@ constexpr int      VIDEO_OUT_FALSE                                      = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_MAIN                              = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_OVERLAY                           = 1;
 constexpr int      VIDEO_OUT_BUS_TYPE_SUB                               = 2;
+constexpr int      VIDEO_OUT_BUS_TYPE_HMD2_MAIN                         = 32;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC                            = 1;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC_MULTI                      = 4;
 constexpr int      VIDEO_OUT_FLIP_MODE_SLAVE                            = 8;
@@ -64,6 +66,7 @@ constexpr uint64_t VIDEO_OUT_REFRESH_RATE_59_94HZ                       = 3;
 constexpr uint64_t VIDEO_OUT_REFRESH_RATE_119_88HZ                      = 13;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED     = 0;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED       = 1;
+constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HMD2             = 16;
 constexpr uint64_t VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY = 8;
 constexpr uint64_t VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED = 32;
 
@@ -250,7 +253,8 @@ private:
 struct VideoOutDriver::Impl {
 public:
 	static constexpr std::array VIDEO_OUT_BUSES {
-	    VIDEO_OUT_BUS_TYPE_MAIN, VIDEO_OUT_BUS_TYPE_OVERLAY, VIDEO_OUT_BUS_TYPE_SUB};
+	    VIDEO_OUT_BUS_TYPE_MAIN, VIDEO_OUT_BUS_TYPE_OVERLAY, VIDEO_OUT_BUS_TYPE_SUB,
+		VIDEO_OUT_BUS_TYPE_HMD2_MAIN};
 	static constexpr int VIDEO_OUT_NUM_MAX = VIDEO_OUT_BUSES.size() + 1;
 
 	Impl(uint32_t width, uint32_t height, Graphics::Presenter& presenter)
@@ -643,6 +647,9 @@ void VideoOutDriver::Impl::Init(uint32_t width, uint32_t height) {
 }
 
 int VideoOutDriver::Impl::Open(int bus_type, int index) {
+	if (bus_type == VIDEO_OUT_BUS_TYPE_HMD2_MAIN && !Config::VrEnabled()) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
 	const auto bus = std::find(VIDEO_OUT_BUSES.begin(), VIDEO_OUT_BUSES.end(), bus_type);
 	if (bus == VIDEO_OUT_BUSES.end()) {
 		return VIDEO_OUT_ERROR_INVALID_VALUE;
@@ -744,7 +751,7 @@ bool VideoOutDriver::Impl::Close(int handle) {
 		master->slave_count--;
 	}
 	m_flip_queue.Cancel(config);
-	m_presenter.ClearLayer(config.bus);
+	m_presenter.ClearLayer(config.bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN ? VIDEO_OUT_BUS_TYPE_MAIN : config.bus);
 	DeleteVideoOutEvents(flip_events, VideoOutEventKind::Flip);
 	DeleteVideoOutEvents(pre_vblank_events, VideoOutEventKind::PreVblankStart);
 	DeleteVideoOutEvents(vblank_events, VideoOutEventKind::Vblank);
@@ -1239,7 +1246,9 @@ bool FlipQueue::Flip(uint32_t micros) {
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg, r.generation);
 		}
-		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
+		layers[i] = {r.frame,
+		             r.cfg->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN ? VIDEO_OUT_BUS_TYPE_MAIN : r.cfg->bus,
+		             r.premultiplied_alpha};
 	}
 	if (due) {
 		m_presenter.Present(std::span(layers.data(), count));
@@ -1307,6 +1316,7 @@ KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void*
 
 	EXIT_NOT_IMPLEMENTED(user_id != 255 && user_id != 0);
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
+	LOGF("VideoOutOpen user=%d bus=%d index=%d\n", user_id, bus_type, index);
 
 	return DriverState().Open(bus_type, index);
 }
@@ -1452,7 +1462,9 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
 	}
 	if (category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED &&
-	    category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED) {
+	    category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED &&
+	    !(category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HMD2 &&
+	      ctx->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN && Config::VrEnabled())) {
 		return VIDEO_OUT_ERROR_INVALID_CATEGORY;
 	}
 
@@ -1470,8 +1482,26 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 			LOGF("\t buffers[%d]: ignoring reserved fields {%p, %p}\n", i, buffers[i].reserved[0],
 			     buffers[i].reserved[1]);
 		}
-		const auto data_address     = reinterpret_cast<uint64_t>(buffers[i].data);
-		const auto metadata_address = reinterpret_cast<uint64_t>(buffers[i].metadata);
+        uint64_t data_address = reinterpret_cast<uint64_t>(buffers[i].data);
+        const auto metadata_address = reinterpret_cast<uint64_t>(buffers[i].metadata);
+        if (category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HMD2) {
+            // Category 16 passes one small eye descriptor per registration.
+            // Each descriptor points to a packed 40-bit GPU image address in
+            // the upper 40 bits of its first QWORD.
+            if (!Graphics::HostMemoryRangeIsReadable(data_address, sizeof(uint64_t))) {
+                return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+            }
+            const auto eye_descriptor = *reinterpret_cast<const uint64_t*>(data_address);
+            if (!Graphics::HostMemoryRangeIsReadable(eye_descriptor, sizeof(uint64_t))) {
+                return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+            }
+            const auto packed = *reinterpret_cast<const uint64_t*>(eye_descriptor);
+            data_address = packed >> 24u;
+            LOGF("HMD2 preview buffer %d: image=0x%016" PRIx64 "\n", i, data_address);
+            if (data_address == 0 || (data_address & 65535u) != 0) {
+                return VIDEO_OUT_ERROR_INVALID_VALUE;
+            }
+        }
 		registrations.push_back({
 		    .group_index      = set_index,
 		    .data_address     = data_address,
