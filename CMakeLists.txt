@@ -519,6 +519,16 @@ add_executable(horizon_calibration_patch_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(horizon_calibration_patch_tests PRIVATE ${inc_headers})
 
+add_executable(hmd2_tracker_pose_tests EXCLUDE_FROM_ALL
+    "${KYTY_TESTS_DIR}/Hmd2TrackerPoseTests.cpp"
+)
+target_include_directories(hmd2_tracker_pose_tests PRIVATE ${inc_headers})
+
+add_executable(hmd2_layer_descriptor_tests EXCLUDE_FROM_ALL
+    "${KYTY_TESTS_DIR}/Hmd2LayerDescriptorTests.cpp"
+)
+target_include_directories(hmd2_layer_descriptor_tests PRIVATE ${inc_headers})
+
 add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
 )
@@ -637,6 +647,8 @@ if(BUILD_TESTING)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME horizon_calibration_patch COMMAND $<TARGET_FILE:horizon_calibration_patch_tests>)
+	add_test(NAME hmd2_tracker_pose COMMAND $<TARGET_FILE:hmd2_tracker_pose_tests>)
+	add_test(NAME hmd2_layer_descriptor COMMAND $<TARGET_FILE:hmd2_layer_descriptor_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
@@ -716,6 +728,8 @@ if(BUILD_TESTING)
 		pad_haptics_tests
 		controller_settings_tests
 		horizon_calibration_patch_tests
+		hmd2_tracker_pose_tests
+		hmd2_layer_descriptor_tests
 		save_data_memory_tests
 		png_enc_tests
 		ces_tests
