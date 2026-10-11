@@ -127,6 +127,44 @@ void ParseEveryExport() {
 		      "known UFunction patch is outside target uexp");
 	}
 }
+void MainMenuDefaultMap() {
+    const auto n = kDefaultMapOriginal.size();
+    Check(n == kDefaultMapMainMenu.size(), "map override changes byte length");
+    std::array<uint8_t, 80> bytes {};
+    std::ranges::copy(kDefaultMapOriginal, bytes.begin() + 8u);
+    const uint64_t start = kDefaultMapPakOffset - 8u;
+    Check(ApplyMainMenuMap(start, bytes) == Result::Patched,
+          "valid packaged DefaultEngine.ini map was not replaced");
+    const std::string_view new_map(
+        reinterpret_cast<const char*>(bytes.data() + 8u), n);
+    Check(new_map == kDefaultMapMainMenu, "main menu map contents differ");
+    Check(ApplyMainMenuMap(start, bytes) == Result::Unchanged,
+          "main menu override not idempotent");
+    Check(ApplyMainMenuMap(start + 100u, bytes) == Result::NoOverlap,
+          "main menu override touched unrelated pak data");
+    std::ranges::copy(kDefaultMapOriginal, bytes.begin() + 8u);
+    bytes[8] = 'X';
+    const auto corrupt = bytes;
+    Check(ApplyMainMenuMap(start, bytes) == Result::Mismatch,
+          "map override accepted corrupt original bytes");
+    Check(bytes == corrupt, "map override mutated unexpected data");
+    Check(ApplyMainMenuMap(kDefaultMapPakOffset - 3u,
+                           std::span(bytes.data(), 5u)) == Result::NoOverlap,
+          "map override accepted an incomplete APR chunk");
+}
+void AutoSaveComfortWidget() {
+    const auto& edit = kAutoSaveComfortEdit;
+    Check(edit.file_offset == 75824259426ull, "comfort widget pak offset changed");
+    Check(edit.original == EntryBytes(0x06d3u), "OnSubMenuCreated entry mismatch");
+    Check(edit.replacement == EntryBytes(0x02d6u), "OnSaveButtonClicked entry mismatch");
+    auto bytes = EventBody(edit);
+    Check(Apply(edit, edit.file_offset - 1u, bytes) == Result::Patched,
+          "comfort widget creation was not redirected to Save");
+    Check(bytes[1] == 0xd6u && bytes[2] == 0x02u,
+          "comfort Save graph entry was not written");
+    Check(Apply(edit, edit.file_offset - 1u, bytes) == Result::Unchanged,
+          "comfort widget patch is not idempotent");
+}
 } // namespace
 
 int main() {
@@ -135,6 +173,8 @@ int main() {
 	RejectUnexpectedBytes();
 	SplitReads();
 	ParseEveryExport();
+	AutoSaveComfortWidget();
+	MainMenuDefaultMap();
 	std::puts("HorizonCalibrationPatchTests: passed");
 	return 0;
 }

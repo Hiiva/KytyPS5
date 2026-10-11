@@ -1370,7 +1370,8 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 
 // Diagnostic-only internal Sense button pulses. These are delivered to the
 // emulated game's pad state, never through Windows keyboard/mouse input.
-// KYTY_VR_SCRIPT="20000:R3,22000:X,24000:X" uses ms after first pad read.
+// KYTY_VR_SCRIPT="20000:R3,22000:X,24000:OPT@2000" uses ms after
+// first pad read. Optional @milliseconds holds the button past 360 ms.
 static uint32_t ApplyVirtualSenseScript(uint32_t buttons) {
     const char* script = std::getenv("KYTY_VR_SCRIPT");
     if (script == nullptr || script[0] == '\0') {
@@ -1387,9 +1388,22 @@ static uint32_t ApplyVirtualSenseScript(uint32_t buttons) {
         }
         const char* key = end + 1;
         const char* endkey = std::strchr(key, ',');
-        const auto length = endkey != nullptr ? static_cast<size_t>(endkey - key)
-                                              : std::strlen(key);
-        if (ms >= scheduled && ms < scheduled + 360u) {
+        const auto full_length = endkey != nullptr ? static_cast<size_t>(endkey - key)
+                                                   : std::strlen(key);
+        const char* duration_separator = static_cast<const char*>(
+            std::memchr(key, '@', full_length));
+        const auto length = duration_separator == nullptr ? full_length
+                            : static_cast<size_t>(duration_separator - key);
+        uint64_t pulse_ms = 360u;
+        if (duration_separator != nullptr) {
+            char* duration_end = nullptr;
+            const auto requested = std::strtoull(duration_separator + 1, &duration_end, 10);
+            if (duration_end == key + full_length && requested >= 1u &&
+                requested <= 10000u) {
+                pulse_ms = requested;
+            }
+        }
+        if (ms >= scheduled && ms - scheduled < pulse_ms) {
             uint32_t bit = 0;
             if (length == 2 && std::strncmp(key, "R3", 2) == 0) {
                 bit = PAD_BUTTON_R3;
@@ -1401,12 +1415,73 @@ static uint32_t ApplyVirtualSenseScript(uint32_t buttons) {
                 bit = PAD_BUTTON_R2;
             } else if (length == 2 && std::strncmp(key, "R1", 2) == 0) {
                 bit = PAD_BUTTON_R1;
+            } else if (length == 3 && std::strncmp(key, "OPT", 3) == 0) {
+                bit = PAD_BUTTON_OPTIONS;
             }
             buttons |= bit;
         }
         part = endkey != nullptr ? endkey + 1 : key + length;
     }
     return buttons;
+}
+// Diagnostic-only Sense-stick pulses, sourced entirely inside the guest.
+// KYTY_VR_STICK_SCRIPT="58000:RIGHT@300,62000:LEFT@300"
+// uses milliseconds since the first virtual-controller poll. Nothing is
+// written to the user's desktop input devices.
+static void ApplyVirtualSenseStickScript(uint8_t* bytes, int side) {
+    const char* script = std::getenv("KYTY_VR_STICK_SCRIPT");
+    if (side != 1 || script == nullptr || script[0] == '\0') {
+        return;
+    }
+    static const uint64_t first_call_us = LibKernel::KernelGetProcessTime();
+    const uint64_t now = LibKernel::KernelGetProcessTime();
+    const uint64_t ms = now >= first_call_us ? (now - first_call_us) / 1000u : 0u;
+    for (const char* part = script; *part != '\0';) {
+        char* end = nullptr;
+        const auto scheduled = std::strtoull(part, &end, 10);
+        if (end == part || *end != ':') {
+            break;
+        }
+        const char* key = end + 1;
+        const char* next = std::strchr(key, ',');
+        const auto full_length = next != nullptr ? static_cast<size_t>(next - key)
+                                                : std::strlen(key);
+        const char* separator = static_cast<const char*>(std::memchr(key, '@', full_length));
+        const auto name_length = separator != nullptr ? static_cast<size_t>(separator - key)
+                                                      : full_length;
+        uint64_t duration = 320u;
+        if (separator != nullptr) {
+            char* duration_end = nullptr;
+            const auto requested = std::strtoull(separator + 1, &duration_end, 10);
+            if (duration_end == key + full_length && requested >= 1u && requested <= 10000u) {
+                duration = requested;
+            }
+        }
+        if (ms >= scheduled && ms - scheduled < duration) {
+            const char* direction = nullptr;
+            if (name_length == 5u && std::strncmp(key, "RIGHT", 5) == 0) {
+                bytes[4] = 255u;
+                direction = "RIGHT";
+            } else if (name_length == 4u && std::strncmp(key, "LEFT", 4) == 0) {
+                bytes[4] = 0u;
+                direction = "LEFT";
+            } else if (name_length == 2u && std::strncmp(key, "UP", 2) == 0) {
+                bytes[5] = 0u;
+                direction = "UP";
+            } else if (name_length == 4u && std::strncmp(key, "DOWN", 4) == 0) {
+                bytes[5] = 255u;
+                direction = "DOWN";
+            }
+            if (direction != nullptr) {
+                static std::atomic<uint64_t> last_logged {UINT64_MAX};
+                if (last_logged.exchange(scheduled, std::memory_order_relaxed) != scheduled) {
+                    LOGF("Virtual Sense scripted stick %s at %llu ms: x=%u y=%u\n",
+                         direction, static_cast<unsigned long long>(ms),
+                         static_cast<unsigned>(bytes[4]), static_cast<unsigned>(bytes[5]));
+                }
+            }
+        }        part = next != nullptr ? next + 1 : key + full_length;
+    }
 }
 // PS VR2 Sense controller read data is a 0x68-byte record. Only established
 // offsets are populated; controller presence does not require host VR hardware.
@@ -1429,6 +1504,7 @@ int KYTY_SYSV_ABI PadVrControllerReadState(int handle, void* state_out) {
     const auto axis_y = side == 0 ? Axis::LeftY : Axis::RightY;
     bytes[4] = static_cast<uint8_t>(state.axes[static_cast<int>(axis_x)]);
     bytes[5] = static_cast<uint8_t>(state.axes[static_cast<int>(axis_y)]);
+    ApplyVirtualSenseStickScript(bytes, side);
     const int trigger = state.axes[static_cast<int>(
         side == 0 ? Axis::TriggerLeft : Axis::TriggerRight)];
     uint32_t buttons = side == 0

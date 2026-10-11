@@ -1170,9 +1170,46 @@ static void MaybePatchHorizonPakBlock(const std::filesystem::path& host_path,
                                      uint64_t file_size, uint64_t offset,
                                      uint8_t* data, uint64_t count) {
     const char* choice = std::getenv("KYTY_HORIZON_CALIBRATION_ENTRY");
-    if (choice == nullptr || choice[0] == '\0' || data == nullptr || count == 0 ||
+    const char* comfort = std::getenv("KYTY_HORIZON_AUTO_SAVE_COMFORT");
+    const bool auto_save_comfort = comfort != nullptr && comfort[0] == '1' &&
+                                   comfort[1] == '\0';
+    const char* main_menu = std::getenv("KYTY_HORIZON_MAINMENU_MAP");
+    const bool override_map = main_menu != nullptr && main_menu[0] == '1' &&
+                              main_menu[1] == '\0';
+    const bool calibration_enabled = choice != nullptr && choice[0] != '\0';
+    if ((!calibration_enabled && !auto_save_comfort && !override_map) ||
+        data == nullptr || count == 0 ||
         host_path.filename() != "azimuth-ps5.pak" ||
         file_size != HorizonCalibrationPatch::kPakSize) {
+        return;
+    }
+    const auto block = std::span<uint8_t>(data, static_cast<size_t>(count));
+    if (override_map) {
+        const auto result = HorizonCalibrationPatch::ApplyMainMenuMap(offset, block);
+        if (result == HorizonCalibrationPatch::Result::Patched) {
+            LOGF("Horizon map override: patched packaged DefaultEngine.ini to MainMenu\n");
+        } else if (result == HorizonCalibrationPatch::Result::Mismatch) {
+            static std::atomic_bool reported {false};
+            if (!reported.exchange(true, std::memory_order_relaxed)) {
+                LOGF("Horizon map override: unexpected DefaultEngine.ini bytes\n");
+            }
+        }
+    }
+    if (auto_save_comfort) {
+        const auto result = HorizonCalibrationPatch::Apply(
+            HorizonCalibrationPatch::kAutoSaveComfortEdit, offset, block);
+        if (result == HorizonCalibrationPatch::Result::Patched) {
+            static std::atomic<uint32_t> logged {0};
+            if (logged.fetch_add(1u, std::memory_order_relaxed) < 6u) {
+                LOGF("Horizon comfort widget: redirected OnSubMenuCreated to "
+                     "OnSaveButtonClicked in guest APR pak read\n");
+            }
+        } else if (result == HorizonCalibrationPatch::Result::Mismatch) {
+            LOGF("Horizon comfort widget: bad signature; no patch at pak=%" PRIu64 "\n",
+                 HorizonCalibrationPatch::kAutoSaveComfortEdit.file_offset);
+        }
+    }
+    if (!calibration_enabled) {
         return;
     }
     static const auto plan = [] {
@@ -1186,7 +1223,6 @@ static void MaybePatchHorizonPakBlock(const std::filesystem::path& host_path,
         }
         return;
     }
-    const auto block = std::span<uint8_t>(data, static_cast<size_t>(count));
     for (const auto& edit : plan.edits) {
         const auto result = HorizonCalibrationPatch::Apply(edit, offset, block);
         if (result == HorizonCalibrationPatch::Result::Patched) {

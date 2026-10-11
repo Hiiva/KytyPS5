@@ -27,7 +27,7 @@ struct Event {
 	uint32_t         graph_entry;
 };
 
-inline constexpr std::array<Event, 23> kEvents {{
+inline constexpr std::array<Event, 39> kEvents {{
     {"begin",       118106u, 0x339bu},
     {"intro",       118158u, 0x3396u},
     {"afterintro",  118002u, 0x3465u},
@@ -51,6 +51,22 @@ inline constexpr std::array<Event, 23> kEvents {{
     {"endclick",    116078u, 0x5195u},
     {"onfadeout",   121302u, 0x0e6fu},
     {"startgame",   116182u, 0x4fb7u},
+    {"comfortmenu",     121354u, 0x0bc9u},
+    {"comfortselected", 118054u, 0x33a0u},
+    {"headsetfadein",   120556u, 0x1b9cu},
+    {"headsetfadeout",  120504u, 0x1bd8u},
+    {"handfadein",      120261u, 0x1df2u},
+    {"handfadeout",     120209u, 0x1e2eu},
+    {"camerafadein",    119968u, 0x23ddu},
+    {"camerafadeout",   119916u, 0x2419u},
+    {"reminderfadein",  119812u, 0x2508u},
+    {"reminderfadeout", 119760u, 0x257eu},
+    {"endforward",      115558u, 0x5edcu},
+    {"endbuttonslayout", 115610u, 0x5d73u},
+    {"endanimateon",     115974u, 0x594au},
+    {"endanimateoff",    115922u, 0x595du},
+    {"endtitlefadeout",  115454u, 0x5f79u},
+    {"continuewarning",  118262u, 0x3317u},
 }};
 
 struct Edit {
@@ -60,12 +76,52 @@ struct Edit {
 	std::array<uint8_t, 4> replacement;
 };
 
+// BP_FrontEndMenu_ComfortSettings_Custom, PPSA05666 01.004.011.
+// OnSubMenuCreated delegates to Kismet entry 0x06d3.
+// OnSaveButtonClicked delegates to entry 0x02d6 with no arguments.
+// Redirect the former to the latter only when explicitly opted in.
+inline constexpr Edit kAutoSaveComfortEdit {
+    "oncreate", 75824259426ull,
+    {0xd3, 0x06, 0x00, 0x00}, {0xd6, 0x02, 0x00, 0x00}
+};
 struct Plan {
 	bool              valid = true;
 	std::vector<Edit> edits;
 };
 
 enum class Result { NoOverlap, Unchanged, Patched, Mismatch };
+
+// The shipped pak stores DefaultEngine.ini uncompressed at this exact
+// offset. This opt-in edit changes GameDefaultMap without touching the pak.
+// Trailing spaces preserve length and are trimmed by UE4's INI parser.
+inline constexpr uint64_t kDefaultMapPakOffset = 61453963ull;
+inline constexpr std::string_view kDefaultMapOriginal =
+    "GameDefaultMap=/Game/Maps/StartupMap.StartupMap";
+inline constexpr std::string_view kDefaultMapMainMenu =
+    "GameDefaultMap=/Game/Maps/MainMenu.MainMenu    ";
+static_assert(kDefaultMapOriginal.size() == kDefaultMapMainMenu.size());
+
+[[nodiscard]] inline Result ApplyMainMenuMap(uint64_t block_offset,
+                                             std::span<uint8_t> block) {
+    if (block_offset > kDefaultMapPakOffset ||
+        kDefaultMapPakOffset - block_offset > block.size()) {
+        return Result::NoOverlap;
+    }
+    const auto at = static_cast<size_t>(kDefaultMapPakOffset - block_offset);
+    if (block.size() - at < kDefaultMapOriginal.size()) {
+        return Result::NoOverlap;
+    }
+    const auto* ptr = reinterpret_cast<const char*>(block.data() + at);
+    const std::string_view actual(ptr, kDefaultMapOriginal.size());
+    if (actual == kDefaultMapMainMenu) {
+        return Result::Unchanged;
+    }
+    if (actual != kDefaultMapOriginal) {
+        return Result::Mismatch;
+    }
+    std::ranges::copy(kDefaultMapMainMenu, block.begin() + at);
+    return Result::Patched;
+}
 
 [[nodiscard]] inline std::string_view Trim(std::string_view s) {
 	const auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
