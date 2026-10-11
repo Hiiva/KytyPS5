@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
@@ -14,6 +15,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -171,7 +173,10 @@ static int32_t KYTY_SYSV_ABI Hmd2Open(int32_t user_id, int32_t type, int32_t ind
         return ERROR_NOT_INITIALIZED;
     }
     LOGF("Hmd2: open user=%d type=%d index=%d param=%p\n", user_id, type, index, param);
-    return 0; // First HMD handle.
+    const char* requested = std::getenv("KYTY_VR_EXPERIMENTAL_HMD");
+    // Keep the known-working virtual HMD handle 0 as the default.
+    // Handle 1 enables the guest's headset tracking path for experiments.
+    return requested != nullptr && std::strcmp(requested, "1") == 0 ? 1 : 0;
 }
 
 static int32_t KYTY_SYSV_ABI Hmd2GetFieldOfView(int32_t handle, SceHmd2FieldOfView* fov) {
@@ -219,11 +224,17 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetParam(
     if (GetReprojectionState() == nullptr) {
         return ERROR_REPROJECTION_NOT_INITIALIZED;
     }
+    if (param == nullptr) {
+        return ERROR_PARAMETER_NULL;
+    }
     static std::atomic<uint32_t> logs {0};
     if (logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
         LOGF("Hmd2: SetParam index=%u frame=%" PRIu64 " param=%p trace=%p\n",
              index, frame, param, trace);
     }
+    // The guest submits per-eye texture layers here. Full PS VR2
+    // reprojection/compositing has not yet been implemented. Desktop mode
+    // can only show surfaces rendered directly into the video-out buffers.
     return OK;
 }
 
@@ -245,6 +256,43 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetMirroringOption(const void* opti
 
 static int32_t KYTY_SYSV_ABI Hmd2ReprojectionEnableMirroring(const void* param) {
     LOGF("Hmd2: mirroring enabled, param=%p\n", param);
+    return OK;
+}
+
+// 0x38-byte native PS VR2 gaze result layout, as observed in PS5VR.
+// On a desktop without an eye tracker, use the headset's forward vector.
+static int32_t KYTY_SYSV_ABI Hmd2GazeGetResult(const void* param, void* result) {
+    if (param == nullptr || result == nullptr) {
+        return ERROR_PARAMETER_NULL;
+    }
+    const auto request_address = reinterpret_cast<uint64_t>(param);
+    const auto result_address = reinterpret_cast<uint64_t>(result);
+    if (!Graphics::HostMemoryRangeIsReadable(request_address, 16) ||
+        !Graphics::HostMemoryRangeIsReadable(result_address, 0x38)) {
+        return ERROR_PARAMETER_NULL;
+    }
+    const auto* const request = static_cast<const uint8_t*>(param);
+    auto* const output = static_cast<uint8_t*>(result);
+    uint32_t request_size = 0;
+    uint32_t result_size = 0;
+    int32_t handle = 0;
+    std::memcpy(&request_size, request, sizeof(request_size));
+    std::memcpy(&handle, request + 4, sizeof(handle));
+    std::memcpy(&result_size, output, sizeof(result_size));
+    static std::atomic<uint32_t> logs {0};
+    if (logs.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+        LOGF("Hmd2: gaze result request size=0x%x hmd=%d result size=0x%x\n",
+             request_size, handle, result_size);
+    }
+    if (request_size != 0x10 || result_size < 0x38) {
+        return ERROR_PARAMETER_NULL;
+    }
+    const uint32_t status = 0;
+    const uint32_t valid = 1;
+    const float forward[3] = {0.0f, 0.0f, -1.0f};
+    std::memcpy(output + 4, &status, sizeof(status));
+    std::memcpy(output + 0x10, &valid, sizeof(valid));
+    std::memcpy(output + 0x14, forward, sizeof(forward));
     return OK;
 }
 
@@ -328,7 +376,8 @@ static int32_t KYTY_SYSV_ABI VrTracker2GetResult(const void* param, void* result
         LOGF("Virtual tracking handle=%d position=(%.2f, %.2f, %.2f) quaternion=(%.2f, %.2f, %.2f, %.2f)\n",
              handle, head_pos[0], head_pos[1], head_pos[2],
              quat[0], quat[1], quat[2], quat[3]);
-    }    std::memcpy(out + 0x60, head_pos, sizeof(head_pos));
+    }
+    std::memcpy(out + 0x60, head_pos, sizeof(head_pos));
     std::memcpy(out + 0x70, quat, sizeof(quat));
     std::memcpy(out + 0xb0, quat, sizeof(quat));
     std::memcpy(out + 0xf0, quat, sizeof(quat));
@@ -434,6 +483,7 @@ LIB_DEFINE(InitHmd2_1) {
     LIB_FUNC("SVEG+1D7qHA", Hmd2::Hmd2ReprojectionGetPredictedDisplayTime);
     LIB_FUNC("Qx7SkcgAzok", Hmd2::Hmd2ReprojectionEnableMirroring);
     LIB_FUNC("retc+-uRMhk", Hmd2::Hmd2GazeGetResultForFoveatedRendering);
+    LIB_FUNC("lAoFUedcfqA", Hmd2::Hmd2GazeGetResult);
     LIB_FUNC("xMo9ENEu2E0", Hmd2::Hmd2ReprojectionSetParam);
     LIB_FUNC("hA9LshbSkzw", Hmd2::Hmd2ReprojectionSetRenderConfig);	LIB_FUNC("bIi4YUfSRys", Hmd2::Hmd2GetDeviceInformation);
 	LIB_FUNC("gF8+lvc7GuQ", Hmd2::Hmd2GetFieldOfViewWithoutHandle);

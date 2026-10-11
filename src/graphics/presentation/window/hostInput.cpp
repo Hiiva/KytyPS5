@@ -78,6 +78,7 @@ constexpr std::string_view MOUSE_SENSITIVITY      = "MouseSensitivity=";
 struct MouseJoystickState {
 	bool     enabled   = false;
 	bool     head_look = false;
+	int      hand_aim  = -1;
 	bool     output    = false;
 	uint64_t next_poll = 0;
 };
@@ -150,7 +151,7 @@ public:
                                   binding.key == SDLK_F7 || binding.key == SDLK_F11 ||
                                   (Config::VrEnabled() &&
                                    (binding.key == SDLK_F6 || binding.key == SDLK_F8 ||
-                                    binding.key == SDLK_F9));
+                                    binding.key == SDLK_F9 || binding.key == SDLK_F10));
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				EXIT("Invalid input mapping: %s\n", value.c_str());
@@ -377,7 +378,12 @@ int PollMouse(uint64_t now_ms) {
 	float delta_x = 0;
 	float delta_y = 0;
 	SDL_GetRelativeMouseState(&delta_x, &delta_y);
-	if (g_mouse.head_look) {
+	if (g_mouse.hand_aim >= 0) {
+		if (delta_x != 0.0f || delta_y != 0.0f) {
+			Controller::VirtualHandMouseMotion(g_mouse.hand_aim, delta_x, delta_y);
+		}
+		CenterMouseStick();
+	} else if (g_mouse.head_look) {
 		if (delta_x != 0.0f || delta_y != 0.0f) {
 			Controller::VirtualHeadMouseMotion(delta_x, delta_y);
 		}
@@ -462,15 +468,17 @@ void HostInputMouseButton(uint8_t mouse_button, bool down) {
 }
 
 void HostInputToggleMouseToJoystick() {
-	if (g_mouse.enabled && !g_mouse.head_look) {
+	if (g_mouse.enabled && !g_mouse.head_look && g_mouse.hand_aim < 0) {
 		SetRelativeMouseMode(false);
 		CenterMouseStick();
 		g_mouse = {};
 		LOGF("Mouse to right stick: disabled\n");
 		return;
 	}
-	if (g_mouse.enabled && g_mouse.head_look) {
+	if (g_mouse.enabled) {
+		CenterMouseStick();
 		g_mouse.head_look = false;
+		g_mouse.hand_aim = -1;
 		g_mouse.next_poll = 0;
 		LOGF("Mouse to right stick: enabled (F7 to release)\n");
 		return;
@@ -480,6 +488,7 @@ void HostInputToggleMouseToJoystick() {
 	}
 	g_mouse.enabled = true;
 	g_mouse.head_look = false;
+	g_mouse.hand_aim = -1;
 	g_mouse.next_poll = 0;
 	LOGF("Mouse to right stick: enabled (F7 to release)\n");
 }
@@ -497,6 +506,7 @@ void HostInputToggleMouseToHead() {
 	if (g_mouse.enabled) {
 		CenterMouseStick();
 		g_mouse.head_look = true;
+		g_mouse.hand_aim = -1;
 		g_mouse.next_poll = 0;
 		LOGF("Virtual headset mouse look: enabled (F8 to release; F9 to recenter)\n");
 		return;
@@ -506,9 +516,34 @@ void HostInputToggleMouseToHead() {
 	}
 	g_mouse.enabled = true;
 	g_mouse.head_look = true;
+	g_mouse.hand_aim = -1;
 	g_mouse.next_poll = 0;
 	LOGF("Virtual headset mouse look: enabled (F8 to release; F9 to recenter)\n");
 }
+
+void HostInputToggleMouseToHand(int side) {
+	if (!Config::VrEnabled() || side < 0 || side > 1) {
+		return;
+	}
+	if (g_mouse.enabled && g_mouse.hand_aim == side) {
+		SetRelativeMouseMode(false);
+		CenterMouseStick();
+		g_mouse = {};
+		LOGF("Virtual Sense mouse aim: disabled\n");
+		return;
+	}
+	if (!g_mouse.enabled && !SetRelativeMouseMode(true)) {
+		return;
+	}
+	CenterMouseStick();
+	g_mouse.enabled = true;
+	g_mouse.head_look = false;
+	g_mouse.hand_aim = side;
+	g_mouse.next_poll = 0;
+	LOGF("Virtual Sense mouse aim: %s hand (F10 toggles; Shift+F10 for left)\n",
+		side == 0 ? "left" : "right");
+}
+
 bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 	int timeout = -1;
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {

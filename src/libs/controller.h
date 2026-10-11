@@ -82,6 +82,7 @@ void VirtualHeadResetPose();
 void VirtualHeadGetPose(float position[3], float orientation[4]);
 void VirtualHandGetPose(int side, float position[3], float orientation[4]);
 void VirtualHandAdjustReach(int side, float wheel_steps);
+void VirtualHandMouseMotion(int side, float dx, float dy);
 
 enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };
 

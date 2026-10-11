@@ -197,6 +197,8 @@ static float g_virtual_head_yaw   = 0.0f;
 static float g_virtual_head_pitch = 0.0f;
 static uint64_t g_virtual_head_updated_us = 0u;
 static float g_virtual_hand_reach[2] = {0.45f, 0.45f};
+static float g_virtual_hand_aim_yaw[2] = {-0.15f, 0.15f};
+static float g_virtual_hand_aim_pitch[2] = {0.14f, 0.14f};
 
 void VirtualHeadMouseMotion(float dx, float dy) {
     if (!Config::VrEnabled()) {
@@ -208,6 +210,24 @@ void VirtualHeadMouseMotion(float dx, float dy) {
     g_virtual_head_pitch = std::clamp(g_virtual_head_pitch - dy * sensitivity, -1.48353f, 1.48353f);
 }
 
+void VirtualHandMouseMotion(int side, float dx, float dy) {
+    if (!Config::VrEnabled() || side < 0 || side > 1 ||
+        !std::isfinite(dx) || !std::isfinite(dy)) {
+        return;
+    }
+    constexpr float sensitivity = 0.0025f;
+    Common::LockGuard lock(g_virtual_head_mutex);
+    g_virtual_hand_aim_yaw[side] = std::clamp(
+        g_virtual_hand_aim_yaw[side] - dx * sensitivity, -1.25f, 1.25f);
+    g_virtual_hand_aim_pitch[side] = std::clamp(
+        g_virtual_hand_aim_pitch[side] - dy * sensitivity, -1.0f, 1.0f);
+    static std::atomic<uint32_t> aim_logs {0};
+    if (aim_logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+        LOGF("Virtual Sense %s aim: yaw=%.3f pitch=%.3f delta=(%.2f,%.2f)\n",
+             side == 0 ? "left" : "right", g_virtual_hand_aim_yaw[side],
+             g_virtual_hand_aim_pitch[side], dx, dy);
+    }
+}
 void VirtualHandAdjustReach(int side, float wheel_steps) {
     if (!Config::VrEnabled() || side < 0 || side > 1 || !std::isfinite(wheel_steps)) {
         return;
@@ -225,6 +245,10 @@ void VirtualHeadResetPose() {
     g_virtual_head_updated_us = 0u;
     g_virtual_hand_reach[0] = 0.45f;
     g_virtual_hand_reach[1] = 0.45f;
+    g_virtual_hand_aim_yaw[0] = -0.15f;
+    g_virtual_hand_aim_yaw[1] = 0.15f;
+    g_virtual_hand_aim_pitch[0] = 0.14f;
+    g_virtual_hand_aim_pitch[1] = 0.14f;
     LOGF("Virtual PS VR2: headset orientation recentered\n");
 }
 
@@ -289,9 +313,13 @@ void VirtualHandGetPose(int side, float position[3], float orientation[4]) {
     }
     VirtualHeadGetPose(position, orientation);
     float reach = 0.45f;
+    float aim_yaw = 0.0f;
+    float aim_pitch = 0.0f;
     {
         Common::LockGuard lock(g_virtual_head_mutex);
         reach = g_virtual_hand_reach[side];
+        aim_yaw = g_virtual_hand_aim_yaw[side];
+        aim_pitch = g_virtual_hand_aim_pitch[side];
     }
     // Neutral Sense pose: shoulder-width hands below and ahead of the face.
     // Rotate local offsets by the virtual headset orientation so mouse look
@@ -307,6 +335,20 @@ void VirtualHandGetPose(int side, float position[3], float orientation[4]) {
     position[0] += local[0] + qw * tx + qy * tz - qz * ty;
     position[1] += local[1] + qw * ty + qz * tx - qx * tz;
     position[2] += local[2] + qw * tz + qx * ty - qy * tx;
+    // The Sense ray orientation is independent of headset gaze. Its local
+    // yaw/pitch can be driven by desktop mouse movements in F10 mode.
+    const float cy = std::cos(aim_yaw * 0.5f);
+    const float sy = std::sin(aim_yaw * 0.5f);
+    const float cp = std::cos(aim_pitch * 0.5f);
+    const float sp = std::sin(aim_pitch * 0.5f);
+    const float ax = cy * sp;
+    const float ay = sy * cp;
+    const float az = -sy * sp;
+    const float aw = cy * cp;
+    orientation[0] = qw * ax + qx * aw + qy * az - qz * ay;
+    orientation[1] = qw * ay - qx * az + qy * aw + qz * ax;
+    orientation[2] = qw * az + qx * ay - qy * ax + qz * aw;
+    orientation[3] = qw * aw - qx * ax - qy * ay - qz * az;
 }
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
                           int connected_count) {
@@ -1370,13 +1412,24 @@ int KYTY_SYSV_ABI PadVrControllerGetDeviceInformation(int handle, void* info) {
     if (!VirtualPadIsOpen(handle)) {
         return PAD_ERROR_INVALID_HANDLE;
     }
-    if (info == nullptr) {
+    if (info == nullptr ||
+        !Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(info), 8u)) {
         return PAD_ERROR_INVALID_ARG;
     }
-    // Do not populate unverified firmware-version-dependent fields.
+    // The guest reads bytes +4 and +5 as analog stick dead zones immediately
+    // after this call. Avoid returning uninitialized stack values.
+    auto* bytes = static_cast<uint8_t*>(info);
+    const uint32_t available = 1u;
+    std::memcpy(bytes, &available, sizeof(available));
+    bytes[4] = 8u;
+    bytes[5] = 8u;
+    static std::atomic<uint32_t> logs {0};
+    if (logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+        LOGF("PadVR device info handle=%d connected=%u deadzones=%u,%u\n",
+             handle, available, bytes[4], bytes[5]);
+    }
     return OK;
 }
-
 int KYTY_SYSV_ABI PadVrControllerGetTriggerEffectState(int handle, int trigger, uint32_t* out) {
     if (!VirtualPadIsOpen(handle)) {
         return PAD_ERROR_INVALID_HANDLE;

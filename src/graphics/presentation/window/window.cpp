@@ -484,10 +484,14 @@ void WindowContext::ProcessEvent(double time_s) {
 	}
 	if (Config::VrEnabled() &&
 	    (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) &&
-	    (event->key.key == SDLK_F8 || event->key.key == SDLK_F9)) {
+	    (event->key.key == SDLK_F8 || event->key.key == SDLK_F9 ||
+	    event->key.key == SDLK_F10)) {
 		if (event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0) {
 			if (event->key.key == SDLK_F8) {
 				HostInputToggleMouseToHead();
+			} else if (event->key.key == SDLK_F10) {
+				const int side = (event->key.mod & SDL_KMOD_SHIFT) != 0 ? 0 : 1;
+				HostInputToggleMouseToHand(side);
 			} else {
 				Controller::VirtualHeadResetPose();
 			}
