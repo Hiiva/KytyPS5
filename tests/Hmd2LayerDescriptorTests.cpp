@@ -59,6 +59,27 @@ void HighAddressBits() {
 	VERIFY(result.left.width == 3328u);
 }
 
+void NativeReprojectionSource() {
+    // 0xe0-byte nested Horizon reprojection block from an earlier, read-only
+    // guest-memory dump. The TSharp descriptor starts at byte 8, rather
+    // than byte 4 as in a category-16 video-out layer.
+    constexpr std::array<uint32_t, 10> words {{
+        0x00000001u, 0x00000000u,
+        0x20723700u, 0xc1600000u, 0x019fc33fu, 0x91b00204u,
+        0x00000000u, 0x00700000u, 0x00000000u, 0x00000000u
+    }};
+    std::array<uint8_t, 40> raw {};
+    std::memcpy(raw.data(), words.data(), raw.size());
+    Texture texture {};
+    VERIFY(DecodeTexture(std::span(raw).subspan(8u, 32u), &texture));
+    VERIFY(texture.address == 0x2072370000ull);
+    VERIFY(texture.width == 3328u && texture.height == 1664u);
+    VERIFY(texture.format == 22u && texture.tile_mode == 27u);
+    VERIFY(texture.image_type == 9u && !texture.compressed);
+    texture.address = 0xfeedbeefu;
+    VERIFY(!DecodeTexture(std::span(raw).subspan(8u, 31u), &texture));
+    VERIFY(texture.address == 0xfeedbeefu);
+}
 void InvalidLayer() {
 	auto bytes = Fixture();
 	Layer result {};
@@ -83,6 +104,7 @@ void InvalidLayer() {
 int main() {
 	NormalLayer();
 	HighAddressBits();
+	NativeReprojectionSource();
 	InvalidLayer();
 	std::puts("Hmd2LayerDescriptorTests: passed");
 }

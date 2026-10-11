@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/cache/vrEyePair.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -520,6 +521,36 @@ bool TextureCache::FindReprojectionCandidateByFormat(uint32_t guest_format,
         }
     });
     return found;
+}
+bool TextureCache::FindReprojectionEyePair(ImageId* left, ImageId* right) const {
+    if (left == nullptr || right == nullptr) {
+        return false;
+    }
+    std::vector<VrEyePair::Candidate> candidates;
+    std::vector<ImageId> ids;
+    m_slot_images.ForEach([&](ImageId id, const Image& image) {
+        const auto& info = image.info;
+        // Observed Horizon native eye targets: RGBA8 2000x2040, tiled,
+        // single level, single layer. Never present an unbacked cache entry.
+        if (!image.registered || info.IsDepth() ||
+            info.extent.width != 2000u || info.extent.height != 2040u ||
+            static_cast<uint32_t>(info.guest_format) != 56u ||
+            info.resources.layers != 1u || info.resources.levels != 1u ||
+            image.backing.image == nullptr) {
+            return;
+        }
+        candidates.push_back({info.data.address, info.data.size,
+                              image.tick_accessed_last,
+                              image.IsGpuModified(), image.usage.render_target});
+        ids.push_back(id);
+    });
+    const auto pair = VrEyePair::Select(candidates);
+    if (!pair) {
+        return false;
+    }
+    *left = ids[pair->left_index];
+    *right = ids[pair->right_index];
+    return true;
 }
 void TextureCache::DumpReprojectionCandidates() const {
     uint32_t candidates = 0;

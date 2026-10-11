@@ -529,6 +529,11 @@ add_executable(hmd2_layer_descriptor_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(hmd2_layer_descriptor_tests PRIVATE ${inc_headers})
 
+add_executable(vr_eye_pair_tests EXCLUDE_FROM_ALL
+    "${KYTY_TESTS_DIR}/VrEyePairTests.cpp"
+)
+target_include_directories(vr_eye_pair_tests PRIVATE ${inc_headers})
+
 add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
 )
@@ -649,6 +654,7 @@ if(BUILD_TESTING)
 	add_test(NAME horizon_calibration_patch COMMAND $<TARGET_FILE:horizon_calibration_patch_tests>)
 	add_test(NAME hmd2_tracker_pose COMMAND $<TARGET_FILE:hmd2_tracker_pose_tests>)
 	add_test(NAME hmd2_layer_descriptor COMMAND $<TARGET_FILE:hmd2_layer_descriptor_tests>)
+	add_test(NAME vr_eye_pair COMMAND $<TARGET_FILE:vr_eye_pair_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
@@ -730,6 +736,7 @@ if(BUILD_TESTING)
 		horizon_calibration_patch_tests
 		hmd2_tracker_pose_tests
 		hmd2_layer_descriptor_tests
+		vr_eye_pair_tests
 		save_data_memory_tests
 		png_enc_tests
 		ces_tests

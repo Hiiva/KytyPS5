@@ -996,13 +996,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
         const char* stereo = std::getenv("KYTY_VR_STEREO_PREVIEW");
         if (stereo != nullptr && stereo[0] == '1' && stereo[1] == '\0') {
             auto& cache = m_impl->renderer.GetTextureCache();
-            ImageInfo left_info {}, right_info {};
             ImageId left_id {}, right_id {};
-            const bool left_ok = cache.FindReprojectionCandidateByFormat(
-                56u, 0u, &left_info, &left_id, 2000u, 2040u);
-            const bool right_ok = cache.FindReprojectionCandidateByFormat(
-                56u, 1u, &right_info, &right_id, 2000u, 2040u);
-            if (left_ok && right_ok && left_id != right_id) {
+            if (cache.FindReprojectionEyePair(&left_id, &right_id)) {
                 auto& left = cache.GetImage(left_id);
                 auto& right = cache.GetImage(right_id);
                 left.usage.video_out = true;
@@ -1016,12 +1011,13 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
                 if (logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
                     LOGF("Hmd2: diagnostic stereo eye mirror left=%016" PRIx64
                          " right=%016" PRIx64 "\n",
-                         left_info.data.address, right_info.data.address);
+                         left.info.data.address, right.info.data.address);
                 }
                 return *frame;
             }
         }
-    }    ImageInfo source = info;
+    }
+    ImageInfo source = info;
     bool direct_source = false;
     ImageId candidate_image_id {};
     // Optional mono eye preview for desktops without PS VR2 hardware.

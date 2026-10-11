@@ -5,6 +5,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
+#include "libs/hmd2LayerDescriptor.h"
 #include "libs/hmd2TrackerPose.h"
 #include "libs/controller.h"
 #include "kernel/pthread.h"
@@ -264,21 +265,14 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetParam(
                             reinterpret_cast<const uint8_t*>(layers) + 0xd8u,
                             sizeof(source_block));
                 if (Graphics::HostMemoryRangeIsReadable(source_block, 40u)) {
-                    std::array<uint32_t, 8> descriptor {};
-                    std::memcpy(descriptor.data(),
-                                reinterpret_cast<const uint8_t*>(source_block) + 8u,
-                                sizeof(descriptor));
-                    const uint64_t gpu_address =
-                        ((static_cast<uint64_t>(descriptor[1] & 0xffu) << 32u) |
-                         descriptor[0]) << 8u;
-                    const uint32_t width =
-                        1u + ((descriptor[1] >> 30u) & 3u) +
-                        ((descriptor[2] & 0xfffu) << 2u);
-                    const uint32_t height = 1u + ((descriptor[2] >> 14u) & 0x3fffu);
-                    const uint32_t format = (descriptor[1] >> 20u) & 0x1ffu;
-                    const uint32_t tile_mode = (descriptor[3] >> 20u) & 0x1fu;
-                    const uint32_t image_type = (descriptor[3] >> 28u) & 0xfu;
-                    const bool compressed = ((descriptor[6] >> 21u) & 1u) != 0u;
+                    // The nested +8 payload is the same native TSharp
+                    // texture descriptor used by type-0x10 video-out layers.
+                    // Use the tested decoder for both paths.
+                    Hmd2LayerDescriptor::Texture texture {};
+                    const bool decoded = Hmd2LayerDescriptor::DecodeTexture(
+                        std::span<const uint8_t>(
+                            reinterpret_cast<const uint8_t*>(source_block) + 8u, 32u),
+                        &texture);
                     if (std::getenv("KYTY_VR_DUMP_SOURCE") != nullptr) {
                         static std::atomic<uint32_t> dump_count {0};
                         if (dump_count.fetch_add(1u, std::memory_order_relaxed) < 2u) {
@@ -312,21 +306,24 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetParam(
                                 }
                             }
                         }
-                    }                    // Observed Horizon source: 3328x1664, R32_FLOAT, tiled 0x1b.
-                    // The bit pattern may represent packed RGBA output; the
-                    // display path interprets it as four 8-bit channels.
-                    if (gpu_address != 0u && (gpu_address & 0xffffu) == 0u &&
-                        width >= 64u && width <= 8192u &&
-                        height >= 64u && height <= 8192u &&
-                        format == 22u && tile_mode == 0x1bu &&
-                        image_type == 9u && !compressed) {
+                    }
+                    // Observed Horizon source: 3328x1664, R32_FLOAT, tiled 0x1b.
+                    // The format may contain a packed four-channel output;
+                    // the diagnostic display interprets it as RGBA8.
+                    if (decoded && (texture.address & 0xffffu) == 0u &&
+                        texture.width <= 8192u && texture.height <= 8192u &&
+                        texture.format == 22u && texture.tile_mode == 0x1bu &&
+                        !texture.compressed) {
                         std::scoped_lock lock {g_preview_source_mutex};
-                        g_preview_source = {gpu_address, width, height, format, tile_mode};
+                        g_preview_source = {texture.address, texture.width,
+                                            texture.height, texture.format,
+                                            texture.tile_mode};
                         static std::atomic<uint32_t> preview_logs {0};
                         if (preview_logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
                             LOGF("Hmd2: direct-preview source addr=%016" PRIx64
                                  " extent=%ux%u guestfmt=%u tile=%u\n",
-                                 gpu_address, width, height, format, tile_mode);
+                                 texture.address, texture.width, texture.height,
+                                 texture.format, texture.tile_mode);
                         }
                     }
                 }

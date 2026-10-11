@@ -47,6 +47,7 @@ public:
 	void                        DumpReprojectionCandidates() const;
 	[[nodiscard]] bool          FindReprojectionCandidate(uint32_t index, ImageInfo* output, ImageId* selected = nullptr) const;
 	[[nodiscard]] bool          FindReprojectionCandidateByFormat(uint32_t guest_format, uint32_t ordinal, ImageInfo* output, ImageId* selected = nullptr, uint32_t width = 3328u, uint32_t height = 1664u) const;
+	[[nodiscard]] bool          FindReprojectionEyePair(ImageId* left, ImageId* right) const;
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
