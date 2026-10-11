@@ -8,6 +8,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
+#include "libs/horizonCalibrationPatch.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
@@ -18,6 +19,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <limits>
@@ -1162,6 +1164,49 @@ static bool AppendCommandRecord(uint64_t command_buffer, CommandBufferState::Com
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
+// Experimental Horizon cooked-Blueprint redirect. This runs on APR's local
+// read buffer only. It does not modify pak files or user saves.
+static void MaybePatchHorizonPakBlock(const std::filesystem::path& host_path,
+                                     uint64_t file_size, uint64_t offset,
+                                     uint8_t* data, uint64_t count) {
+    const char* choice = std::getenv("KYTY_HORIZON_CALIBRATION_ENTRY");
+    if (choice == nullptr || choice[0] == '\0' || data == nullptr || count == 0 ||
+        host_path.filename() != "azimuth-ps5.pak" ||
+        file_size != HorizonCalibrationPatch::kPakSize) {
+        return;
+    }
+    static const auto plan = [] {
+        const char* requested = std::getenv("KYTY_HORIZON_CALIBRATION_ENTRY");
+        return HorizonCalibrationPatch::ParsePlan(requested != nullptr ? requested : "");
+    }();
+    if (!plan.valid) {
+        static std::atomic_bool reported {false};
+        if (!reported.exchange(true, std::memory_order_relaxed)) {
+            LOGF("Horizon calibration redirect: invalid entry specification\n");
+        }
+        return;
+    }
+    const auto block = std::span<uint8_t>(data, static_cast<size_t>(count));
+    for (const auto& edit : plan.edits) {
+        const auto result = HorizonCalibrationPatch::Apply(edit, offset, block);
+        if (result == HorizonCalibrationPatch::Result::Patched) {
+            static std::atomic<uint32_t> count_logged {0};
+            if (count_logged.fetch_add(1u, std::memory_order_relaxed) < 20u) {
+                LOGF("Horizon calibration redirect: event=%.*s pak=%" PRIu64
+                     " replacement=%02x%02x%02x%02x\n",
+                     static_cast<int>(edit.event.size()), edit.event.data(),
+                     edit.file_offset, edit.replacement[3], edit.replacement[2],
+                     edit.replacement[1], edit.replacement[0]);
+            }
+        } else if (result == HorizonCalibrationPatch::Result::Mismatch) {
+            static std::atomic_bool reported {false};
+            if (!reported.exchange(true, std::memory_order_relaxed)) {
+                LOGF("Horizon calibration redirect: unexpected bytes near pak=%" PRIu64
+                     ", no patch applied to this event\n", edit.file_offset);
+            }
+        }
+    }
+}
 static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
 
@@ -1429,6 +1474,8 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		if (read == 0) {
 			break;
 		}
+		MaybePatchHorizonPakBlock(host_path, file_size, file_offset + *bytes_read,
+				buffer.data(), read);
 		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
 		*bytes_read += read;
 	}
