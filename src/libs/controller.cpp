@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 namespace Libs::Controller {
@@ -350,13 +351,14 @@ void VirtualHandGetPose(int side, float position[3], float orientation[4]) {
     orientation[2] = qw * az + qx * ay - qy * ax + qz * aw;
     orientation[3] = qw * aw - qx * ax - qy * ay - qz * az;
 }
+static uint32_t ApplyVirtualSenseScript(uint32_t buttons);
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
                           int connected_count) {
 	EXIT_IF(data == nullptr);
 
 	std::memset(data, 0, sizeof(*data));
 
-	data->buttons           = state.buttons;
+	data->buttons           = Config::VrEnabled() ? ApplyVirtualSenseScript(state.buttons) : state.buttons;
 	data->left_stick_x      = state.axes[static_cast<int>(Axis::LeftX)];
 	data->left_stick_y      = state.axes[static_cast<int>(Axis::LeftY)];
 	data->right_stick_x     = state.axes[static_cast<int>(Axis::RightX)];
@@ -1366,6 +1368,46 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	return ret_num;
 }
 
+// Diagnostic-only internal Sense button pulses. These are delivered to the
+// emulated game's pad state, never through Windows keyboard/mouse input.
+// KYTY_VR_SCRIPT="20000:R3,22000:X,24000:X" uses ms after first pad read.
+static uint32_t ApplyVirtualSenseScript(uint32_t buttons) {
+    const char* script = std::getenv("KYTY_VR_SCRIPT");
+    if (script == nullptr || script[0] == '\0') {
+        return buttons;
+    }
+    static const uint64_t first_call_us = LibKernel::KernelGetProcessTime();
+    const uint64_t now = LibKernel::KernelGetProcessTime();
+    const uint64_t ms = now >= first_call_us ? (now - first_call_us) / 1000u : 0u;
+    for (const char* part = script; *part != '\0';) {
+        char* end = nullptr;
+        const auto scheduled = std::strtoull(part, &end, 10);
+        if (end == part || *end != ':') {
+            break;
+        }
+        const char* key = end + 1;
+        const char* endkey = std::strchr(key, ',');
+        const auto length = endkey != nullptr ? static_cast<size_t>(endkey - key)
+                                              : std::strlen(key);
+        if (ms >= scheduled && ms < scheduled + 360u) {
+            uint32_t bit = 0;
+            if (length == 2 && std::strncmp(key, "R3", 2) == 0) {
+                bit = PAD_BUTTON_R3;
+            } else if (length == 1 && key[0] == 'X') {
+                bit = PAD_BUTTON_CROSS;
+            } else if (length == 1 && key[0] == 'O') {
+                bit = PAD_BUTTON_CIRCLE;
+            } else if (length == 2 && std::strncmp(key, "R2", 2) == 0) {
+                bit = PAD_BUTTON_R2;
+            } else if (length == 2 && std::strncmp(key, "R1", 2) == 0) {
+                bit = PAD_BUTTON_R1;
+            }
+            buttons |= bit;
+        }
+        part = endkey != nullptr ? endkey + 1 : key + length;
+    }
+    return buttons;
+}
 // PS VR2 Sense controller read data is a 0x68-byte record. Only established
 // offsets are populated; controller presence does not require host VR hardware.
 int KYTY_SYSV_ABI PadVrControllerReadState(int handle, void* state_out) {
@@ -1397,12 +1439,16 @@ int KYTY_SYSV_ABI PadVrControllerReadState(int handle, void* state_out) {
     if (trigger > 32) {
         buttons |= side == 0 ? PAD_BUTTON_L2 : PAD_BUTTON_R2;
     }
+    if (side == 1) {
+        buttons = ApplyVirtualSenseScript(buttons);
+    }
     std::memcpy(bytes, &buttons, sizeof(buttons));
     bytes[6] = static_cast<uint8_t>(std::clamp(trigger, 0, 255));
     static std::array<std::atomic<uint32_t>, 2> previous_buttons {};
     if (previous_buttons[static_cast<size_t>(side)].exchange(buttons, std::memory_order_relaxed) != buttons) {
-        LOGF("Virtual Sense %s buttons=0x%08x trigger=%d\n",
-             side == 0 ? "left" : "right", buttons, trigger);
+        LOGF("Virtual Sense %s buttons=0x%08x trigger=%d process_ms=%" PRIu64 "\n",
+             side == 0 ? "left" : "right", buttons, trigger,
+             LibKernel::KernelGetProcessTime() / 1000u);
     }
     bytes[0x40] = 1; // Connected.
     return OK;

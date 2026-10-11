@@ -20,12 +20,15 @@
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "libs/hmd2.h"
+#include "libs/hmd2LayerDescriptor.h"
 #include "libs/libs.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -1115,6 +1118,31 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		}
 		return;
 	}
+	if (!special && cfg->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN && Config::VrEnabled()) {
+		Hmd2::ReprojectionPreviewSource preview {};
+		if (Hmd2::GetReprojectionPreviewSource(&preview)) {
+			// Mirror the guest's stereo 32-bit source as four 8-bit channels.
+			// This is a diagnostic display, not lens/timewarp reprojection.
+			Graphics::ImageInfo candidate {};
+			candidate.data = {preview.address, 0};
+			candidate.guest_format = Graphics::Prospero::BufferFormat::k8_8_8_8Srgb;
+			candidate.pixel_format = vk::Format::eR8G8B8A8Srgb;
+			candidate.type = Graphics::Prospero::ImageType::kColor2D;
+			candidate.extent = {preview.width, preview.height, 1};
+			candidate.resources = {1, 1};
+			candidate.bytes_per_block = 4;
+			candidate.samples = 1;
+			candidate.tile_mode = Graphics::Prospero::TileMode::kRenderTarget;
+			candidate.UpdateSize();
+			source_info = candidate;
+			static std::atomic<uint32_t> mirror_logs {0};
+			if (mirror_logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+				LOGF("Hmd2: mirroring submitted image=%016" PRIx64
+					" extent=%ux%u\n", preview.address,
+					preview.width, preview.height);
+			}
+		}
+	}
 	Graphics::Presenter::Frame* frame = nullptr;
 	if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
@@ -1497,6 +1525,32 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
             }
             const auto packed = *reinterpret_cast<const uint64_t*>(eye_descriptor);
             data_address = packed >> 24u;
+
+            // Firmware layer type 0x10 contains two native 32-byte TSharp
+            // descriptors. The legacy extraction above only sees 32 of the
+            // 40 address bits. Decode both when explicitly requested, but
+            // preserve the calibrated default behavior if the flag is unset.
+            const char* native_layer = std::getenv("KYTY_VR_NATIVE_LAYER_ADDRESS");
+            if (native_layer != nullptr && native_layer[0] == '1' &&
+                native_layer[1] == '\0' &&
+                Graphics::HostMemoryRangeIsReadable(
+                    eye_descriptor, Hmd2LayerDescriptor::kLayerBytes)) {
+                Hmd2LayerDescriptor::Layer layer {};
+                const auto bytes = std::span<const uint8_t>(
+                    reinterpret_cast<const uint8_t*>(eye_descriptor),
+                    Hmd2LayerDescriptor::kLayerBytes);
+                if (Hmd2LayerDescriptor::Decode(bytes, &layer)) {
+                    data_address = layer.left.address;
+                    static std::atomic<uint32_t> layer_logs {0};
+                    if (layer_logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+                        LOGF("Hmd2: native layer[%d] texture=%016" PRIx64
+                             " %ux%u format=%u tile=%u second=%016" PRIx64 "\n",
+                             i, layer.left.address, layer.left.width,
+                             layer.left.height, layer.left.format,
+                             layer.left.tile_mode, layer.right.address);
+                    }
+                }
+            }
             LOGF("HMD2 preview buffer %d: image=0x%016" PRIx64 "\n", i, data_address);
             if (data_address == 0 || (data_address & 65535u) != 0) {
                 return VIDEO_OUT_ERROR_INVALID_VALUE;

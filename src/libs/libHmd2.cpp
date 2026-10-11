@@ -5,6 +5,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
+#include "libs/hmd2TrackerPose.h"
 #include "libs/controller.h"
 #include "kernel/pthread.h"
 #include "libs/libs.h"
@@ -94,6 +95,21 @@ static_assert(offsetof(SceHmd2ReprojectionInitializeParam, reserved) == 52);
 
 static std::atomic<bool> g_initialized = false;
 static std::mutex g_reprojection_mutex;
+static std::mutex g_preview_source_mutex;
+static ReprojectionPreviewSource g_preview_source {};
+
+bool GetReprojectionPreviewSource(ReprojectionPreviewSource* source) {
+    if (source == nullptr) {
+        return false;
+    }
+    std::scoped_lock lock {g_preview_source_mutex};
+    if (g_preview_source.address == 0) {
+        return false;
+    }
+    *source = g_preview_source;
+    return true;
+}
+
 static std::atomic<ReprojectionState*> g_reprojection_state {nullptr};
 
 ReprojectionState* GetReprojectionState() {
@@ -232,6 +248,91 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetParam(
         LOGF("Hmd2: SetParam index=%u frame=%" PRIu64 " param=%p trace=%p\n",
              index, frame, param, trace);
     }
+    if (Config::VrEnabled()) {
+        const char* mirror = std::getenv("KYTY_VR_MIRROR_SOURCE");
+        if (mirror != nullptr && mirror[0] == '1' &&
+            Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(param), 24u)) {
+            uint64_t layers = 0;
+            uint32_t count = 0;
+            const auto* const bytes = static_cast<const uint8_t*>(param);
+            std::memcpy(&layers, bytes, sizeof(layers));
+            std::memcpy(&count, bytes + 8, sizeof(count));
+            if (count >= 1u && count <= 4u &&
+                Graphics::HostMemoryRangeIsReadable(layers, 0xe0u)) {
+                uint64_t source_block = 0;
+                std::memcpy(&source_block,
+                            reinterpret_cast<const uint8_t*>(layers) + 0xd8u,
+                            sizeof(source_block));
+                if (Graphics::HostMemoryRangeIsReadable(source_block, 40u)) {
+                    std::array<uint32_t, 8> descriptor {};
+                    std::memcpy(descriptor.data(),
+                                reinterpret_cast<const uint8_t*>(source_block) + 8u,
+                                sizeof(descriptor));
+                    const uint64_t gpu_address =
+                        ((static_cast<uint64_t>(descriptor[1] & 0xffu) << 32u) |
+                         descriptor[0]) << 8u;
+                    const uint32_t width =
+                        1u + ((descriptor[1] >> 30u) & 3u) +
+                        ((descriptor[2] & 0xfffu) << 2u);
+                    const uint32_t height = 1u + ((descriptor[2] >> 14u) & 0x3fffu);
+                    const uint32_t format = (descriptor[1] >> 20u) & 0x1ffu;
+                    const uint32_t tile_mode = (descriptor[3] >> 20u) & 0x1fu;
+                    const uint32_t image_type = (descriptor[3] >> 28u) & 0xfu;
+                    const bool compressed = ((descriptor[6] >> 21u) & 1u) != 0u;
+                    if (std::getenv("KYTY_VR_DUMP_SOURCE") != nullptr) {
+                        static std::atomic<uint32_t> dump_count {0};
+                        if (dump_count.fetch_add(1u, std::memory_order_relaxed) < 2u) {
+                            const auto* nested_words =
+                                reinterpret_cast<const uint32_t*>(source_block);
+                            if (Graphics::HostMemoryRangeIsReadable(source_block, 0xe0u)) {
+                                for (uint32_t k = 0; k < 0xe0u / 4u; k += 4u) {
+                                    LOGF("Hmd2: nested-data[%02x] %08x %08x %08x %08x\n",
+                                         k * 4u, nested_words[k], nested_words[k + 1],
+                                         nested_words[k + 2], nested_words[k + 3]);
+                                }
+                                const uint32_t follow_offsets[] = {0x68u, 0x98u, 0xa0u};
+                                for (uint32_t offset : follow_offsets) {
+                                    uint64_t ptr = 0;
+                                    std::memcpy(&ptr,
+                                                reinterpret_cast<const uint8_t*>(source_block) + offset,
+                                                sizeof(ptr));
+                                    const bool readable =
+                                        Graphics::HostMemoryRangeIsReadable(ptr, 0x80u);
+                                    LOGF("Hmd2: nested follow +%02x addr=%016" PRIx64
+                                         " readable=%d\n", offset, ptr, readable);
+                                    if (readable) {
+                                        const auto* words =
+                                            reinterpret_cast<const uint32_t*>(ptr);
+                                        for (uint32_t k = 0; k < 0x80u / 4u; k += 4u) {
+                                            LOGF("Hmd2: follow+%02x[%02x] %08x %08x %08x %08x\n",
+                                                 offset, k * 4u, words[k], words[k + 1],
+                                                 words[k + 2], words[k + 3]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }                    // Observed Horizon source: 3328x1664, R32_FLOAT, tiled 0x1b.
+                    // The bit pattern may represent packed RGBA output; the
+                    // display path interprets it as four 8-bit channels.
+                    if (gpu_address != 0u && (gpu_address & 0xffffu) == 0u &&
+                        width >= 64u && width <= 8192u &&
+                        height >= 64u && height <= 8192u &&
+                        format == 22u && tile_mode == 0x1bu &&
+                        image_type == 9u && !compressed) {
+                        std::scoped_lock lock {g_preview_source_mutex};
+                        g_preview_source = {gpu_address, width, height, format, tile_mode};
+                        static std::atomic<uint32_t> preview_logs {0};
+                        if (preview_logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+                            LOGF("Hmd2: direct-preview source addr=%016" PRIx64
+                                 " extent=%ux%u guestfmt=%u tile=%u\n",
+                                 gpu_address, width, height, format, tile_mode);
+                        }
+                    }
+                }
+            }
+        }
+    }
     // The guest submits per-eye texture layers here. Full PS VR2
     // reprojection/compositing has not yet been implemented. Desktop mode
     // can only show surfaces rendered directly into the video-out buffers.
@@ -289,7 +390,9 @@ static int32_t KYTY_SYSV_ABI Hmd2GazeGetResult(const void* param, void* result) 
     }
     const uint32_t status = 0;
     const uint32_t valid = 1;
-    const float forward[3] = {0.0f, 0.0f, -1.0f};
+    // Horizon initializes this native gaze vector along +Z before the call.
+    // Its VR conversion applies the PS5-to-engine sign change afterward.
+    const float forward[3] = {0.0f, 0.0f, 1.0f};
     std::memcpy(output + 4, &status, sizeof(status));
     std::memcpy(output + 0x10, &valid, sizeof(valid));
     std::memcpy(output + 0x14, forward, sizeof(forward));
@@ -297,11 +400,32 @@ static int32_t KYTY_SYSV_ABI Hmd2GazeGetResult(const void* param, void* result) 
 }
 
 static int32_t KYTY_SYSV_ABI Hmd2GazeGetResultForFoveatedRendering(
-    uint64_t arg0, uint64_t arg1) {
+    const void* request, void* result) {
+    // Native UE 4.26 Horizon requests 0x10 bytes and a 0x18-byte result.
+    // Its caller consumes the normalized +Z gaze vector at result +0x08.
+    // Without PS VR2 eye tracking, supply a stable center-of-view gaze.
+    if (request == nullptr || result == nullptr ||
+        !Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(request), 0x10u) ||
+        !Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(result), 0x18u)) {
+        return ERROR_PARAMETER_NULL;
+    }
+    const auto* input = static_cast<const uint8_t*>(request);
+    auto* output = static_cast<uint8_t*>(result);
+    uint32_t request_size = 0;
+    uint32_t result_size = 0;
+    std::memcpy(&request_size, input, sizeof(request_size));
+    std::memcpy(&result_size, output, sizeof(result_size));
+    if (request_size != 0x10u || result_size < 0x18u) {
+        return ERROR_PARAMETER_NULL;
+    }
+    const uint32_t valid = 1u;
+    const float direction[3] = {0.0f, 0.0f, 1.0f};
+    std::memcpy(output + 4u, &valid, sizeof(valid));
+    std::memcpy(output + 8u, direction, sizeof(direction));
     static std::atomic<uint32_t> logs {0};
-    if (logs.fetch_add(1, std::memory_order_relaxed) < 3) {
-        LOGF("Hmd2: foveated gaze request arg0=%p arg1=%p (not emulated)\n",
-             reinterpret_cast<void*>(arg0), reinterpret_cast<void*>(arg1));
+    if (logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+        LOGF("Hmd2: virtual foveated gaze request size=0x%x result size=0x%x\n",
+             request_size, result_size);
     }
     return OK;
 }
@@ -358,8 +482,41 @@ static int32_t KYTY_SYSV_ABI VrTracker2GetResult(const void* param, void* result
     const auto log_index = handle >= 0 && handle < 4 ? handle : 4;
     const auto n = result_logs[static_cast<size_t>(log_index)].fetch_add(1u, std::memory_order_relaxed);
     if (n < 4u) {
-        LOGF("VrTracker2: GetResult handle=%d paramsize=0x%x result=%p first=0x%x\n",
-             handle, param_size, result, *reinterpret_cast<const uint32_t*>(out));
+        LOGF("VrTracker2: GetResult handle=%d paramsize=0x%x result=%p first=0x%x caller=%p in=%p\n",
+             handle, param_size, result, *reinterpret_cast<const uint32_t*>(out),
+             __builtin_return_address(0), param);
+    }
+    if (n < 4u && Graphics::HostMemoryRangeIsReadable(
+            reinterpret_cast<uint64_t>(param), 0x30u)) {
+        const auto* q = reinterpret_cast<const uint32_t*>(in);
+        LOGF("VrTracker2: request [%08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x]\n",
+             q[0],q[1],q[2],q[3],q[4],q[5],q[6],q[7],q[8],q[9],q[10],q[11]);
+    }
+    // TEMP investigation: test the three guest-consumed validity fields
+    // separately, without changing default desktop behavior.
+    if (const char* quality = std::getenv("KYTY_VR_TRACKING_QUALITY");
+        quality != nullptr) {
+        const bool all = std::strcmp(quality, "all") == 0 || std::strcmp(quality, "1") == 0;
+        uint32_t mode = 0;
+        if (all || std::strcmp(quality, "mode2") == 0 ||
+            std::strcmp(quality, "mode2flag") == 0) {
+            mode = 2;
+        } else if (std::strcmp(quality, "mode1") == 0) {
+            mode = 1;
+        }
+        if (mode != 0) {
+            std::memcpy(out + 0x0c, &mode, sizeof(mode));
+        }
+        if (all || std::strcmp(quality, "stamp") == 0) {
+            uint64_t timestamp = 0;
+            std::memcpy(&timestamp, in + 0x10, sizeof(timestamp));
+            std::memcpy(out + 0x10, &timestamp, sizeof(timestamp));
+        }
+        if (all || std::strcmp(quality, "flag") == 0 ||
+            std::strcmp(quality, "mode2flag") == 0) {
+            const uint32_t valid_pose = 1;
+            std::memcpy(out + 0x18, &valid_pose, sizeof(valid_pose));
+        }
     }
     // PS VR2 tracker result: status at +4; head position at +0x60, quaternion
     // at +0x70, and per-eye orientation quaternions at +0xb0 and +0xf0.
@@ -377,7 +534,35 @@ static int32_t KYTY_SYSV_ABI VrTracker2GetResult(const void* param, void* result
              handle, head_pos[0], head_pos[1], head_pos[2],
              quat[0], quat[1], quat[2], quat[3]);
     }
-    std::memcpy(out + 0x60, head_pos, sizeof(head_pos));
+    // Optional fuller 6DoF result derived from the four pose blocks the
+    // Horizon caller reads at +0x60, +0xa0, +0xe0 and +0x120. In the default
+    // path, preserve the previously verified calibration behavior.
+    if (const char* full = std::getenv("KYTY_VR_FULL_TRACKING_RESULT");
+        full != nullptr && full[0] == '1' && full[1] == '\0') {
+        if (!Graphics::HostMemoryRangeIsReadable(
+                reinterpret_cast<uint64_t>(param), 0x20u) ||
+            !Graphics::HostMemoryRangeIsReadable(
+                reinterpret_cast<uint64_t>(result),
+                Hmd2TrackerPose::kResultBytes)) {
+            return ERROR_PARAMETER_NULL;
+        }
+        uint64_t predicted_time = 0;
+        std::memcpy(&predicted_time, in + 0x10u, sizeof(predicted_time));
+        const std::array<float, 3> position {head_pos[0], head_pos[1], head_pos[2]};
+        const std::array<float, 4> orientation {quat[0], quat[1], quat[2], quat[3]};
+        if (!Hmd2TrackerPose::Write(
+                std::span<uint8_t>(out, Hmd2TrackerPose::kResultBytes), position,
+                orientation, predicted_time, handle == 1)) {
+            return ERROR_PARAMETER_NULL;
+        }
+        static std::atomic<uint32_t> full_logs {0};
+        if (full_logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+            LOGF("VrTracker2: complete desktop 6DoF pose handle=%d time=%" PRIu64
+                 " ipd=%.4f m\n", handle, predicted_time,
+                 Hmd2TrackerPose::kInterpupillaryDistance);
+        }
+        return OK;
+    }    std::memcpy(out + 0x60, head_pos, sizeof(head_pos));
     std::memcpy(out + 0x70, quat, sizeof(quat));
     std::memcpy(out + 0xb0, quat, sizeof(quat));
     std::memcpy(out + 0xf0, quat, sizeof(quat));

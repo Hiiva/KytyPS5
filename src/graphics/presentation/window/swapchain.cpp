@@ -21,6 +21,15 @@
 #include <limits>
 #include <memory>
 #include <vector>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
+// A private PNG writer used only for opt-in Vulkan framebuffer diagnostics.
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#define STBIWDEF static inline
+#include "stb_image_write.h"
 #include <vulkan/vk_platform.h>
 
 // IWYU pragma: no_include <intrin.h>
@@ -29,6 +38,44 @@ namespace Libs::Graphics {
 std::atomic_bool g_vr_eye_crop {true};
 
 
+namespace {
+constexpr uint64_t kPreviewSeriesStart = 220u;
+constexpr uint64_t kPreviewSeriesFrames = 75u;
+
+const std::vector<uint32_t>& PreviewImageSeries() {
+    static const std::vector<uint32_t> ids = [] {
+        std::vector<uint32_t> values;
+        const char* next = std::getenv("KYTY_VR_PREVIEW_IDS");
+        if (next == nullptr) {
+            return values;
+        }
+        while (*next != '\0' && values.size() < 24u) {
+            char* end = nullptr;
+            const auto id = std::strtoul(next, &end, 10);
+            if (end == next || id > 100000u) {
+                break;
+            }
+            values.push_back(static_cast<uint32_t>(id));
+            next = *end == ',' ? end + 1 : end;
+            if (*end == '\0') {
+                break;
+            }
+        }
+        return values;
+    }();
+    return ids;
+}
+
+size_t PreviewSeriesIndex(uint64_t frame) {
+    const auto& ids = PreviewImageSeries();
+    if (ids.empty() || frame < kPreviewSeriesStart) {
+        return 0;
+    }
+    return std::min(static_cast<size_t>((frame - kPreviewSeriesStart) /
+                                         kPreviewSeriesFrames),
+                    ids.size() - 1u);
+}
+} // namespace
 struct Presenter::Frame {
 	VulkanImage   image;
 	vk::ImageView view         = nullptr;
@@ -38,6 +85,7 @@ struct Presenter::Frame {
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);
+	void BlitStereo(CommandBuffer& command, Image& left, Image& right);
 	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
 };
 
@@ -247,6 +295,37 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
 }
 
+void Presenter::Frame::BlitStereo(CommandBuffer& command_buffer, Image& left, Image& right) {
+    // Opt-in diagnostic: assemble 2 native eye render targets into a
+    // side-by-side desktop image without lens distortion or timewarp.
+    command_buffer.EndRendering();
+    const auto command = command_buffer.Handle();
+    Transit(command, vk::ImageLayout::eTransferDstOptimal,
+            vk::AccessFlagBits2::eTransferWrite);
+    const std::array<Image*, 2> sources {&left, &right};
+    for (size_t eye = 0; eye < sources.size(); ++eye) {
+        auto& src = *sources[eye];
+        if (src.backing.layers != 1u || src.backing.extent.depth != 1u) {
+            EXIT("stereo preview source has unsupported layers or depth\n");
+        }
+        src.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                    vk::AccessFlagBits2::eTransferRead, {}, command);
+        vk::ImageBlit region {};
+        region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+        region.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+        region.srcOffsets[0] = {0, 0, 0};
+        region.srcOffsets[1] = {static_cast<int32_t>(src.backing.extent.width),
+                                static_cast<int32_t>(src.backing.extent.height), 1};
+        const auto width = static_cast<int32_t>(image.extent.width);
+        const auto height = static_cast<int32_t>(image.extent.height);
+        region.dstOffsets[0] = {static_cast<int32_t>(eye) * (width / 2), 0, 0};
+        region.dstOffsets[1] = {static_cast<int32_t>(eye + 1u) * (width / 2),
+                                height, 1};
+        command.blitImage(src.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+                          image.image, vk::ImageLayout::eTransferDstOptimal,
+                          1, &region, vk::Filter::eNearest);
+    }
+}
 void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
 	command_buffer.EndRendering();
 	auto command = command_buffer.Handle();
@@ -317,7 +396,7 @@ struct Presenter::Impl {
 		frames.SetFormat(swapchain.Format());
 	}
 
-	Image& ResolveSurface(const ImageInfo& info) {
+	Image& ResolveSurface(const ImageInfo& info, const ImageId* direct_source = nullptr) {
 		TextureCache::ImageDesc desc {};
 		desc.info                  = info;
 		desc.view_info.format      = info.pixel_format;
@@ -331,6 +410,19 @@ struct Presenter::Impl {
 		desc.type                  = TextureCache::BindingType::VideoOut;
 
 		auto&      cache      = renderer.GetTextureCache();
+		if (direct_source != nullptr) {
+			auto& image = cache.GetImage(*direct_source);
+			image.usage.video_out = true;
+			cache.UpdateImage(*direct_source);
+			return image;
+		}
+        if (std::getenv("KYTY_VR_DUMP_IMAGES") != nullptr) {
+            static bool reported = false;
+            if (!reported && window.loop.presented_frames.load(std::memory_order_relaxed) >= 450) {
+                reported = true;
+                cache.DumpReprojectionCandidates();
+            }
+        }
 		const auto image_id   = cache.FindImage(desc);
 		auto&      image      = cache.GetImage(image_id);
 		image.usage.video_out = true;
@@ -338,6 +430,7 @@ struct Presenter::Impl {
 		return image;
 	}
 	void Present();
+	void CaptureFrameIfRequested(Presenter::Frame* frame);
 
 	RenderContext&        renderer;
 	WindowContext&        window;
@@ -882,26 +975,121 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 Presenter::~Presenter() = default;
 
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
-	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(buffer.IsInvalid());
-	auto frame_format = info.pixel_format;
-	switch (frame_format) {
-		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
-		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
-		default: break;
-	}
-	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-	auto&             image = m_impl->ResolveSurface(info);
-	if (image.backing.format == vk::Format::eUndefined) {
-		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
-	}
-	frame->Configure(m_impl->window.graphic_ctx,
-	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
-	frame->CopyFrom(buffer, image);
-	return *frame;
-}
+    KYTY_PROFILER_FUNCTION();
+    EXIT_IF(buffer.IsInvalid());
+    // Wait for a free presentation frame before taking the renderer lock:
+    // frame acquisition can block on a GPU tick that needs the same mutex.
+    auto initial_format = info.pixel_format;
+    switch (initial_format) {
+        case vk::Format::eR8G8B8A8Srgb: initial_format = vk::Format::eR8G8B8A8Unorm; break;
+        case vk::Format::eB8G8R8A8Srgb: initial_format = vk::Format::eB8G8R8A8Unorm; break;
+        default: break;
+    }
+    auto* frame = m_impl->frames.Acquire(
+        {info.extent.width, info.extent.height}, initial_format);
+    Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+    // Native PS VR2 reprojection normally fills a 4000x2040 panel buffer.
+    // Without compositor hardware, allow an explicit desktop-only stereo
+    // blit of the guest's observed 2000x2040 RGBA8 eye surfaces.
+    if (Config::VrEnabled() && info.extent.width == 4000u &&
+        info.extent.height == 2040u) {
+        const char* stereo = std::getenv("KYTY_VR_STEREO_PREVIEW");
+        if (stereo != nullptr && stereo[0] == '1' && stereo[1] == '\0') {
+            auto& cache = m_impl->renderer.GetTextureCache();
+            ImageInfo left_info {}, right_info {};
+            ImageId left_id {}, right_id {};
+            const bool left_ok = cache.FindReprojectionCandidateByFormat(
+                56u, 0u, &left_info, &left_id, 2000u, 2040u);
+            const bool right_ok = cache.FindReprojectionCandidateByFormat(
+                56u, 1u, &right_info, &right_id, 2000u, 2040u);
+            if (left_ok && right_ok && left_id != right_id) {
+                auto& left = cache.GetImage(left_id);
+                auto& right = cache.GetImage(right_id);
+                left.usage.video_out = true;
+                right.usage.video_out = true;
+                cache.UpdateImage(left_id);
+                cache.UpdateImage(right_id);
+                frame->Configure(m_impl->window.graphic_ctx,
+                                 {4000u, 2040u}, initial_format);
+                frame->BlitStereo(buffer, left, right);
+                static std::atomic<uint32_t> logs {0};
+                if (logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+                    LOGF("Hmd2: diagnostic stereo eye mirror left=%016" PRIx64
+                         " right=%016" PRIx64 "\n",
+                         left_info.data.address, right_info.data.address);
+                }
+                return *frame;
+            }
+        }
+    }    ImageInfo source = info;
+    bool direct_source = false;
+    ImageId candidate_image_id {};
+    // Optional mono eye preview for desktops without PS VR2 hardware.
+    // The observed Horizon eye textures are RGBA8 2000x2040.
+    // This does not affect normal presentation without the environment flag.
+    if (Config::VrEnabled() && info.extent.width == 3328u &&
+        info.extent.height == 1664u) {
+        if (const char* eye = std::getenv("KYTY_VR_PREVIEW_EYE");
+            eye != nullptr && (eye[0] == '0' || eye[0] == '1') &&
+            eye[1] == '\0') {
+            direct_source = m_impl->renderer.GetTextureCache()
+                .FindReprojectionCandidateByFormat(
+                    56u, static_cast<uint32_t>(eye[0] - '0'),
+                    &source, &candidate_image_id, 2000u, 2040u);
+            static std::atomic<uint32_t> logs {0};
+            if (logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+                LOGF("Hmd2: mono eye preview eye=%c found=%d gpu=%016" PRIx64 "\n",
+                     eye[0], direct_source, source.data.address);
+            }
+        }
+    }
+    if (!direct_source && Config::VrEnabled() && info.extent.width == 3328 &&
+        info.extent.height == 1664) {
+        uint32_t series_id = 0u;
+        if (!PreviewImageSeries().empty()) {
+            series_id = PreviewImageSeries()[PreviewSeriesIndex(
+                m_impl->window.loop.presented_frames.load(std::memory_order_relaxed))];
+        }
+        if (const char* candidate = std::getenv("KYTY_VR_PREVIEW_ID");
+            series_id != 0u || (candidate != nullptr && candidate[0] != '\0')) {
+            const auto id = series_id != 0u ? series_id : std::strtoul(candidate, nullptr, 10);            if (id <= 100000u) {
+                                if (id >= 30000u && id < 40000u) {
+                    const auto packed = static_cast<uint32_t>(id - 30000u);
+                    direct_source = m_impl->renderer.GetTextureCache()
+                        .FindReprojectionCandidateByFormat(
+                            packed / 100u, packed % 100u, &source, &candidate_image_id);
+                } else {
+                    direct_source = m_impl->renderer.GetTextureCache()
+                        .FindReprojectionCandidate(static_cast<uint32_t>(id), &source,
+                                                  &candidate_image_id);
+                }
+                static std::atomic<uint32_t> logs {0};
+                if (logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+                    LOGF("Hmd2: preview candidate id=%lu found=%d address=%016" PRIx64
+                         " extent=%ux%u fmt=%u\n", id, direct_source,
+                         source.data.address, source.extent.width, source.extent.height,
+                         static_cast<uint32_t>(source.guest_format));
+                }
+            }
+        }
+    }
+    auto frame_format = source.pixel_format;
+    switch (frame_format) {
+        case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
+        case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
+        default: break;
+    }
 
+    auto& image = m_impl->ResolveSurface(source,
+                                         direct_source ? &candidate_image_id : nullptr);
+    if (image.backing.format == vk::Format::eUndefined) {
+        EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
+    }
+    frame->Configure(m_impl->window.graphic_ctx,
+                     {image.backing.extent.width, image.backing.extent.height}, frame_format);
+    frame->CopyFrom(buffer, image);
+    return *frame;
+}
 Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
                                                CommandBuffer* producer) {
 	KYTY_PROFILER_FUNCTION();
@@ -976,6 +1164,185 @@ void Presenter::ClearLayer(int bus) {
 	}
 }
 
+void Presenter::Impl::CaptureFrameIfRequested(Presenter::Frame* frame) {
+    const char* filename = std::getenv("KYTY_TEST_FRAME_CAPTURE");
+    if (filename == nullptr || filename[0] == '\0' || frame == nullptr) {
+        return;
+    }
+    const auto index = window.loop.presented_frames.load(std::memory_order_relaxed);
+    const auto& series = PreviewImageSeries();
+    static bool captured = false;
+    static int last_series_capture = -1;
+    std::string capture_path(filename);
+    if (!series.empty()) {
+        if (index < kPreviewSeriesStart + 40u) {
+            return;
+        }
+        const auto slot = PreviewSeriesIndex(index);
+        if (slot == static_cast<size_t>(last_series_capture) ||
+            index < kPreviewSeriesStart + slot * kPreviewSeriesFrames + 40u) {
+            return;
+        }
+        last_series_capture = static_cast<int>(slot);
+        const std::string suffix = "-id" + std::to_string(series[slot]);
+        const auto dot = capture_path.rfind(".png");
+        capture_path.insert(dot == std::string::npos ? capture_path.size() : dot, suffix);
+    } else if (const char* points = std::getenv("KYTY_TEST_CAPTURE_POINTS");
+               points != nullptr && points[0] != '\0') {
+        static const std::vector<uint64_t> thresholds = [] {
+            std::vector<uint64_t> values;
+            const char* next = std::getenv("KYTY_TEST_CAPTURE_POINTS");
+            while (next != nullptr && *next != '\0' && values.size() < 12u) {
+                char* end = nullptr;
+                const auto threshold = std::strtoull(next, &end, 10);
+                if (end == next || threshold < 1u || threshold > 100000u) {
+                    break;
+                }
+                values.push_back(threshold);
+                next = *end == ',' ? end + 1 : end;
+                if (*end == '\0') {
+                    break;
+                }
+            }
+            return values;
+        }();
+        static size_t capture_index = 0;
+        if (capture_index >= thresholds.size() ||
+            index < thresholds[capture_index]) {
+            return;
+        }
+        const std::string suffix = "-f" + std::to_string(thresholds[capture_index]);
+        const auto dot = capture_path.rfind(".png");
+        capture_path.insert(dot == std::string::npos ? capture_path.size() : dot,
+                            suffix);
+        ++capture_index;
+    } else {
+        if (captured) {
+            return;
+        }
+        uint64_t threshold = 600u;
+        if (const char* requested = std::getenv("KYTY_TEST_CAPTURE_AFTER_FRAMES");
+            requested != nullptr && requested[0] != '\0') {
+            const auto number = std::strtoull(requested, nullptr, 10);
+            if (number >= 1u && number <= 100000u) {
+                threshold = number;
+            }
+        }
+        if (index < threshold) {
+            return;
+        }
+        captured = true;
+    }
+
+    // One synchronous GPU readback per selected VR diagnostic source.
+    const auto width = frame->image.extent.width;
+    const auto height = frame->image.extent.height;
+    if (width == 0 || height == 0 || width > 8192 || height > 8192 ||
+        frame->image.layers != 1 ||
+        !(frame->image.usage & vk::ImageUsageFlagBits::eTransferSrc)) {
+        LOGF("Hidden frame capture: unsuitable source extent=%ux%u\n", width, height);
+        return;
+    }
+    const uint64_t bytes = static_cast<uint64_t>(width) * height * 4u;
+    if (bytes > 256u * 1024u * 1024u) {
+        return;
+    }
+    auto& graphics = window.graphic_ctx;
+    VkBufferCreateInfo buffer_info {};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = bytes;
+    buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo allocation_info {};
+    allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+    allocation_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    VkBuffer native_buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation = nullptr;
+    if (vmaCreateBuffer(graphics.allocator, &buffer_info, &allocation_info,
+                        &native_buffer, &allocation, nullptr) != VK_SUCCESS) {
+        LOGF("Hidden frame capture: failed to allocate staging buffer\n");
+        return;
+    }
+    const vk::Buffer buffer = native_buffer;
+
+    auto& command_buffer = present_scheduler.BeginCommand();
+    const auto command = command_buffer.Handle();
+    frame->Transit(command, vk::ImageLayout::eTransferSrcOptimal,
+                   vk::AccessFlagBits2::eTransferRead);
+    vk::BufferImageCopy copy {};
+    copy.bufferOffset = 0;
+    copy.bufferRowLength = 0;
+    copy.bufferImageHeight = 0;
+    copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+    copy.imageOffset = {0, 0, 0};
+    copy.imageExtent = {width, height, 1};
+    command.copyImageToBuffer(frame->image.image,
+                              vk::ImageLayout::eTransferSrcOptimal,
+                              buffer, 1, &copy);
+
+    vk::BufferMemoryBarrier2 barrier {};
+    barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+    barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+    barrier.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+    barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+    barrier.buffer = buffer;
+    barrier.offset = 0;
+    barrier.size = bytes;
+    vk::DependencyInfo dependency {};
+    dependency.bufferMemoryBarrierCount = 1;
+    dependency.pBufferMemoryBarriers = &barrier;
+    command.pipelineBarrier2(dependency);
+
+    const auto tick = present_scheduler.Submit();
+    present_scheduler.Wait(tick);
+
+    void* mapped = nullptr;
+    const auto map_result = vmaMapMemory(graphics.allocator, allocation, &mapped);
+    if (map_result == VK_SUCCESS && mapped != nullptr) {
+        vmaInvalidateAllocation(graphics.allocator, allocation, 0, VK_WHOLE_SIZE);
+        std::vector<uint8_t> rgba(static_cast<size_t>(bytes));
+        const auto* raw = static_cast<const uint8_t*>(mapped);
+        const auto fmt = frame->image.format;
+        if (fmt == vk::Format::eA2B10G10R10UnormPack32 ||
+            fmt == vk::Format::eA2R10G10B10UnormPack32) {
+            for (size_t i = 0; i < rgba.size(); i += 4) {
+                uint32_t word = 0;
+                std::memcpy(&word, raw + i, 4);
+                const uint32_t lo = (word & 0x3ffu) * 255u / 1023u;
+                const uint32_t mid = ((word >> 10u) & 0x3ffu) * 255u / 1023u;
+                const uint32_t hi = ((word >> 20u) & 0x3ffu) * 255u / 1023u;
+                rgba[i] = static_cast<uint8_t>(
+                    fmt == vk::Format::eA2B10G10R10UnormPack32 ? lo : hi);
+                rgba[i + 1] = static_cast<uint8_t>(mid);
+                rgba[i + 2] = static_cast<uint8_t>(
+                    fmt == vk::Format::eA2B10G10R10UnormPack32 ? hi : lo);
+                rgba[i + 3] = 255;
+            }
+        } else if (fmt == vk::Format::eB8G8R8A8Unorm ||
+                   fmt == vk::Format::eB8G8R8A8Srgb) {
+            for (size_t i = 0; i < rgba.size(); i += 4) {
+                rgba[i] = raw[i + 2];
+                rgba[i + 1] = raw[i + 1];
+                rgba[i + 2] = raw[i];
+                rgba[i + 3] = raw[i + 3];
+            }
+        } else {
+            std::memcpy(rgba.data(), raw, rgba.size());
+        }
+        const int ok = stbi_write_png(capture_path.c_str(), static_cast<int>(width),
+                                      static_cast<int>(height), 4, rgba.data(),
+                                      static_cast<int>(width * 4u));
+        LOGF("Hidden frame capture: file=%s extent=%ux%u format=%d success=%d frame=%" PRIu64 " host_ms=%" PRIu64 "\n",
+             capture_path.c_str(), width, height, static_cast<int>(fmt), ok,
+             index, static_cast<uint64_t>(SDL_GetTicks()));
+        vmaUnmapMemory(graphics.allocator, allocation);
+    } else {
+        LOGF("Hidden frame capture: could not map host buffer\n");
+    }
+    vmaDestroyBuffer(graphics.allocator, native_buffer, allocation);
+}
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
 
@@ -998,6 +1365,7 @@ void Presenter::Impl::Present() {
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);
 			const auto tick = swapchain.Submit(present_scheduler);
+			CaptureFrameIfRequested(layers[0].frame);
 			for (const auto& layer: layers) {
 				if (layer.frame != nullptr) {
 					layer.frame->present_tick = tick;

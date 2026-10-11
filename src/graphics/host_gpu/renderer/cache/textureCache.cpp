@@ -476,6 +476,74 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	return id;
 }
 
+bool TextureCache::FindReprojectionCandidate(uint32_t index, ImageInfo* output, ImageId* selected) const {
+    if (output == nullptr) {
+        return false;
+    }
+    bool found = false;
+    m_slot_images.ForEach([&](ImageId id, const Image& image) {
+        if (id.index != index || !image.registered || image.info.IsDepth()) {
+            return;
+        }
+        if (image.info.extent.width < 128u || image.info.extent.height < 128u) {
+            return;
+        }
+        *output = image.info;
+        if (selected != nullptr) {
+            *selected = id;
+        }
+        found = true;
+    });
+    return found;
+}
+bool TextureCache::FindReprojectionCandidateByFormat(uint32_t guest_format,
+                                                     uint32_t ordinal,
+                                                     ImageInfo* output, ImageId* selected, uint32_t width, uint32_t height) const {
+    if (output == nullptr || width == 0 || height == 0) {
+        return false;
+    }
+    uint32_t matched = 0;
+    bool found = false;
+    m_slot_images.ForEach([&](ImageId id, const Image& image) {
+        const auto& info = image.info;
+        if (found || !image.registered || info.IsDepth() ||
+            info.extent.width != width || info.extent.height != height ||
+            static_cast<uint32_t>(info.guest_format) != guest_format) {
+            return;
+        }
+        if (matched++ == ordinal) {
+            *output = info;
+            if (selected != nullptr) {
+                *selected = id;
+            }
+            found = true;
+        }
+    });
+    return found;
+}
+void TextureCache::DumpReprojectionCandidates() const {
+    uint32_t candidates = 0;
+    m_slot_images.ForEach([&](ImageId id, const Image& image) {
+        const auto& info = image.info;
+        if (!image.registered || info.extent.width < 960u ||
+            info.extent.height < 800u || info.IsDepth() ||
+            candidates >= 100u) {
+            return;
+        }
+        ++candidates;
+        LOGF("Hmd2 texture candidate id=%u gpu=%016" PRIx64
+             " extent=%ux%u format=%u host=%u tile=%u levels=%u"
+             " layers=%u bytes=%" PRIu64 " dirty=%d\n",
+             id.index, info.data.address,
+             info.extent.width, info.extent.height,
+             static_cast<uint32_t>(info.guest_format),
+             static_cast<uint32_t>(info.pixel_format),
+             static_cast<uint32_t>(info.tile_mode),
+             info.resources.levels, info.resources.layers,
+             info.data.size, image.IsCpuDirty());
+    });
+    LOGF("Hmd2: texture cache candidate count=%u\n", candidates);
+}
 void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
 	ImageOps::Validate(desc.info);
 	if (desc.view_info.format == vk::Format::eUndefined || desc.view_info.level_count == 0 ||

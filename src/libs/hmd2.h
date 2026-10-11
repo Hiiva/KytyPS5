@@ -17,6 +17,17 @@ struct ReprojectionState {
 	std::atomic<uint32_t> timing_us {3000};
 };
 
+struct ReprojectionPreviewSource {
+    uint64_t address = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t format = 0;
+    uint32_t tile_mode = 0;
+};
+
+// Experimental desktop mirror of the reprojection source image, not the
+// panel surface. Populated only with KYTY_VR_MIRROR_SOURCE=1.
+[[nodiscard]] bool GetReprojectionPreviewSource(ReprojectionPreviewSource* source);
 [[nodiscard]] ReprojectionState* GetReprojectionState();
 
 } // namespace Libs::Hmd2

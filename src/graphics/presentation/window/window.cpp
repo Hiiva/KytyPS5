@@ -843,6 +843,11 @@ static void WindowCreate(WindowContext& context) {
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
 	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+    // Diagnostics can run the Vulkan presentation path without showing a
+    // window or taking keyboard/mouse focus from the host desktop.
+    if (std::getenv("KYTY_TEST_HIDDEN_WINDOW") != nullptr) {
+        flags |= static_cast<uint32_t>(SDL_WINDOW_HIDDEN);
+    }
 	if (fullscreen) {
 		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN);
 	}
