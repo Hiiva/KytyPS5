@@ -1552,6 +1552,21 @@ int KYTY_SYSV_ABI PadVrControllerGetDeviceInformation(int handle, void* info) {
     }
     return OK;
 }
+int KYTY_SYSV_ABI PadVrControllerSetTriggerEffects(int handle, const void* effects) {
+    if (!VirtualPadIsOpen(handle)) {
+        return PAD_ERROR_INVALID_HANDLE;
+    }
+    if (effects == nullptr) {
+        return PAD_ERROR_INVALID_ARG;
+    }
+    // A desktop's virtual Sense controllers have no adaptive trigger hardware.
+    // Accept the requested effect without writing into the guest parameter.
+    static std::atomic<uint32_t> logs {0};
+    if (logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+        LOGF("PadVR: trigger effect accepted for virtual handle=%d\n", handle);
+    }
+    return OK;
+}
 int KYTY_SYSV_ABI PadVrControllerGetTriggerEffectState(int handle, int trigger, uint32_t* out) {
     if (!VirtualPadIsOpen(handle)) {
         return PAD_ERROR_INVALID_HANDLE;

@@ -97,6 +97,7 @@ int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index);
 int KYTY_SYSV_ABI PadVrControllerReadState(int handle, void* state);
 int KYTY_SYSV_ABI PadVrControllerGetDeviceInformation(int handle, void* info);
 int KYTY_SYSV_ABI PadVrControllerGetTriggerEffectState(int handle, int trigger, uint32_t* state);
+int KYTY_SYSV_ABI PadVrControllerSetTriggerEffects(int handle, const void* effects);
 int KYTY_SYSV_ABI PadClose(int handle);
 int KYTY_SYSV_ABI PadSetMotionSensorState(int handle, bool enable);
 int KYTY_SYSV_ABI PadSetAngularVelocityDeadbandState(int handle, bool enable);

@@ -1,4 +1,5 @@
 #include "kernel/fileSystem.h"
+#include "kernel/horizonCookedPaths.h"
 
 #include "common/archive.h"
 #include "common/assert.h"
@@ -19,6 +20,7 @@
 #include <atomic>
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <random>
@@ -338,13 +340,25 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 	Common::LockGuard lock(m_mutex);
 
 	// Match the entire guest path so a mount root works with or without a trailing slash.
-	const auto mounted_path = Common::FixDirectorySlash(mounted_name);
+	auto resolved_name = Common::FixFilenameSlash(mounted_name);
+    if (const char* enabled = std::getenv("KYTY_HORIZON_REMAP_MOVIES");
+        enabled != nullptr && enabled[0] == '1' && enabled[1] == '\0') {
+        if (auto remapped = ResolveHorizonCookedMoviePath(resolved_name)) {
+            static std::atomic<uint32_t> remap_logs {0};
+            if (remap_logs.fetch_add(1u, std::memory_order_relaxed) < 6u) {
+                ::printf("FileSystem: Horizon cooked movie path remap: %s -> %s\n",
+                         resolved_name.c_str(), remapped->c_str());
+            }
+            resolved_name = std::move(*remapped);
+        }
+    }
+    const auto mounted_path = Common::FixDirectorySlash(resolved_name);
 	const auto it           = std::find_if(
 	    m_mount_pairs.begin(), m_mount_pairs.end(),
 	    [&mounted_path](const MountPair& p) { return mounted_path.starts_with(p.point); });
 	if (it != m_mount_pairs.end()) {
 		const auto& p = *it;
-		auto rel_path = Common::RemoveFirst(Common::FixFilenameSlash(mounted_name), p.point.size());
+		auto rel_path = Common::RemoveFirst(resolved_name, p.point.size());
 		while (rel_path.starts_with('/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
