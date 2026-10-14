@@ -798,6 +798,20 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
 		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
 		rendering.color_formats[slot] = colors[i].desc.view_info.format;
+		if (ps_active && slot < std::size(ps_input_info->target_output_mode)) {
+			const bool uint_output = ps_input_info->target_output_mode[slot] == 7u;
+			const auto format = rendering.color_formats[slot];
+			const bool uint_attachment = format == vk::Format::eR8Uint;
+			if (uint_attachment && !uint_output) {
+				static std::atomic_uint mismatch_count = 0;
+				if (mismatch_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("Pipeline MRT type mismatch: ps=%" PRIu64
+					     " slot=%u output_mode=%u format=%s color_mask=0x%x\n",
+					     ps_id, slot, ps_input_info->target_output_mode[slot],
+					     vk::to_string(format).c_str(), static_params.color_mask[slot]);
+				}
+			}
+		}
 		if (attachment_samples == 0) {
 			attachment_samples = colors[i].desc.info.samples;
 		} else if (attachment_samples != colors[i].desc.info.samples) {
