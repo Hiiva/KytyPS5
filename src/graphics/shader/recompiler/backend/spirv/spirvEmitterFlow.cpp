@@ -520,7 +520,12 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (state.program.stage != ShaderType::Mesh && variable == 0) {
 			return;
 		}
-		const bool uint_output = MrtOutputMode(state, exp) == 7u;
+			const bool uint_output = MrtOutputMode(state, exp) == 7u;
+			const bool convert_uint =
+			    !uint_output && state.program.stage == ShaderType::Pixel &&
+			    exp.kind == IR::ExportTargetKind::Mrt &&
+			    exp.index < std::size(state.input_info.pixel->target_uint_output) &&
+			    state.input_info.pixel->target_uint_output[exp.index] != 0;
 		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output);
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
@@ -572,13 +577,32 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    state.input_info.vertex->clip_space.enabled) {
 			value = ConvertPositionToClipSpace(state, value);
 		}
-		if (state.program.stage == ShaderType::Mesh) {
+			if (state.program.stage == ShaderType::Mesh) {
 			const auto kind = exp.kind == IR::ExportTargetKind::Position
 			                      ? IR::StageOutputKind::Position
 			                      : IR::StageOutputKind::Parameter;
-			state.builder.AddFunction(spv::OpStore, MeshOutputPointer(state, kind, exp.index),
-			                          value);
-		} else if (exp.kind == IR::ExportTargetKind::Position) {
+				state.builder.AddFunction(spv::OpStore, MeshOutputPointer(state, kind, exp.index),
+				                          value);
+			} else if (convert_uint) {
+				// The guest's float export is converted by its integer color target.
+				// Vulkan instead requires an integer-typed fragment output.
+				const auto zero = state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 4));
+				const auto max_component = ConstantF32Value(state, 255.0f);
+				const auto max_vector = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4),
+				                          max_vector, max_component, max_component, max_component,
+				                          max_component);
+				const auto clamped = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 4), clamped,
+				                          GlslStd450(state), GLSLstd450FClamp, value, zero, max_vector);
+				const auto rounded = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 4), rounded,
+				                          GlslStd450(state), GLSLstd450RoundEven, clamped);
+				const auto converted = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpConvertFToU, TypeU32Vector(state, 4), converted,
+				                          rounded);
+				state.builder.AddFunction(spv::OpStore, variable, converted);
+			} else if (exp.kind == IR::ExportTargetKind::Position) {
 			if (state.invalid_position_clip_distance != UINT32_MAX) {
 				const auto zero = state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 4));
 				const auto equal = state.builder.AllocateId();

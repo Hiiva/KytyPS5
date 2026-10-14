@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -716,6 +717,23 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				pixel_info.target_export_mapping[1] = {};
 			}
 		}
+		for (uint32_t export_index = 0; export_index < std::size(pixel_info.target_uint_output);
+		     export_index++) {
+			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
+			if (slot >= RENDER_COLOR_ATTACHMENTS_MAX ||
+			    pixel_info.target_output_mode[export_index] == 7u ||
+			    pixel_info.dual_source_blending ||
+			    pixel_info.alpha_blend_source != ShaderAlphaBlendSource::None) {
+				continue;
+			}
+			const auto& rt = context.GetRenderTarget(slot);
+			if (rt.base.addr == 0) {
+				continue;
+			}
+			const auto format = TextureGetRenderTargetFormat(
+			    rt.info.format, rt.info.channel_type, rt.info.channel_order).format;
+			pixel_info.target_uint_output[export_index] = format == vk::Format::eR8Uint;
+		}
 	}
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
@@ -805,8 +823,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			if (uint_attachment && !uint_output) {
 				static std::atomic_uint mismatch_count = 0;
 				if (mismatch_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-					LOGF("Pipeline MRT type mismatch: ps=%" PRIu64
+					LOGF("Pipeline MRT float-to-uint %s: ps=%" PRIu64
 					     " slot=%u output_mode=%u format=%s color_mask=0x%x\n",
+					     ps_input_info->target_uint_output[slot] ? "conversion" : "mismatch",
 					     ps_id, slot, ps_input_info->target_output_mode[slot],
 					     vk::to_string(format).c_str(), static_params.color_mask[slot]);
 				}
