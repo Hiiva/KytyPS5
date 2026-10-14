@@ -201,6 +201,22 @@ static float g_virtual_hand_reach[2] = {0.45f, 0.45f};
 static float g_virtual_hand_aim_yaw[2] = {-0.15f, 0.15f};
 static float g_virtual_hand_aim_pitch[2] = {0.14f, 0.14f};
 
+// Fixed initial ray directions are useful for headset-free wizard navigation.
+// Mouse aim still applies normally after this initial pose has been chosen.
+static float VirtualHandAimOverride(const char* name, float fallback, float minimum, float maximum) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const float parsed = std::strtof(value, &end);
+    if (end == value || *end != '\0' || !std::isfinite(parsed) ||
+        parsed < minimum || parsed > maximum) {
+        return fallback;
+    }
+    return parsed;
+}
+
 void VirtualHeadMouseMotion(float dx, float dy) {
     if (!Config::VrEnabled()) {
         return;
@@ -246,10 +262,14 @@ void VirtualHeadResetPose() {
     g_virtual_head_updated_us = 0u;
     g_virtual_hand_reach[0] = 0.45f;
     g_virtual_hand_reach[1] = 0.45f;
-    g_virtual_hand_aim_yaw[0] = -0.15f;
-    g_virtual_hand_aim_yaw[1] = 0.15f;
-    g_virtual_hand_aim_pitch[0] = 0.14f;
-    g_virtual_hand_aim_pitch[1] = 0.14f;
+    g_virtual_hand_aim_yaw[0] = VirtualHandAimOverride(
+        "KYTY_VR_LEFT_AIM_YAW", -0.15f, -1.25f, 1.25f);
+    g_virtual_hand_aim_yaw[1] = VirtualHandAimOverride(
+        "KYTY_VR_RIGHT_AIM_YAW", 0.15f, -1.25f, 1.25f);
+    g_virtual_hand_aim_pitch[0] = VirtualHandAimOverride(
+        "KYTY_VR_LEFT_AIM_PITCH", 0.14f, -1.0f, 1.0f);
+    g_virtual_hand_aim_pitch[1] = VirtualHandAimOverride(
+        "KYTY_VR_RIGHT_AIM_PITCH", 0.14f, -1.0f, 1.0f);
     LOGF("Virtual PS VR2: headset orientation recentered\n");
 }
 
@@ -312,6 +332,19 @@ void VirtualHandGetPose(int side, float position[3], float orientation[4]) {
     if (side < 0 || side > 1 || position == nullptr || orientation == nullptr) {
         return;
     }
+    static const bool initial_aim = [] {
+        Common::LockGuard lock(g_virtual_head_mutex);
+        g_virtual_hand_aim_yaw[0] = VirtualHandAimOverride(
+            "KYTY_VR_LEFT_AIM_YAW", -0.15f, -1.25f, 1.25f);
+        g_virtual_hand_aim_yaw[1] = VirtualHandAimOverride(
+            "KYTY_VR_RIGHT_AIM_YAW", 0.15f, -1.25f, 1.25f);
+        g_virtual_hand_aim_pitch[0] = VirtualHandAimOverride(
+            "KYTY_VR_LEFT_AIM_PITCH", 0.14f, -1.0f, 1.0f);
+        g_virtual_hand_aim_pitch[1] = VirtualHandAimOverride(
+            "KYTY_VR_RIGHT_AIM_PITCH", 0.14f, -1.0f, 1.0f);
+        return true;
+    }();
+    (void)initial_aim;
     VirtualHeadGetPose(position, orientation);
     float reach = 0.45f;
     float aim_yaw = 0.0f;
