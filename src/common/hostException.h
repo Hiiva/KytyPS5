@@ -33,11 +33,17 @@ struct ExceptionInfo {
 	uint32_t            native_code            = 0;
 	// Platform-specific mutable context, valid only for the duration of the handler call.
 	void* native_context = nullptr;
+	void* native_exception_record = nullptr;
 };
 
 using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
+
+// Optional Windows capture, enabled at InstallHandler by KYTY_CRASH_DUMP_PREFIX.
+// Call after recovery rejects a fault, before logging or accessing guest TLS.
+// Copies the native context and waits at most three seconds for its dump worker.
+void CaptureFatalException(const ExceptionInfo& info) noexcept;
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();

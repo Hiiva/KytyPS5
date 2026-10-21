@@ -58,6 +58,14 @@ void UnregisterGuestInstructionPatchModule(void* module_ptr);
 
 // Opt-in diagnostic for the verified PPSA05666 eboot only. The loader installs
 // before guest execution; the guest hook records without calling host code.
+// On Windows, KYTY_HORIZON_KISMET_TRACE_FILE optionally names a new file in an
+// existing directory. CREATE_NEW preserves older captures; any file error rejects
+// installation. Without a path, trace storage remains in memory only.
+// File layout 1 is little-endian: u32 reservation count@0, records@8, 2048 slots
+// of 64 bytes (131080 bytes total). Each slot has u32 committed@0, entry@4,
+// script_num@8, reserved@12; u64 object@16, node@24, frame@32, script@40, code@48,
+// native_frame@56. Read a slot only when committed == its zero-based index + 1;
+// a process crash can leave an uncommitted gap before later completed slots.
 bool HorizonKismetTraceEnabled();
 bool InstallHorizonKismetTrace(uint64_t module_addr, uint64_t module_size);
 // Call from a periodic host frame path. A disabled trace only checks an atomic.

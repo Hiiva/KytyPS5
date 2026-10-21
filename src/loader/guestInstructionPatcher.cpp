@@ -27,6 +27,13 @@
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #ifdef min
 #undef min
 #endif
@@ -143,8 +150,104 @@ struct HorizonKismetTraceBuffer {
 	std::atomic<u32>                                      reserved {0};
 	std::array<HorizonKismetTraceRecord, HorizonTraceCapacity> records {};
 };
+static_assert(offsetof(HorizonKismetTraceBuffer, reserved) == 0);
+static_assert(offsetof(HorizonKismetTraceBuffer, records) == 8);
+static_assert(sizeof(HorizonKismetTraceBuffer) == 8 + HorizonTraceCapacity * 64);
 
-static std::unique_ptr<HorizonKismetTraceBuffer> g_horizon_trace_buffer;
+// A file-backed section retains completed guest writes after process termination,
+// independently of the periodic logger and exception handling. No guest-path flush
+// is needed for process-crash readback; this is not a power-loss durability journal.
+class HorizonKismetTraceStorage {
+public:
+	HorizonKismetTraceStorage() = default;
+	HorizonKismetTraceStorage(const HorizonKismetTraceStorage&) = delete;
+	HorizonKismetTraceStorage& operator=(const HorizonKismetTraceStorage&) = delete;
+
+	~HorizonKismetTraceStorage() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (view != nullptr) {
+			std::destroy_at(buffer);
+			FlushViewOfFile(view, sizeof(HorizonKismetTraceBuffer));
+			UnmapViewOfFile(view);
+		}
+		if (mapping != nullptr) CloseHandle(mapping);
+		if (file != INVALID_HANDLE_VALUE) {
+			FlushFileBuffers(file);
+			CloseHandle(file);
+		}
+#endif
+	}
+
+	bool Initialize(const char*& operation, u32& system_error) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		constexpr auto variable = L"KYTY_HORIZON_KISMET_TRACE_FILE";
+		SetLastError(ERROR_SUCCESS);
+		const DWORD length = GetEnvironmentVariableW(variable, nullptr, 0);
+		if (length != 0) {
+			std::vector<wchar_t> path(length);
+			const DWORD written = GetEnvironmentVariableW(variable, path.data(), length);
+			if (written == 0 || written >= length) {
+				operation = "GetEnvironmentVariableW(trace file path changed)";
+				system_error = written >= length ? ERROR_INSUFFICIENT_BUFFER : GetLastError();
+				return false;
+			}
+			file = CreateFileW(path.data(), GENERIC_READ | GENERIC_WRITE,
+			                   FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_NEW,
+			                   FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (file == INVALID_HANDLE_VALUE) {
+				operation = "CreateFileW(CREATE_NEW)";
+				system_error = GetLastError();
+				return false;
+			}
+			mapping = CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0,
+			                             static_cast<DWORD>(sizeof(HorizonKismetTraceBuffer)), nullptr);
+			if (mapping == nullptr) {
+				operation = "CreateFileMappingW";
+				system_error = GetLastError();
+				return false;
+			}
+			view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(HorizonKismetTraceBuffer));
+			if (view == nullptr) {
+				operation = "MapViewOfFile";
+				system_error = GetLastError();
+				return false;
+			}
+			buffer = new (view) HorizonKismetTraceBuffer {};
+			return true;
+		}
+		const DWORD error = GetLastError();
+		if (error != ERROR_SUCCESS && error != ERROR_ENVVAR_NOT_FOUND) {
+			operation = "GetEnvironmentVariableW";
+			system_error = error;
+			return false;
+		}
+#endif
+		heap = std::make_unique<HorizonKismetTraceBuffer>();
+		buffer = heap.get();
+		return true;
+	}
+
+	bool IsFileBacked() const {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		return view != nullptr;
+#else
+		return false;
+#endif
+	}
+
+	HorizonKismetTraceBuffer* buffer = nullptr;
+
+private:
+	std::unique_ptr<HorizonKismetTraceBuffer> heap;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	HANDLE file    = INVALID_HANDLE_VALUE;
+	HANDLE mapping = nullptr;
+	void*  view    = nullptr;
+#endif
+};
+
+static std::unique_ptr<HorizonKismetTraceStorage> g_horizon_trace_storage;
+static HorizonKismetTraceBuffer*                 g_horizon_trace_buffer = nullptr;
 static std::atomic_bool                          g_horizon_trace_active {false};
 static std::mutex                               g_horizon_trace_drain_mutex;
 static u64                                      g_horizon_trace_module = 0;
@@ -178,12 +281,12 @@ void GenerateHorizonKismetTrace(Xbyak::CodeGenerator& generator,
 	generator.jz(done, Xbyak::CodeGenerator::T_NEAR);
 	// Both verified graphs start PushExecutionFlow(Num-3), ComputedJump:
 	// movement 4c 24 37 00 00 4e; calibration 4c 9e 60 00 00 4e.
-	generator.cmp(byte[r9], 0x4c);
+	generator.cmp(Xbyak::util::byte[r9], 0x4c);
 	generator.jne(done, Xbyak::CodeGenerator::T_NEAR);
 	generator.lea(ecx, ptr[rdx - 3]);
 	generator.cmp(dword[r9 + 1], ecx);
 	generator.jne(done, Xbyak::CodeGenerator::T_NEAR);
-	generator.cmp(byte[r9 + 5], 0x4e);
+	generator.cmp(Xbyak::util::byte[r9 + 5], 0x4e);
 	generator.jne(done, Xbyak::CodeGenerator::T_NEAR);
 	generator.mov(esi, dword[rbp - 0x6c]);
 	generator.cmp(esi, edx); // Unsigned comparison also rejects negative entries.
@@ -1897,7 +2000,16 @@ bool InstallHorizonKismetTrace(uint64_t module_addr, uint64_t module_size) {
 		return reject("eboot computed-jump signature mismatch");
 	}
 
-	auto buffer = std::make_unique<HorizonKismetTraceBuffer>();
+	auto storage = std::make_unique<HorizonKismetTraceStorage>();
+	const char* storage_operation = "unknown";
+	u32 storage_error = 0;
+	if (!storage->Initialize(storage_operation, storage_error)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Horizon Kismet trace not installed: file storage {} failed (Windows error {})\n",
+		    storage_operation, storage_error));
+		return false;
+	}
+	auto* buffer = storage->buffer;
 	auto& generator = module->trampoline_gen;
 	const size_t begin = generator.getSize();
 	const auto trampoline = reinterpret_cast<u64>(generator.getCode()) + begin;
@@ -1907,7 +2019,7 @@ bool InstallHorizonKismetTrace(uint64_t module_addr, uint64_t module_size) {
 		return reject("instruction trampoline is outside rel32 range");
 	}
 	Xbyak::ClearError();
-	GenerateHorizonKismetTrace(generator, buffer.get(), reinterpret_cast<const void*>(continuation));
+	GenerateHorizonKismetTrace(generator, buffer, reinterpret_cast<const void*>(continuation));
 	const auto rollback = [&] {
 		generator.reset();
 		generator.setSize(begin);
@@ -1932,16 +2044,18 @@ bool InstallHorizonKismetTrace(uint64_t module_addr, uint64_t module_size) {
 		rollback();
 		return reject("could not finalize the hook; original bytes restored");
 	}
-	g_horizon_trace_buffer = std::move(buffer);
+	g_horizon_trace_buffer = buffer;
+	g_horizon_trace_storage = std::move(storage);
 	g_horizon_trace_module = module_addr;
 	g_horizon_trace_active.store(true, std::memory_order_release);
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Horizon Kismet trace installed: hook=0x{:016x} trampoline=0x{:016x} bytes={} "
 	    "counter=0x{:016x} records=0x{:016x} capacity={} record_size=64 layout=1 "
-	    "script_nums=14119,24737\n",
+	    "file_backed={} file_size={} records_offset=8 script_nums=14119,24737\n",
 	    reinterpret_cast<u64>(hook), trampoline, trampoline_size,
 	    reinterpret_cast<u64>(&g_horizon_trace_buffer->reserved),
-	    reinterpret_cast<u64>(g_horizon_trace_buffer->records.data()), HorizonTraceCapacity));
+	    reinterpret_cast<u64>(g_horizon_trace_buffer->records.data()), HorizonTraceCapacity,
+	    g_horizon_trace_storage->IsFileBacked(), sizeof(HorizonKismetTraceBuffer)));
 	return true;
 }
 
