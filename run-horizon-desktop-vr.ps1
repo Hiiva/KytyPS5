@@ -36,16 +36,21 @@ if ($GuestMemoryMB -lt 2048 -or $GuestMemoryMB -gt 13824) {
 
 $env:KYTY_GUEST_BACKING_MB = [string]$GuestMemoryMB
 
-Write-Host "Horizon Call of the Mountain - virtual PS VR2 desktop mode"
+Write-Host "Horizon Call of the Mountain - experimental virtual PS VR2 desktop mode"
+Write-Host "Gameplay, including climbing and bow use, is not verified; loading/rendering work continues."
+Write-Host "Default keyboard/mouse controls:"
 Write-Host "F6: toggle cropped left-eye/full-panel desktop mirror"
 Write-Host "F7: mouse controls right stick"
 Write-Host "F8: capture/release mouse for headset look"
-Write-Host "F9: recenter virtual headset orientation"
-Write-Host "F10: aim virtual right Sense with mouse (Shift+F10 for left)"
-Write-Host "WASD: left stick; TFGH: right stick; JIKL: face buttons"
-Write-Host "Left click: right trigger; right click: right grip; middle click: left trigger"
-Write-Host "Mouse wheel: change right-hand reach; Shift+wheel: left-hand reach"
-Write-Host "Q/E: left/right grip; Z/C: left/right trigger; Enter: options"
+Write-Host "F9: recenter headset and reset both hand positions, reach and wrist aim"
+Write-Host "F2/F3: toggle left/right hand position control (mouse XY; wheel depth)"
+Write-Host "F5/F10: toggle left/right wrist aim with the mouse (Shift+F10 also selects left)"
+Write-Host "Positioned hands stay in place when you turn your head or release mouse control; F9 resets them."
+Write-Host "Wheel: selected hand depth/reach; right hand if none selected. Shift+wheel: left (Shift is also L3)."
+Write-Host "WASD: left stick; TFGH: right stick; JIKL: face buttons; Enter: options"
+Write-Host "Horizon primary grip/trigger: Z or middle click = left L2; C or left click = right R2"
+Write-Host "Q/E (L1/R1), or right click (R1): alternate grip/standing jump, depending on game context"
+Write-Host "Custom bindings replace game-input defaults; bindings assigned to F2/F3/F5 take priority."
 Write-Host "Physical gamepads are also supported through the normal KytyPS5 mappings."
 
 & $exe --game $GameDir --vr --skip-notice-screen true --screen-width $Width --screen-height $Height
