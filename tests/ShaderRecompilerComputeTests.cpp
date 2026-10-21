@@ -26251,6 +26251,98 @@ TestCase VectorDppBoundsControlZeroPreservesDestination() {
   return test;
 }
 
+// Selector-only observation of the current clamp path against AMD's DX10
+// NaN-to-zero contract. DX10_CLAMP/IEEE are not represented by CompileOptions;
+// this probe does not assert the mode of any live game draw or join AllCases.
+int ProbeVectorF32ClampDx10Contract(VulkanHarness *vulkan) {
+  using O = ShaderOpcode;
+  struct Sample {
+    const char *name;
+    u32 a, b, c, finite_result, dx10_result;
+    bool nan_result;
+  };
+  constexpr std::array<Sample, 7> samples{{
+      {"qnan-product", 0x7fc12345u, 0x3f800000u, 0x3e800000u, 0u, 0u, true},
+      {"snan-product", 0x7fa12345u, 0x3f800000u, 0x3e800000u, 0u, 0u, true},
+      {"zero-times-qnan", 0u, 0x7fc12345u, 0x3e800000u, 0u, 0u, true},
+      {"qnan-addend", 0x3f800000u, 0x3f000000u, 0x7fc12345u, 0u, 0u, true},
+      {"finite-negative", 0xbf800000u, 0x3f800000u, 0x3e800000u,
+       0xbf400000u, 0u, false},
+      {"finite-interior", 0x3f000000u, 0x3f000000u, 0x3e800000u,
+       0x3f000000u, 0x3f000000u, false},
+      {"finite-above-one", 0x40000000u, 0x3f800000u, 0x3e800000u,
+       0x40100000u, 0x3f800000u, false},
+  }};
+  constexpr u32 input_words = static_cast<u32>(samples.size()) * 3u;
+  constexpr u32 output_words = static_cast<u32>(samples.size()) * 4u;
+  TestCase test;
+  test.name = "VectorF32ClampDx10Contract";
+  for (const auto &sample : samples) {
+    test.initial.insert(test.initial.end(), {sample.a, sample.b, sample.c});
+  }
+  // Inputs and outputs are disjoint. Runtime loads prevent constant folding.
+  test.initial.resize(input_words + output_words, 0xdeadbeefu);
+  auto &code = test.code;
+  for (u32 i = 0; i < samples.size(); ++i) {
+    for (u32 source = 0; source < 3u; ++source) {
+      AppendVMovU32(&code, 30, (i * 3u + source) * sizeof(u32));
+      AppendBufferLoadDword(&code, source, 30);
+    }
+    // These are the same decoded MAD/MAC families as PS 8f4 at b2c/ae0.
+    AppendVop3(&code, 0x141, 10, Vgpr(0), Vgpr(1), Vgpr(2));
+    AppendVop3(&code, 0x141, 11, Vgpr(0), Vgpr(1), Vgpr(2), 0, 0, true);
+    code.push_back(EncodeVop1(0x01, 12, Vgpr(2)));
+    code.push_back(EncodeVop1(0x01, 13, Vgpr(2)));
+    AppendVop3(&code, 0x11f, 12, Vgpr(0), Vgpr(1));
+    AppendVop3(&code, 0x11f, 13, Vgpr(0), Vgpr(1), 0, 0, 0, true);
+    for (u32 result = 0; result < 4u; ++result) {
+      AppendStoreVgpr(&code, 10u + result, input_words + i * 4u + result);
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAD_F32,
+                  O::V_MAC_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MAD_F32", samples.size() * 2u},
+                         {"V_MAC_F32", samples.size() * 2u}};
+  const auto compiled = CompileCase(test, vulkan->SubgroupSize());
+  auto buffer = vulkan->CreateStorageBuffer(test.name, test.initial, test.initial.size());
+  vulkan->Dispatch(test, compiled, buffer);
+  const auto actual = vulkan->ReadBuffer(test.name, buffer, test.initial.size());
+  vulkan->DestroyBuffer(&buffer);
+
+  std::printf("[probe] %s mode=unrepresented dx10_expected_is_conditional=1 "
+              "live_game_mode_asserted=0\n", test.name);
+  u32 arithmetic_mismatches = 0;
+  u32 contract_mismatches = 0;
+  for (u32 i = 0; i < samples.size(); ++i) {
+    const auto &sample = samples[i];
+    for (u32 form = 0; form < 2u; ++form) {
+      const auto offset = input_words + i * 4u + form * 2u;
+      const u32 raw = actual[offset];
+      const u32 clamped = actual[offset + 1u];
+      const bool raw_ok = sample.nan_result ? (raw & 0x7fffffffu) > 0x7f800000u
+                                            : raw == sample.finite_result;
+      const bool contract_ok = clamped == sample.dx10_result;
+      arithmetic_mismatches += raw_ok ? 0u : 1u;
+      contract_mismatches += contract_ok ? 0u : 1u;
+      std::printf("[probe] sample=%s op=%s inputs=%08x,%08x,%08x "
+                  "unclamped=%08x clamped=%08x dx10_expected=%08x "
+                  "raw_arithmetic_match=%u conditional_contract_match=%u\n",
+                  sample.name, form == 0u ? "MAD" : "MAC", sample.a, sample.b,
+                  sample.c, raw, clamped, sample.dx10_result,
+                  raw_ok ? 1u : 0u, contract_ok ? 1u : 0u);
+    }
+  }
+  const bool inputs_intact = std::equal(test.initial.begin(),
+      test.initial.begin() + input_words, actual.begin());
+  std::printf("[probe] %s inputs_intact=%u arithmetic_mismatches=%u "
+              "conditional_dx10_mismatches=%u result=%s\n", test.name,
+              inputs_intact ? 1u : 0u, arithmetic_mismatches, contract_mismatches,
+              inputs_intact && arithmetic_mismatches == 0u && contract_mismatches == 0u
+                  ? "matches-conditional-dx10-contract" : "conditional-measurement-mismatch");
+  return inputs_intact && arithmetic_mismatches == 0u && contract_mismatches == 0u ? 0 : 1;
+}
+
 TestCase VectorMadF32RoundsProduct() {
   using O = ShaderOpcode;
 
@@ -44894,6 +44986,10 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorAlignByteUsesTwoBitByteOffset());
     RunCase(&vulkan, VectorVop3IntegerOps());
     return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--f32-clamp-dx10-contract-only") == 0) {
+    VulkanHarness vulkan;
+    return ProbeVectorF32ClampDx10Contract(&vulkan);
   }
   if (argc == 2 && std::strcmp(argv[1], "--mad-f32-only") == 0) {
     VulkanHarness vulkan;
