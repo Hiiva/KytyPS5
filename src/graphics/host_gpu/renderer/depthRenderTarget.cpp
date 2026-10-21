@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -19,6 +20,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/shaderCompiler.h"
 
 #include <algorithm>
 #include <array>
@@ -31,15 +33,21 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
+#include <span>
 
 namespace Libs::Graphics {
 
-static void TraceDepthCopyState(const CommandBuffer& buffer) {
+static bool DepthCopyTraceEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_VR_TRACE_DEPTH_COPY");
 		return value != nullptr && std::strcmp(value, "1") == 0;
 	}();
-	if (!enabled) {
+	return enabled;
+}
+
+static void TraceDepthCopyState(const CommandBuffer& buffer) {
+	if (!DepthCopyTraceEnabled()) {
 		return;
 	}
 	const auto& hw = buffer.GetRegisters();
@@ -121,6 +129,8 @@ static void TraceDepthCopyState(const CommandBuffer& buffer) {
 	    pair(vp.window_offset_x, vp.window_offset_y), pair(vp.hw_offset_x, vp.hw_offset_y),
 	    coverage_flags, pair(hw.GetColorControl().op, blend.enable),
 	    pair(masks.masks[0], masks.masks[1]), pair(masks.shader_sample_exclusion, masks.observed),
+	    pair(z.stencil_info.htile_stencil_disabled,
+	         static_cast<uint32_t>(z.stencil_info.texture_compatibility)),
 	});
 	using Key = decltype(key);
 	// Surface addresses rotate; retain distinct format, shader, and draw-coverage states.
@@ -157,13 +167,16 @@ static void TraceDepthCopyState(const CommandBuffer& buffer) {
 	LOGF("DepthCopyTrace[%u]: source z=0x%016" PRIx64 "/0x%016" PRIx64
 	     " stencil=0x%016" PRIx64 "/0x%016" PRIx64
 	     " formats=%u/%u extent=%ux%u valid=%u samples=%u(enc=%u) mip=%u layers=%u..%u"
-	     " htile=0x%016" PRIx64 " enabled=%u\n",
+	     " htile=0x%016" PRIx64 " enabled=%u stencil_disabled=%u stencil_compressed=%u\n",
 	     id, z.z_read_base_addr, z.z_write_base_addr, z.stencil_read_base_addr, z.stencil_write_base_addr,
 	     static_cast<unsigned>(z.z_info.format), static_cast<unsigned>(z.stencil_info.format),
 	     z.size.x_max + 1u, z.size.y_max + 1u, static_cast<unsigned>(z.size.valid),
 	     render_sample_count(z.z_info.num_samples), z.z_info.num_samples,
 	     z.depth_view.current_mip_level, z.depth_view.slice_start, z.depth_view.slice_max, z.htile_data_base_addr,
-	     static_cast<unsigned>(z.z_info.htile_acceleration));
+	     static_cast<unsigned>(z.z_info.htile_acceleration),
+	     static_cast<unsigned>(z.stencil_info.htile_stencil_disabled),
+	     static_cast<unsigned>(z.stencil_info.format != Prospero::StencilFormat::kInvalid &&
+	                           z.z_info.htile_acceleration && !z.stencil_info.htile_stencil_disabled));
 	LOGF("DepthCopyTrace[%u]: cb0=0x%016" PRIx64
 	     " format=%u nfmt=%u order=%u tile=%u extent=%ux%ux%u dimension=%u samples_enc=%u fragments_enc=%u"
 	     " mip=%u layers=%u..%u target_mask=0x%x shader_mask=0x%x output_mode=%u color_mode=%u alias_z=%u alias_stencil=%u\n",
@@ -555,6 +568,347 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	auto& cache = m_context.GetTextureCache();
 	r.image_id = cache.FindImage(r.desc);
 	BindRenderTarget(r.image_id);
+}
+
+namespace {
+
+struct DepthStencilColorCopyPlan {
+	vk::ImageAspectFlagBits aspect;
+	vk::Format color_format;
+	vk::Rect2D region;
+	ImageInfo color_info;
+};
+
+enum class DepthCopyFallback : uint32_t {
+	Draw, Source, Color, Raster, EmptyScissor, VertexShader, TargetMapping, PixelShader,
+	TargetTiling, AliasedRanges, Discovery, NativeBacking,
+};
+
+void TraceDepthCopyFallback(const CommandBuffer& buffer, DepthCopyFallback reason) {
+	if (!DepthCopyTraceEnabled()) {
+		return;
+	}
+	const auto& hw = buffer.GetRegisters();
+	const auto& rc = hw.GetRenderControl();
+	const auto& sh = hw.GetShaderRegisters();
+	const auto& db = sh.db_shader_control;
+	const auto& vs = buffer.GetShaders().GetVs();
+	const uint64_t bit = uint64_t {1} << (static_cast<uint32_t>(reason) * 2u +
+	                                    static_cast<uint32_t>(rc.copy_stencil_to_color));
+	static std::atomic<uint64_t> logged {0};
+	if ((logged.fetch_or(bit, std::memory_order_relaxed) & bit) != 0) {
+		return;
+	}
+	static constexpr const char* names[] = {
+	    "draw-or-copy-state", "source-plane-state", "color-or-export-state", "raster-coverage",
+	    "empty-scissor", "vertex-template-or-inputs", "target-channel-mapping", "pixel-template",
+	    "target-tile-alignment", "overlapping-guest-ranges", "image-discovery", "native-copy-state",
+	};
+	uint32_t output_modes = 0;
+	for (uint32_t i = 0; i < std::size(sh.target_output_mode); i++) {
+		output_modes |= static_cast<uint32_t>(sh.target_output_mode[i]) << (i * 4u);
+	}
+	LOGF("DepthCopy: fallback reason=%s depth=%u stencil=%u stages=0x%x lds=%u vs_out=0x%x"
+	     " db_kill/z/mask/dual/noop=%u/%u/%u/%u/%u aa=%u/%u"
+	     " target_mask=0x%08x shader_mask=0x%08x output_modes=0x%08x\n",
+	     names[static_cast<uint32_t>(reason)], static_cast<unsigned>(rc.copy_depth_to_color),
+	     static_cast<unsigned>(rc.copy_stencil_to_color), hw.GetShaderStages(), vs.gs_regs.rsrc2.lds_size,
+	     sh.m_paClVsOutCntl, static_cast<unsigned>(db.shader_kill_enable),
+	     static_cast<unsigned>(db.shader_z_export_enable), static_cast<unsigned>(db.shader_mask_export_enable),
+	     static_cast<unsigned>(db.shader_dual_export_enable), static_cast<unsigned>(db.shader_execute_on_noop),
+	     hw.GetAaConfig().msaa_num_samples, hw.GetAaConfig().msaa_exposed_samples,
+	     hw.GetRenderTargetMask(), sh.m_cbShaderMask, output_modes);
+}
+
+// This template emits (-1,-1), (1,-1), (-1,1), z=0, w=1 from VertexIndex.
+// RectList assembly supplies the fourth corner. Match all executed instructions,
+// including the NGG bookkeeping prefix, rather than a title or guest address.
+constexpr std::array<uint32_t, 27> depth_copy_vertex_code {
+	0xbfa00001u, 0x93ebff03u, 0x00080008u, 0x8700ff03u, 0x000000ffu, 0x8f6a8c6bu,
+	0x887c6a00u, 0xbf900009u, 0x81ea6bc0u, 0x90fe6ac1u, 0xf8000941u, 0x00000000u,
+	0x81ea00c0u, 0xbf8cff0fu, 0x90fe6ac1u, 0x34040a81u, 0x36060ac2u, 0x7e000280u,
+	0x7e0202f2u, 0x36040482u, 0x4a0606c1u, 0x4a0404c1u, 0x7e060b03u, 0x7e040b02u,
+	0xf80008cfu, 0x01000302u, 0xbf810000u,
+};
+// The export only triggers the DB copy; its zero values are replaced by the selected plane.
+constexpr std::array<uint32_t, 4> depth_copy_pixel_code {
+	0x7e000280u, 0xf8001803u, 0x00000000u, 0xbf810000u,
+};
+
+std::optional<DepthStencilColorCopyPlan> PlanDepthStencilColorCopy(
+    const CommandBuffer& buffer, const DrawAutoArgs& args, DepthCopyFallback& reason) {
+	const auto reject = [&](DepthCopyFallback why) -> std::optional<DepthStencilColorCopyPlan> {
+		reason = why;
+		return std::nullopt;
+	};
+	const auto& hw = buffer.GetRegisters();
+	const auto& rc = hw.GetRenderControl();
+	const auto& dc = hw.GetDepthControl();
+	const auto& z = hw.GetDepthRenderTarget();
+	const auto& cb = hw.GetRenderTarget(0);
+	const auto& sh = hw.GetShaderRegisters();
+	const auto& vs = buffer.GetShaders().GetVs();
+	const auto& ps = buffer.GetShaders().GetPs();
+	const auto& ucfg = buffer.GetUserConfig();
+	if (rc.copy_depth_to_color == rc.copy_stencil_to_color || !rc.copy_centroid ||
+	    rc.copy_sample != 0 || rc.depth_clear_enable || rc.stencil_clear_enable ||
+	    rc.depth_compress_disable || rc.stencil_compress_disable || rc.resummarize_enable ||
+	    dc.z_enable || dc.z_write_enable || dc.stencil_enable || dc.depth_bounds_enable ||
+	    args.vertex_count != 3 || args.instance_count != 1 || args.first_vertex != 0 ||
+	    args.first_instance != 0 || args.render_target_slice_offset != 0 ||
+	    ucfg.GetPrimType() != Prospero::PrimitiveType::kRectList || ucfg.GetIndexOffset() != 0 ||
+	    (hw.GetShaderStages() & 0x20u) != 0 || vs.gs_regs.rsrc2.lds_size != 0 ||
+	    vs.es_regs.data_addr == 0 || ps.ps_regs.data_addr == 0) {
+		return reject(DepthCopyFallback::Draw);
+	}
+	const bool stencil = rc.copy_stencil_to_color;
+	const bool has_stencil = z.stencil_info.format == Prospero::StencilFormat::k8UInt;
+	if (z.z_info.format != Prospero::DepthFormat::kZ32F || z.z_info.num_samples != 0 ||
+	    !z.size.valid || z.size.x_max >= 16384 || z.size.y_max >= 16384 ||
+	    !z.z_info.HasValidTextureCompatibility() || !z.stencil_info.HasValidTextureCompatibility() ||
+	    z.z_info.partially_resident || z.stencil_info.partially_resident ||
+	    z.z_info.max_mip_level != 0 || z.depth_view.current_mip_level != 0 ||
+	    z.depth_view.slice_start != 0 || z.depth_view.slice_max != 0 ||
+	    z.depth_view.depth_write_disable || z.depth_view.stencil_write_disable ||
+	    z.shading_rate_encoding != 0 || z.z_read_base_addr == 0 ||
+	    (z.z_read_base_addr & 0xffffu) != 0 || z.z_read_base_addr != z.z_write_base_addr ||
+	    (has_stencil ? (z.stencil_read_base_addr == 0 ||
+	                    (z.stencil_read_base_addr & 0xffffu) != 0 ||
+	                    z.stencil_read_base_addr != z.stencil_write_base_addr)
+	                 : (z.stencil_info.format != Prospero::StencilFormat::kInvalid ||
+	                    z.stencil_read_base_addr != 0 || z.stencil_write_base_addr != 0)) ||
+	    (z.z_info.htile_acceleration &&
+	     (z.htile_data_base_addr == 0 || (z.htile_data_base_addr & 0x7fffu) != 0)) ||
+	    !depth_htile_stencil_acceleration_compatible(
+	        has_stencil, z.z_info.htile_acceleration, z.stencil_info.htile_stencil_disabled) ||
+	    (stencil && (!has_stencil ||
+	                 (z.z_info.htile_acceleration && !z.stencil_info.htile_stencil_disabled)))) {
+		return reject(DepthCopyFallback::Source);
+	}
+	const auto& db = sh.db_shader_control;
+	const uint32_t logical_mask = stencil ? 2u : 1u;
+	if (hw.GetColorControl().mode != 1 || hw.GetColorControl().op != 0xcc ||
+	    hw.GetBlendControl(0).enable || hw.GetRenderTargetMask() != logical_mask ||
+	    sh.m_cbShaderMask != 3 || sh.target_output_mode[0] != 2 ||
+	    !std::all_of(std::begin(sh.target_output_mode) + 1, std::end(sh.target_output_mode),
+	                 [](uint8_t mode) { return mode == 0; }) ||
+	    sh.shader_z_format != 0 || sh.m_paClVsOutCntl != 0 ||
+	    db.shader_kill_enable || db.shader_z_export_enable || db.shader_mask_export_enable ||
+	    db.shader_dual_export_enable || db.shader_execute_on_noop ||
+	    cb.base.addr == 0 || cb.attrib.num_samples != 0 || cb.attrib.num_fragments != 0 ||
+	    cb.attrib3.dimension != 1 || cb.attrib3.depth != 0 || cb.attrib2.num_mip_levels != 0 ||
+	    cb.view.current_mip_level != 0 || cb.view.base_array_slice_index != 0 ||
+	    cb.view.last_array_slice_index != 0 || cb.attrib2.width != z.size.x_max ||
+	    cb.attrib2.height != z.size.y_max || cb.info.fmask_compression_enable ||
+	    cb.info.fmask_data_compression_disable || cb.info.fmask_one_frag_mode ||
+	    cb.info.cmask_fast_clear_enable || cb.info.dcc_compression_enable ||
+	    cb.cmask.addr != 0 || cb.fmask.addr != 0 || cb.dcc_addr.addr != 0 ||
+	    cb.dcc.data_write_on_dcc_clear_to_reg ||
+	    (stencil ? (cb.info.format != Prospero::ChannelLayout::k8 ||
+	                cb.info.channel_type != Prospero::ChannelType::kUInt ||
+	                cb.info.channel_order != Prospero::ChannelOrder::kAlt)
+	             : (cb.info.format != Prospero::ChannelLayout::k32 ||
+	                cb.info.channel_type != Prospero::ChannelType::kFloat ||
+	                cb.info.channel_order != Prospero::ChannelOrder::kStandard))) {
+		return reject(DepthCopyFallback::Color);
+	}
+	switch (cb.attrib3.tile_mode) {
+		case Prospero::TileMode::kLinear:
+		case Prospero::TileMode::kStandard4KB:
+		case Prospero::TileMode::kStandard64KB:
+		case Prospero::TileMode::kDepth:
+		case Prospero::TileMode::kRenderTarget: break;
+		default: return reject(DepthCopyFallback::TargetTiling);
+	}
+	const auto& mode = hw.GetModeControl();
+	const auto& clip = hw.GetClipControl();
+	const auto& scan = hw.GetScanModeControl();
+	const auto& aa = hw.GetAaMaskControl();
+	const auto& vp = hw.GetScreenViewport();
+	const auto& vp0 = vp.viewports[0];
+	const uint32_t width = cb.attrib2.width + 1u;
+	const uint32_t height = cb.attrib2.height + 1u;
+	if (mode.cull_front || mode.cull_back || mode.poly_mode != 0 ||
+	    mode.polymode_front_ptype != 0 || mode.polymode_back_ptype != 0 ||
+	    mode.vtx_window_offset_enable || clip.clip_disable || clip.dx_clip_space ||
+	    clip.vertex_kill_any || clip.user_clip_planes != 0 || clip.user_clip_plane_mode != 0 ||
+	    clip.force_viewport_index_from_vs_enable || clip.min_z_clip_disable || clip.max_z_clip_disable ||
+	    scan.msaa_enable || scan.line_stipple_enable || hw.GetAaConfig().msaa_num_samples != 0 ||
+	    hw.GetAaConfig().msaa_exposed_samples != 0 || aa.masks[0] != UINT32_MAX ||
+	    aa.masks[1] != UINT32_MAX || aa.shader_sample_exclusion != 0 ||
+	    vp.transform_control != 0x43fu || vp.clip_rect_rule != 0xffffu ||
+	    vp0.xscale != static_cast<float>(width) * 0.5f || vp0.xoffset != vp0.xscale ||
+	    vp0.yscale != -static_cast<float>(height) * 0.5f || vp0.yoffset != -vp0.yscale ||
+	    vp0.zscale != 0.5f || vp0.zoffset != 0.5f ||
+	    !std::isfinite(hw.GetDepthClearValue()) || hw.GetDepthClearValue() < 0.0f ||
+	    hw.GetDepthClearValue() > 1.0f) {
+		return reject(DepthCopyFallback::Raster);
+	}
+	const auto scissor = calc_final_scissor(vp, scan, {width, height}, 0);
+	if (scissor.right <= scissor.left || scissor.bottom <= scissor.top) {
+		return reject(DepthCopyFallback::EmptyScissor);
+	}
+	ShaderVertexInputInfo vertex_info {};
+	const auto vertex = PrepareProgram(vs, hw, ucfg, vertex_info);
+	if (vertex_info.logical_stage != ShaderType::Vertex || vertex_info.fetch_embedded ||
+	    vertex_info.fetch_external || vertex_info.resources_num != 0 ||
+	    vertex.code.size() < depth_copy_vertex_code.size() ||
+	    !std::equal(depth_copy_vertex_code.begin(), depth_copy_vertex_code.end(), vertex.code.begin())) {
+		return reject(DepthCopyFallback::VertexShader);
+	}
+	const auto format = TextureGetRenderTargetFormat(cb.info.format, cb.info.channel_type,
+	                                                cb.info.channel_order);
+	if (format.export_mapping.ApplyMask(logical_mask & sh.m_cbShaderMask) != 1u) {
+		return reject(DepthCopyFallback::TargetMapping);
+	}
+	if (cb.attrib3.tile_mode == Prospero::TileMode::kStandard4KB ||
+	    cb.attrib3.tile_mode == Prospero::TileMode::kStandard64KB ||
+	    cb.attrib3.tile_mode == Prospero::TileMode::kDepth) {
+		TileTextureBlockLayout layout {};
+		if (!TileGetTextureBlockLayout(ImageOps::RenderTargetTransferFormat(format.bytes_per_element),
+		                                cb.attrib3.tile_mode, false, layout) ||
+		    (cb.base.addr & (layout.block.block_size - 1u)) != 0) {
+			return reject(DepthCopyFallback::TargetTiling);
+		}
+	}
+	std::array<Prospero::ColorComponentMapping, 8> mappings {};
+	mappings[0] = format.export_mapping;
+	ShaderPixelInputInfo pixel_info {};
+	const auto pixel = PrepareProgram(ps, sh, mappings, pixel_info);
+	if (pixel.code.size() < depth_copy_pixel_code.size() ||
+	    !std::equal(depth_copy_pixel_code.begin(), depth_copy_pixel_code.end(), pixel.code.begin())) {
+		return reject(DepthCopyFallback::PixelShader);
+	}
+	DepthStencilColorCopyPlan plan {};
+	plan.aspect = stencil ? vk::ImageAspectFlagBits::eStencil : vk::ImageAspectFlagBits::eDepth;
+	plan.color_format = stencil ? vk::Format::eR8Uint : vk::Format::eR32Sfloat;
+	plan.region = {{scissor.left, scissor.top},
+	               {static_cast<uint32_t>(scissor.right - scissor.left),
+	                static_cast<uint32_t>(scissor.bottom - scissor.top)}};
+	plan.color_info.data.address = cb.base.addr;
+	plan.color_info.pixel_format = format.format;
+	plan.color_info.guest_format = format.guest_format;
+	plan.color_info.type = Prospero::ImageType::kColor2D;
+	plan.color_info.extent = {width, height, 1};
+	plan.color_info.resources = {1, 1};
+	plan.color_info.bytes_per_block = format.bytes_per_element;
+	plan.color_info.samples = 1;
+	plan.color_info.tile_mode = cb.attrib3.tile_mode;
+	plan.color_info.UpdateSize();
+	return plan;
+}
+
+} // namespace
+
+bool RenderExecutor::DepthStencilColorCopy(CommandBuffer& buffer, const DrawAutoArgs& args) {
+	const auto& hw = buffer.GetRegisters();
+	const auto& rc = hw.GetRenderControl();
+	if (!rc.copy_depth_to_color && !rc.copy_stencil_to_color) {
+		return false;
+	}
+	TraceDepthCopyState(buffer);
+	DepthCopyFallback reason {};
+	const auto plan = PlanDepthStencilColorCopy(buffer, args, reason);
+	if (!plan) {
+		TraceDepthCopyFallback(buffer, reason);
+		return false;
+	}
+	auto source_desc = MakeDepthTargetDesc(buffer, hw.GetDepthRenderTarget());
+	const auto overlaps_color = [&](GuestRange range) {
+		return !range.Empty() && ImageRangeOverlaps(range.address, range.size,
+		                                           plan->color_info.data.address, plan->color_info.data.size);
+	};
+	if (!plan->color_info.data.Valid() || overlaps_color(source_desc.info.data) ||
+	    overlaps_color(source_desc.info.stencil) || overlaps_color(source_desc.info.metadata.range)) {
+		TraceDepthCopyFallback(buffer, DepthCopyFallback::AliasedRanges);
+		return false;
+	}
+	auto& cache = m_context.GetTextureCache();
+	const auto source_id = cache.FindImage(source_desc, true);
+	BindRenderTarget(source_id);
+	RenderColorInfo color {};
+	ResolveRenderColorTarget(buffer, color, 0, 0, false, true);
+	if (!color.image_id || cache.m_slot_images.try_get(source_id) == nullptr ||
+	    cache.m_slot_images.try_get(color.image_id) == nullptr) {
+		TraceDepthCopyFallback(buffer, DepthCopyFallback::Discovery);
+		ResetBindings();
+		return false;
+	}
+	auto& source = cache.GetImage(source_id);
+	auto& destination = cache.GetImage(color.image_id);
+	auto& scratch = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
+	const auto& source_view = source_desc.view_info;
+	const auto& color_view = color.desc.view_info;
+	const auto native_fits = [&](const Image& image, const ImageViewInfo& view) {
+		if (view.base_level >= image.backing.mip_levels || view.base_layer >= image.backing.layers) {
+			return false;
+		}
+		return static_cast<uint64_t>(plan->region.offset.x) + plan->region.extent.width <=
+		           std::max(image.backing.extent.width >> view.base_level, 1u) &&
+		       static_cast<uint64_t>(plan->region.offset.y) + plan->region.extent.height <=
+		           std::max(image.backing.extent.height >> view.base_level, 1u);
+	};
+	const uint32_t bytes_per_texel = plan->aspect == vk::ImageAspectFlagBits::eDepth ? 4u : 1u;
+	if (source_id == color.image_id || source.backing.image == nullptr ||
+	    destination.backing.image == nullptr || source.backing.image == destination.backing.image ||
+	    source.depth_id || destination.depth_id || source.binding.needs_rebind ||
+	    destination.binding.needs_rebind || source.backing.samples != 1 || destination.backing.samples != 1 ||
+	    source.backing.image_type != vk::ImageType::e2D || destination.backing.image_type != vk::ImageType::e2D ||
+	    (source.backing.format != vk::Format::eD32SfloatS8Uint &&
+	     (plan->aspect != vk::ImageAspectFlagBits::eDepth || source.backing.format != vk::Format::eD32Sfloat)) ||
+	    destination.backing.format != plan->color_format || source_view.base_level != 0 ||
+	    source_view.base_layer != 0 || source_view.level_count != 1 || source_view.layer_count != 1 ||
+	    color_view.level_count != 1 || color_view.layer_count != 1 ||
+	    !native_fits(source, source_view) || !native_fits(destination, color_view) ||
+	    scratch.Handle() == nullptr ||
+	    static_cast<uint64_t>(plan->region.extent.width) * bytes_per_texel > scratch.Size()) {
+		TraceDepthCopyFallback(buffer, DepthCopyFallback::NativeBacking);
+		ResetBindings();
+		return false;
+	}
+	// Every condition that can reject the low-level copy has now been checked.
+	// No fallback is allowed after consuming a deferred clear.
+	cache.UpdateImage(color.image_id);
+	const bool depth_clear = cache.PrepareDepthCopySource(
+	    buffer, source_id, source_desc, plan->aspect, hw.GetDepthClearValue());
+	vk::ImageCopy region {};
+	region.srcSubresource = {plan->aspect, source_view.base_level, source_view.base_layer, 1};
+	region.dstSubresource = {vk::ImageAspectFlagBits::eColor, color_view.base_level, color_view.base_layer, 1};
+	region.srcOffset = {plan->region.offset.x, plan->region.offset.y, 0};
+	region.dstOffset = region.srcOffset;
+	region.extent = {plan->region.extent.width, plan->region.extent.height, 1};
+	EXIT_IF(!destination.CopyDepthStencilToColor(source, scratch, region));
+	{
+		std::scoped_lock lock {cache.m_lock};
+		destination.usage.render_target = true;
+		cache.TrackImage(color.image_id);
+		cache.CommitGpuWrite(destination);
+		cache.TrackImageDownload(color.image_id, destination);
+	}
+	if (DepthCopyTraceEnabled()) {
+		std::array<uint64_t, 6> key {static_cast<uint32_t>(plan->aspect),
+		    (static_cast<uint64_t>(region.extent.width) << 32u) | region.extent.height,
+		    (static_cast<uint64_t>(region.srcOffset.x) << 32u) | static_cast<uint32_t>(region.srcOffset.y),
+		    static_cast<uint32_t>(source.backing.format), static_cast<uint32_t>(plan->color_format),
+		    static_cast<uint64_t>(depth_clear)};
+		static std::mutex mutex;
+		static std::array<decltype(key), 32> configurations {};
+		static uint32_t count = 0;
+		const std::lock_guard lock(mutex);
+		const auto end = configurations.begin() + count;
+		if (count < configurations.size() && std::find(configurations.begin(), end, key) == end) {
+			configurations[count++] = key;
+			LOGF("DepthCopy: expanded %s to %s source=0x%016" PRIx64 " color=0x%016" PRIx64
+			     " extent=%ux%u region=(%d,%d)+%ux%u htile_clear=%u\n",
+			     plan->aspect == vk::ImageAspectFlagBits::eDepth ? "depth" : "stencil",
+			     vk::to_string(plan->color_format).c_str(),
+			     plan->aspect == vk::ImageAspectFlagBits::eDepth ? source_desc.info.data.address : source_desc.info.stencil.address,
+			     color.desc.info.data.address, source_desc.info.extent.width, source_desc.info.extent.height,
+			     region.srcOffset.x, region.srcOffset.y, region.extent.width, region.extent.height,
+			     static_cast<unsigned>(depth_clear));
+		}
+	}
+	return true;
 }
 
 bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {

@@ -548,6 +548,13 @@ struct RenderExecutorTestAccess {
     return executor.DepthStencilCopy(buffer);
   }
 
+  static bool DepthStencilColorCopy(RenderExecutor &executor,
+                                    CommandBuffer &buffer,
+                                    const DrawAutoArgs &args) {
+    Common::LockGuard lock(executor.m_context.GetMutex());
+    return executor.DepthStencilColorCopy(buffer, args);
+  }
+
   static void ResolveRenderColorTarget(RenderExecutor &executor,
                                        CommandBuffer &buffer,
                                        RenderColorInfo &color, uint32_t slot) {
@@ -11993,6 +12000,378 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "depth-tiled color allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckRendererDepthStencilColorCopy() {
+    constexpr const char *name = "RendererDepthStencilColorCopy";
+    constexpr uintptr_t base = 0x0000000206800000ull;
+    constexpr uint64_t allocation_size = 0x80000;
+    constexpr uint64_t plane_size = 0x10000;
+    constexpr uint64_t depth_address = base + 0x10000;
+    constexpr uint64_t stencil_address = base + 0x20000;
+    constexpr uint64_t htile_address = base + 0x30000;
+    constexpr uint64_t depth_color_address = base + 0x40000;
+    constexpr uint64_t stencil_color_address = base + 0x50000;
+    constexpr uint32_t width = 7, height = 5, texels = width * height;
+    constexpr std::array<size_t, 6> copied_pixels{9, 10, 11, 16, 17, 18};
+    constexpr std::array<uint8_t, 6> copied_stencil{0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff};
+    constexpr uint32_t depth_sentinel = std::bit_cast<uint32_t>(-7.25f);
+    constexpr uint8_t stencil_sentinel = 0xd6;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                plane_size, 0, &direct_offset) == 0,
+            "copy fixture direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, plane_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "copy fixture fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    std::vector<uint32_t> expected_depth(texels);
+    std::vector<uint8_t> expected_stencil(texels);
+    std::vector<uint8_t> updated_stencil(texels);
+    std::vector<uint8_t> tiled_depth(plane_size, 0), tiled_stencil(plane_size, 0);
+    std::array<uint32_t, texels> stencil_offsets{};
+    TileBlockLayout depth_block{}, stencil_block{};
+    Require(name, "source tile layouts",
+            TileGetBlockLayout(TileBlockFamily::Depth64KB, 4, depth_block) &&
+                TileGetBlockLayout(TileBlockFamily::Depth64KB, 1, stencil_block),
+            "independent depth and stencil tile layouts are unavailable");
+    for (uint32_t i = 0; i < texels; ++i) {
+      uint32_t depth_offset = 0;
+      Require(name, "source tile offsets",
+              TileGetBlockOffset(depth_block, i % width, i / width, 0, depth_offset) &&
+                  TileGetBlockOffset(stencil_block, i % width, i / width, 0,
+                                     stencil_offsets[i]),
+              "fixture texel lies outside its tiled plane");
+      expected_depth[i] = 0x3e000000u + i * 257u;
+      expected_stencil[i] = static_cast<uint8_t>(0x23u + i * 7u);
+      updated_stencil[i] = static_cast<uint8_t>(0xb1u + i * 13u);
+      std::memcpy(tiled_depth.data() + depth_offset, &expected_depth[i], sizeof(uint32_t));
+      tiled_stencil[stencil_offsets[i]] = expected_stencil[i];
+    }
+    for (size_t i = 0; i < copied_pixels.size(); ++i) {
+      updated_stencil[copied_pixels[i]] = copied_stencil[i];
+    }
+    std::memcpy(reinterpret_cast<void *>(depth_address), tiled_depth.data(), plane_size);
+    std::memcpy(reinterpret_cast<void *>(stencil_address), tiled_stencil.data(), plane_size);
+
+    // The executed guest templates supply a full RectList and a DB copy export.
+    // Keep the fixture bytes independent of the production recognizer.
+    static std::array<uint32_t, 27> vertex_code{
+        0xbfa00001u, 0x93ebff03u, 0x00080008u, 0x8700ff03u, 0x000000ffu,
+        0x8f6a8c6bu, 0x887c6a00u, 0xbf900009u, 0x81ea6bc0u, 0x90fe6ac1u,
+        0xf8000941u, 0x00000000u, 0x81ea00c0u, 0xbf8cff0fu, 0x90fe6ac1u,
+        0x34040a81u, 0x36060ac2u, 0x7e000280u, 0x7e0202f2u, 0x36040482u,
+        0x4a0606c1u, 0x4a0404c1u, 0x7e060b03u, 0x7e040b02u, 0xf80008cfu,
+        0x01000302u, 0xbf810000u};
+    static std::array<uint32_t, 4> pixel_code{
+        0x7e000280u, 0xf8001803u, 0x00000000u, 0xbf810000u};
+    static ShaderUserData vertex_user_data{};
+    const auto vertex_address = reinterpret_cast<uint64_t>(vertex_code.data());
+    const auto pixel_address = reinterpret_cast<uint64_t>(pixel_code.data());
+    ShaderMapUserData(vertex_address,
+        {.type = Prospero::ShaderBinaryType::kGs,
+         .user_data = &vertex_user_data,
+         .code_size_bytes = static_cast<uint32_t>(sizeof(vertex_code))});
+    ShaderMapUserData(pixel_address,
+        {.type = Prospero::ShaderBinaryType::kPs,
+         .code_size_bytes = static_cast<uint32_t>(sizeof(pixel_code))});
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      LibKernel::Memory::InstallGpuResources(&context);
+
+      HW::DepthRenderTarget target{};
+      target.z_info.format = Prospero::DepthFormat::kZ32F;
+      target.z_info.texture_compatibility = Prospero::TextureCompatiblePlaneCompression::kEnable;
+      target.z_info.htile_acceleration = true;
+      target.stencil_info.format = Prospero::StencilFormat::k8UInt;
+      target.stencil_info.texture_compatibility = Prospero::TextureCompatibleStencil::kEnable;
+      target.stencil_info.htile_stencil_disabled = true;
+      target.z_read_base_addr = target.z_write_base_addr = depth_address;
+      target.stencil_read_base_addr = target.stencil_write_base_addr = stencil_address;
+      target.htile_data_base_addr = htile_address;
+      target.size = {width - 1, height - 1, true};
+      registers.SetDepthRenderTarget(target);
+      registers.SetDepthControl({.z_enable = true});
+      RenderDepthInfo source{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), source);
+      Require(name, "combined source discovery", static_cast<bool>(source.image_id),
+              "combined D32/S8 source was not discovered");
+      // Establish the initial native pixels and the separate stencil owner without
+      // declaring a GPU write or materializing the pending depth clear.
+      (void)cache.PrepareDepthCopySource(scheduler.Current(), source.image_id,
+                                       source.desc, vk::ImageAspectFlagBits::eStencil, 0.0f);
+      const auto stencil_id = cache.FindImageFromRange(stencil_address, plane_size, false);
+      Require(name, "independent stencil association",
+              stencil_id && cache.GetImage(stencil_id).depth_id == source.image_id &&
+                  !cache.GetImage(source.image_id).IsGpuModified() && cache.ClearMeta(htile_address),
+              "source preparation lost the stencil association or consumed depth ownership");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
+      const auto SetColor = [&](bool stencil) {
+        registers.SetColorBase(0, {.addr = stencil ? stencil_color_address : depth_color_address});
+        registers.SetColorInfo(0,
+            {.format = stencil ? Prospero::ChannelLayout::k8 : Prospero::ChannelLayout::k32,
+             .channel_type = stencil ? Prospero::ChannelType::kUInt : Prospero::ChannelType::kFloat,
+             .channel_order = stencil ? Prospero::ChannelOrder::kAlt : Prospero::ChannelOrder::kStandard});
+        registers.SetColorAttrib2(0, {.height = height - 1, .width = width - 1});
+        registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+        registers.SetRenderTargetMask(stencil ? 2u : 1u);
+      };
+      const auto DiscoverColor = [&](bool stencil) {
+        SetColor(stencil);
+        RenderColorInfo color{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0);
+        Require(name, "scalar color discovery", static_cast<bool>(color.image_id),
+                "copy destination was not discovered");
+        RenderExecutorTestAccess::ResetBindings(executor);
+        return color.image_id;
+      };
+      const auto depth_color_id = DiscoverColor(false);
+      const auto stencil_color_id = DiscoverColor(true);
+      const auto ClearDestination = [&](bool stencil) {
+        vk::ClearValue clear{};
+        if (stencil) {
+          clear.color.uint32[0] = stencil_sentinel;
+        } else {
+          clear.color.float32[0] = std::bit_cast<float>(depth_sentinel);
+        }
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(),
+            stencil ? stencil_color_id : depth_color_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      };
+      ClearDestination(false);
+      ClearDestination(true);
+      std::vector<uint32_t> expected_depth_color(texels, depth_sentinel);
+      std::vector<uint8_t> expected_stencil_color(texels, stencil_sentinel);
+
+      shaders.SetEsShaderBase(vertex_address);
+      shaders.SetPsShaderBase(pixel_address);
+      registers.SetShaderStages(0);
+      registers.SetShaderMask(3);
+      registers.SetTargetOutputMode(0, 2);
+      user_config.SetPrimitiveType(Prospero::PrimitiveType::kRectList);
+      registers.SetDepthControl({});
+      registers.SetViewportTransformControl(0x43f);
+      registers.SetViewportScaleOffset(0, 3.5f, 3.5f, -2.5f, 2.5f, 0.5f, 0.5f);
+      registers.SetScreenScissor(0, 0, width, height);
+      registers.SetWindowScissor(0, 0, width, height, false);
+      registers.SetViewportScissor(0, 0, 0, width, height, false);
+      registers.SetGenericScissor(2, 1, 5, 3, false);
+      const DrawAutoArgs draw{.vertex_count = 3, .instance_count = 1};
+      const auto SetCopy = [&](bool stencil) {
+        SetColor(stencil);
+        HW::RenderControl control{};
+        control.copy_depth_to_color = !stencil;
+        control.copy_stencil_to_color = stencil;
+        control.copy_centroid = true;
+        registers.SetRenderControl(control);
+      };
+      SetCopy(true);
+
+      // A host write dirties only the independent stencil record. Rejection must
+      // not refresh it, even with the parent depth clear still pending.
+      for (uint32_t i = 0; i < texels; ++i) {
+        tiled_stencil[stencil_offsets[i]] = updated_stencil[i];
+      }
+      std::memcpy(reinterpret_cast<void *>(stencil_address), tiled_stencil.data(), plane_size);
+      Require(name, "independent stencil dirtiness",
+              cache.GetImage(stencil_id).IsCpuDirty() &&
+                  !cache.GetImage(source.image_id).IsCpuDirty(),
+              "host stencil write did not remain isolated from the depth plane");
+      const auto CheckPending = [&](bool depth_pending, const char *phase) {
+        Require(name, phase, cache.IsMetaCleared(htile_address, 0) == depth_pending &&
+                    cache.IsMetaCleared(htile_address, 1) && cache.IsMetaCleared(htile_address, 31),
+                "copy consumed an unrelated HTile bit or failed to consume its own clear");
+      };
+      const auto SameState = [](const VulkanImageState &a, const VulkanImageState &b) {
+        return a.pl_stage == b.pl_stage && a.access_mask == b.access_mask && a.layout == b.layout;
+      };
+      const std::array image_ids{source.image_id, stencil_id, depth_color_id, stencil_color_id};
+      const auto Reject = [&](const char *phase, const DrawAutoArgs &args) {
+        struct State {
+          vk::Image handle;
+          VulkanImageState state;
+          std::vector<VulkanImageState> subresources;
+          bool cpu_dirty, buffer_modified, gpu_modified, bound, target, rebind;
+        };
+        std::array<State, 4> before;
+        for (size_t i = 0; i < image_ids.size(); ++i) {
+          const auto &image = cache.GetImage(image_ids[i]);
+          before[i] = {image.backing.image, image.backing.state, image.backing.subresource_states,
+                       image.IsCpuDirty(), image.IsBufferModified(), image.IsGpuModified(),
+                       image.binding.is_bound, image.binding.is_target, image.binding.needs_rebind};
+        }
+        Require(name, phase, !RenderExecutorTestAccess::DepthStencilColorCopy(
+                    executor, scheduler.Current(), args), "unsupported draw was accepted");
+        for (size_t i = 0; i < image_ids.size(); ++i) {
+          const auto &image = cache.GetImage(image_ids[i]);
+          const auto &saved = before[i];
+          Require(name, phase,
+                  image.backing.image == saved.handle && SameState(image.backing.state, saved.state) &&
+                      std::equal(saved.subresources.begin(), saved.subresources.end(),
+                                 image.backing.subresource_states.begin(), image.backing.subresource_states.end(), SameState) &&
+                      image.IsCpuDirty() == saved.cpu_dirty && image.IsBufferModified() == saved.buffer_modified &&
+                      image.IsGpuModified() == saved.gpu_modified && image.binding.is_bound == saved.bound &&
+                      image.binding.is_target == saved.target && image.binding.needs_rebind == saved.rebind,
+                  "rejected draw changed image ownership, layout, dirtiness, or bindings");
+        }
+        CheckPending(true, phase);
+      };
+      registers.SetRenderTargetMask(1);
+      Reject("logical R cannot copy stencil G", draw);
+      registers.SetRenderTargetMask(2);
+      auto offset_draw = draw;
+      offset_draw.first_vertex = 1;
+      Reject("offset vertex coverage", offset_draw);
+      registers.SetViewportXScale(0, 3.0f);
+      Reject("incomplete viewport coverage", draw);
+      registers.SetViewportXScale(0, 3.5f);
+      // Mutate after ShaderMapUserData: a stale hash must not bypass byte validation.
+      vertex_code[16] ^= 1u;
+      Reject("changed executed vertex instruction", draw);
+      vertex_code[16] ^= 1u;
+      pixel_code[2] ^= 1u;
+      Reject("changed pixel export", draw);
+      pixel_code[2] ^= 1u;
+      auto compressed = target;
+      compressed.stencil_info.htile_stencil_disabled = false;
+      registers.SetDepthRenderTarget(compressed);
+      Reject("compressed stencil source", draw);
+      registers.SetDepthRenderTarget(target);
+      registers.SetColorBase(0, {.addr = depth_address});
+      Reject("overlapping source and destination", draw);
+      SetColor(true);
+
+      StreamBuffer readback(context.GetGraphics(), scheduler, MemoryUsage::Download, 65536);
+      struct Check {
+        uint8_t *data;
+        uint64_t offset;
+        std::string label;
+        std::vector<uint8_t> expected;
+      };
+      std::vector<Check> checks;
+      const auto QueuePlane = [&](ImageId id, vk::ImageAspectFlagBits aspect,
+                                  const auto &pixels, const std::string &label) {
+        const auto bytes = pixels.size() * sizeof(pixels[0]);
+        const auto [data, offset] = readback.Map(bytes, 4);
+        Require(name, label.c_str(), data != nullptr, "native readback allocation failed");
+        readback.Commit();
+        vk::BufferImageCopy copy{};
+        copy.bufferOffset = offset;
+        copy.imageSubresource = {aspect, 0, 0, 1};
+        copy.imageExtent = {width, height, 1};
+        // Download the existing native image directly; verification must not
+        // refresh the cache or materialize metadata on the path under test.
+        cache.GetImage(id).Download(std::span{&copy, 1}, readback.Handle(), offset, bytes);
+        const auto *expected = reinterpret_cast<const uint8_t *>(pixels.data());
+        checks.push_back({data, offset, label, {expected, expected + bytes}});
+      };
+      const auto QueuePixels = [&](const char *phase) {
+        QueuePlane(source.image_id, vk::ImageAspectFlagBits::eDepth, expected_depth,
+                   std::string(phase) + " source depth");
+        QueuePlane(source.image_id, vk::ImageAspectFlagBits::eStencil, expected_stencil,
+                   std::string(phase) + " source stencil");
+        QueuePlane(depth_color_id, vk::ImageAspectFlagBits::eColor, expected_depth_color,
+                   std::string(phase) + " float color and borders");
+        QueuePlane(stencil_color_id, vk::ImageAspectFlagBits::eColor, expected_stencil_color,
+                   std::string(phase) + " byte color and borders");
+      };
+      QueuePixels("after rejection");
+      Require(name, "stencil copy accepted", RenderExecutorTestAccess::DepthStencilColorCopy(
+                  executor, scheduler.Current(), draw), "valid G-to-R stencil copy was rejected");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      expected_stencil = updated_stencil;
+      for (const auto pixel : copied_pixels) {
+        expected_stencil_color[pixel] = updated_stencil[pixel];
+      }
+      CheckPending(true, "stencil preserves depth metadata");
+      Require(name, "stencil refresh remains a read",
+              !cache.GetImage(stencil_id).IsCpuDirty() &&
+                  !cache.GetImage(source.image_id).IsGpuModified() &&
+                  cache.GetImage(stencil_color_id).IsGpuModified(),
+              "stencil copy missed its dirty association or marked the depth source written");
+      QueuePixels("after stencil copy");
+
+      SetCopy(false);
+      registers.SetDepthClearValue(0.375f);
+      Require(name, "deferred depth copy accepted", RenderExecutorTestAccess::DepthStencilColorCopy(
+                  executor, scheduler.Current(), draw), "valid depth copy was rejected");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      std::fill(expected_depth.begin(), expected_depth.end(), std::bit_cast<uint32_t>(0.375f));
+      for (const auto pixel : copied_pixels) {
+        expected_depth_color[pixel] = std::bit_cast<uint32_t>(0.375f);
+      }
+      CheckPending(false, "depth consumes only its pending clear");
+      Require(name, "materialized depth becomes GPU owned",
+              cache.GetImage(source.image_id).IsGpuModified(),
+              "materialized clear was not retained as GPU-written source data");
+      QueuePixels("after full depth clear and partial color copy");
+
+      // Run the real DrawAuto hook. Changing DB_DEPTH_CLEAR without ClearMeta
+      // must not clear the source again, and the ordinary zero-valued PS must
+      // never replace the copied depth. Re-seed the output to expose either error.
+      ClearDestination(false);
+      registers.SetDepthClearValue(0.125f);
+      constexpr const char *flag = "KYTY_VR_DEPTH_STENCIL_COLOR_COPY";
+      const char *previous_value = std::getenv(flag);
+      const std::optional<std::string> previous = previous_value != nullptr
+          ? std::optional<std::string>(previous_value) : std::nullopt;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+      Require(name, "enable DrawAuto copy", _putenv_s(flag, "1") == 0,
+              "failed to set copy opt-in");
+#else
+      Require(name, "enable DrawAuto copy", setenv(flag, "1", 1) == 0,
+              "failed to set copy opt-in");
+#endif
+      RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(), draw);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+      Require(name, "restore DrawAuto setting", _putenv_s(flag, previous ? previous->c_str() : "") == 0,
+              "failed to restore copy opt-in");
+#else
+      Require(name, "restore DrawAuto setting",
+              (previous ? setenv(flag, previous->c_str(), 1) : unsetenv(flag)) == 0,
+              "failed to restore copy opt-in");
+#endif
+      CheckPending(false, "DrawAuto does not repeat the clear");
+      QueuePixels("after opt-in DrawAuto without a new clear");
+      scheduler.Finish();
+      for (const auto &check : checks) {
+        readback.Invalidate(check.offset, check.expected.size());
+        Require(name, check.label.c_str(),
+                std::memcmp(check.data, check.expected.data(), check.expected.size()) == 0,
+                "native pixels lost aspect data, retained stale stencil, or changed outside the copy rectangle");
+      }
+
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap direct backing",
+            LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "copy fixture direct mapping release failed");
+    Require(name, "release direct backing",
+            LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "copy fixture direct-memory allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -43997,6 +44376,11 @@ int main(int argc, char **argv) {
     CheckDepthStencilColorCopy(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--renderer-depth-stencil-color-copy-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRendererDepthStencilColorCopy();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-rebind-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
@@ -44068,6 +44452,7 @@ int main(int argc, char **argv) {
   CheckSampledColorViews();
   CheckImageTransitionState(vulkan.RuntimeRenderer());
   CheckDepthStencilColorCopy(vulkan.RuntimeRenderer());
+  vulkan.CheckRendererDepthStencilColorCopy();
   CheckSampledDepthResource();
   CheckDepthTextureEncoding();
   vulkan.CheckSamplerBorderColors();

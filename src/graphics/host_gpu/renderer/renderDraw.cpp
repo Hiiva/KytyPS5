@@ -37,6 +37,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1309,6 +1310,15 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.vertex_count == 0 || args.instance_count == 0) {
 		return;
+	}
+
+	const auto& copy_control = buffer.GetRegisters().GetRenderControl();
+	if (copy_control.copy_depth_to_color || copy_control.copy_stencil_to_color) {
+		const char* enabled = std::getenv("KYTY_VR_DEPTH_STENCIL_COLOR_COPY");
+		if (enabled != nullptr && std::strcmp(enabled, "1") == 0 && DepthStencilColorCopy(buffer, args)) {
+			ResetBindings();
+			return;
+		}
 	}
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||

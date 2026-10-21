@@ -56,6 +56,9 @@ public:
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// Returns whether a pending depth clear was materialized, not a success flag.
+	bool PrepareDepthCopySource(CommandBuffer& command, ImageId id, const ImageDesc& desc,
+	                            vk::ImageAspectFlagBits aspect, float depth_clear);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -140,6 +143,8 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
+	// Caller holds m_lock. Read-only preparation must not acquire guest write ownership.
+	void                        PrepareDepthTarget(ImageId id, const ImageDesc& desc, bool written);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);

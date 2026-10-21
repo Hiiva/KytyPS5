@@ -1475,16 +1475,23 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 }
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
+	std::scoped_lock lock {m_lock};
+	PrepareDepthTarget(id, desc, true);
+	return m_slot_images[id].FindView(desc.view_info);
+}
+
+void TextureCache::PrepareDepthTarget(ImageId id, const ImageDesc& desc, bool written) {
 	if (desc.type != BindingType::DepthTarget) {
 		EXIT("TextureCache: invalid depth-target binding\n");
 	}
-	std::scoped_lock lock {m_lock};
-	auto&            image = m_slot_images[id];
+	auto& image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
-	image.MarkGpuModified();
+	if (written) {
+		image.MarkGpuModified();
+	}
 	image.usage.depth_target = true;
 	if (desc.info.HasStencil()) {
 		const auto layers = image.info.resources.layers;
@@ -1506,11 +1513,45 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		                                      .clear_mask = image.info.htile_clear_mask});
 	}
 	RefreshImage(id);
-	CommitGpuWrite(image);
+	if (written) {
+		CommitGpuWrite(image);
+	}
 	if (desc.info.HasStencil()) {
 		RefreshImage(AssociateStencil(id, desc.info.stencil));
 	}
-	return image.FindView(desc.view_info);
+}
+
+bool TextureCache::PrepareDepthCopySource(CommandBuffer& command, ImageId id,
+                                         const ImageDesc& desc, vk::ImageAspectFlagBits aspect,
+                                         float depth_clear) {
+	std::scoped_lock lock {m_lock};
+	const auto& view = desc.view_info;
+	// The initial copy path accepts only guest/native mip and layer zero, so the
+	// metadata slice and native layer cannot be confused by cache view remapping.
+	EXIT_IF((aspect != vk::ImageAspectFlagBits::eDepth &&
+	         aspect != vk::ImageAspectFlagBits::eStencil) ||
+	        view.base_level != 0 || view.level_count != 1 || view.base_layer != 0 ||
+	        view.layer_count != 1 ||
+	        (aspect == vk::ImageAspectFlagBits::eStencil && desc.info.metadata.stencil_compressed));
+	PrepareDepthTarget(id, desc, false);
+	if (aspect != vk::ImageAspectFlagBits::eDepth ||
+	    desc.info.metadata.kind != ImageMetadataKind::Htile) {
+		return false;
+	}
+	const auto found = m_surface_metas.find(desc.info.metadata.range.address);
+	EXIT_IF(found == m_surface_metas.end() || found->second.type != MetaDataInfo::Type::HTile);
+	if ((found->second.clear_mask & 1u) == 0) {
+		return false;
+	}
+	// A pending HTile bit describes the entire slice, even when the color write
+	// covers only an interior scissor. Preserve the other aspect and other layers.
+	vk::ClearValue clear {};
+	clear.depthStencil = vk::ClearDepthStencilValue {depth_clear, 0};
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+	ClearImage(command, id, m_slot_images[id].backing.format, range, clear);
+	// Publish consumption only after the full-slice clear has been recorded.
+	found->second.clear_mask &= ~1u;
+	return true;
 }
 
 void TextureCache::MarkGpuWritten(ImageId id) {
