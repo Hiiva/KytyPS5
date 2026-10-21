@@ -347,6 +347,12 @@ struct AaSampleControl {
 	uint32_t locations[16]     = {};
 };
 
+struct AaMaskControl {
+	uint32_t masks[2] = {0xffffffffu, 0xffffffffu};
+	uint32_t shader_sample_exclusion = 0;
+	uint8_t observed = 0; // Bits 0/1: AA mask words; bit 2: shader exclusion mask.
+};
+
 struct DepthShaderControl {
 	uint32_t other_bits                  = 0;
 	uint8_t  conservative_z_export_value = 0;
@@ -844,6 +850,8 @@ public:
 	void SetScanModeControl(const ScanModeControl& control) { m_scan_mode_control = control; }
 	[[nodiscard]] const AaSampleControl& GetAaSampleControl() const { return m_aa_sample_control; }
 	void SetAaSampleControl(const AaSampleControl& control) { m_aa_sample_control = control; }
+	[[nodiscard]] const AaMaskControl& GetAaMaskControl() const { return m_aa_mask_control; }
+	void SetAaMaskControl(const AaMaskControl& control) { m_aa_mask_control = control; }
 	[[nodiscard]] const AaConfig& GetAaConfig() const { return m_aa_config; }
 	void                          SetAaConfig(const AaConfig& config) { m_aa_config = config; }
 
@@ -917,6 +925,7 @@ private:
 	ScanModeControl m_scan_mode_control;
 
 	AaSampleControl m_aa_sample_control;
+	AaMaskControl   m_aa_mask_control;
 	AaConfig        m_aa_config;
 
 	uint32_t m_shader_stages = 0;

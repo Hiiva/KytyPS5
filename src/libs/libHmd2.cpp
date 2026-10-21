@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -238,6 +239,90 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionGetPredictedDisplayTime(
     return OK;
 }
 
+// Diagnostic layout from Horizon's native builder at RVA 0x10ed8b0 and
+// sceHmd2ReprojectionSetParam call at RVA 0x10edeae. The nested descriptors
+// are optional reprojection inputs; their format does not establish colour.
+static void TraceReprojectionSources(uint32_t index, uint64_t frame, const void* param) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("KYTY_VR_SOURCE_TRACE");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::atomic<uint32_t> calls {0};
+    if (calls.load(std::memory_order_relaxed) >= 16384u) {
+        return;
+    }
+    const uint32_t call = calls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    // Retain both alternating buffer indices at each later sampling point.
+    if (call > 16384u || (call > 4u && (call & 255u) > 1u)) {
+        return;
+    }
+    const auto clock_ms = static_cast<uint64_t>(std::chrono::duration_cast<
+        std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    const auto address = reinterpret_cast<uint64_t>(param);
+    if (!Graphics::HostMemoryRangeIsReadable(address, 24u)) {
+        LOGF("Hmd2 source trace submit call=%u index=%u frame=%" PRIu64
+             " clock_ms=%" PRIu64 " param=%p readable=0\n", call, index, frame, clock_ms, param);
+        return;
+    }
+    uint64_t layers = 0;
+    uint32_t count = 0;
+    std::memcpy(&layers, param, sizeof(layers));
+    std::memcpy(&count, static_cast<const uint8_t*>(param) + 8u, sizeof(count));
+    constexpr size_t layer_bytes = 0x148u;
+    const bool readable = count >= 1u && count <= 4u &&
+        Graphics::HostMemoryRangeIsReadable(layers, count * layer_bytes);
+    LOGF("Hmd2 source trace submit call=%u index=%u frame=%" PRIu64
+         " clock_ms=%" PRIu64 " param=%p layers=%016" PRIx64 " count=%u readable=%d\n",
+         call, index, frame, clock_ms, param, layers, count, readable);
+    if (!readable) {
+        return;
+    }
+    for (uint32_t layer_index = 0; layer_index < count; ++layer_index) {
+        std::array<uint8_t, layer_bytes> layer {};
+        std::memcpy(layer.data(), reinterpret_cast<const void*>(layers + layer_index * layer_bytes),
+                    layer.size());
+        std::array<uint32_t, 6> header {};
+        std::array<uint32_t, 8> rects {};
+        uint64_t nested = 0;
+        uint64_t layer_frame = 0;
+        std::memcpy(header.data(), layer.data(), sizeof(header));
+        std::memcpy(rects.data(), layer.data() + 0x28u, sizeof(rects));
+        std::memcpy(&layer_frame, layer.data() + 0x90u, sizeof(layer_frame));
+        std::memcpy(&nested, layer.data() + 0xd8u, sizeof(nested));
+        LOGF("Hmd2 source trace layer call=%u layer=%u type=%u id=%u"
+             " dimsL=%ux%u dimsR=%ux%u rectL=(%u,%u,%u,%u) rectR=(%u,%u,%u,%u)"
+             " byte9d=%u layer_frame=%" PRIu64 " nested=%016" PRIx64 "\n",
+             call, layer_index, header[0], header[1], header[2], header[3], header[4], header[5],
+             rects[2], rects[3], rects[0], rects[1], rects[6], rects[7], rects[4], rects[5],
+             static_cast<uint32_t>(layer[0x9du]), layer_frame, nested);
+        // Two 32-byte TSharps followed by two {width,height,x,y} rectangles.
+        // Read only the evidenced prefix, not the complete native 0x290-byte block.
+        std::array<uint8_t, 0x68u> inputs {};
+        if (!Graphics::HostMemoryRangeIsReadable(nested, inputs.size())) {
+            LOGF("Hmd2 source trace nested call=%u layer=%u readable=0\n", call, layer_index);
+            continue;
+        }
+        std::memcpy(inputs.data(), reinterpret_cast<const void*>(nested), inputs.size());
+        uint32_t nested_type = 0;
+        std::memcpy(&nested_type, inputs.data(), sizeof(nested_type));
+        std::memcpy(rects.data(), inputs.data() + 0x48u, sizeof(rects));
+        for (uint32_t eye = 0; eye < 2u; ++eye) {
+            Hmd2LayerDescriptor::Texture texture {};
+            const bool decoded = Hmd2LayerDescriptor::DecodeTexture(
+                std::span<const uint8_t>(inputs).subspan(8u + eye * 32u, 32u), &texture);
+            const auto r = eye * 4u;
+            LOGF("Hmd2 source trace nested call=%u layer=%u type=%u eye=%u decoded=%d"
+                 " gpu=%016" PRIx64 " extent=%ux%u format=%u tile=%u image_type=%u compressed=%d"
+                 " rect=(%u,%u,%u,%u)\n", call, layer_index, nested_type, eye, decoded,
+                 texture.address, texture.width, texture.height, texture.format, texture.tile_mode,
+                 texture.image_type, texture.compressed, rects[r + 2u], rects[r + 3u], rects[r], rects[r + 1u]);
+        }
+    }
+}
+
 static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetParam(
     uint32_t index, uint64_t frame, const void* param, const void* trace) {
     if (GetReprojectionState() == nullptr) {
@@ -246,6 +331,7 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetParam(
     if (param == nullptr) {
         return ERROR_PARAMETER_NULL;
     }
+    TraceReprojectionSources(index, frame, param);
     static std::atomic<uint32_t> logs {0};
     if (logs.fetch_add(1u, std::memory_order_relaxed) < 4u) {
         LOGF("Hmd2: SetParam index=%u frame=%" PRIu64 " param=%p trace=%p\n",

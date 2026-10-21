@@ -29,6 +29,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -1445,6 +1446,64 @@ KYTY_SYSV_ABI int VideoOutAddOutputModeEvent(LibKernel::EventQueue::KernelEqueue
 	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::OutputMode, udata);
 }
 
+// Horizon registers two colour layers per buffer through a {pointer,count}
+// wrapper (RVA 0x10e9c7e/0x10e9c96, second buffer 0x10e9db1/0x10e9dc4).
+// Their native stride is 0x130; only the type and two TSharp prefixes are decoded.
+static void TraceRegisteredHmd2Layers(int handle, int set_index, int buffer_index,
+                                      uint64_t registration) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("KYTY_VR_SOURCE_TRACE");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::atomic<uint32_t> calls {0};
+    if (calls.load(std::memory_order_relaxed) >= 16u) {
+        return;
+    }
+    const uint32_t call = calls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (call > 16u) {
+        return;
+    }
+    std::array<uint8_t, 16> wrapper {};
+    if (!Graphics::HostMemoryRangeIsReadable(registration, wrapper.size())) {
+        LOGF("Hmd2 source trace register call=%u handle=%d set=%d buffer=%d wrapper=%016" PRIx64
+             " readable=0\n", call, handle, set_index, buffer_index, registration);
+        return;
+    }
+    std::memcpy(wrapper.data(), reinterpret_cast<const void*>(registration), wrapper.size());
+    uint64_t layers = 0;
+    uint32_t count = 0;
+    std::memcpy(&layers, wrapper.data(), sizeof(layers));
+    std::memcpy(&count, wrapper.data() + 8u, sizeof(count));
+    constexpr size_t stride = 0x130u;
+    const bool readable = count >= 1u && count <= 4u &&
+        Graphics::HostMemoryRangeIsReadable(layers, count * stride);
+    LOGF("Hmd2 source trace register call=%u handle=%d set=%d buffer=%d wrapper=%016" PRIx64
+         " layers=%016" PRIx64 " count=%u readable=%d\n",
+         call, handle, set_index, buffer_index, registration, layers, count, readable);
+    if (!readable) {
+        return;
+    }
+    for (uint32_t layer_index = 0; layer_index < count; ++layer_index) {
+        std::array<uint8_t, Hmd2LayerDescriptor::kLayerBytes> raw {};
+        std::memcpy(raw.data(), reinterpret_cast<const void*>(layers + layer_index * stride), raw.size());
+        Hmd2LayerDescriptor::Layer layer {};
+        const bool decoded = Hmd2LayerDescriptor::Decode(raw, &layer);
+        uint32_t type = 0;
+        std::memcpy(&type, raw.data(), sizeof(type));
+        for (uint32_t eye = 0; eye < 2u; ++eye) {
+            const auto& texture = eye == 0u ? layer.left : layer.right;
+            LOGF("Hmd2 source trace registered-layer call=%u buffer=%d layer=%u type=%u eye=%u decoded=%d"
+                 " gpu=%016" PRIx64 " extent=%ux%u format=%u tile=%u image_type=%u compressed=%d\n",
+                 call, buffer_index, layer_index, type, eye, decoded, texture.address,
+                 texture.width, texture.height, texture.format, texture.tile_mode,
+                 texture.image_type, texture.compressed);
+        }
+    }
+}
+
 KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer_index_start,
                                            const VideoOutBuffers* buffers, int buffer_num,
                                            const VideoOutBufferAttribute2* attribute, int category,
@@ -1513,6 +1572,7 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
         uint64_t data_address = reinterpret_cast<uint64_t>(buffers[i].data);
         const auto metadata_address = reinterpret_cast<uint64_t>(buffers[i].metadata);
         if (category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HMD2) {
+            TraceRegisteredHmd2Layers(handle, set_index, buffer_index_start + i, data_address);
             // Category 16 passes one small eye descriptor per registration.
             // Each descriptor points to a packed 40-bit GPU image address in
             // the upper 40 bits of its first QWORD.

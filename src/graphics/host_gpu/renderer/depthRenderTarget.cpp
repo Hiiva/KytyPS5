@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -48,6 +49,35 @@ static void TraceDepthCopyState(const CommandBuffer& buffer) {
 	const auto& cb = hw.GetRenderTarget(0);
 	const auto& sh = hw.GetShaderRegisters();
 	const auto ps = buffer.GetShaders().GetPs().ps_regs.data_addr;
+	const auto& vs = buffer.GetShaders().GetVs();
+	const auto& ucfg = buffer.GetUserConfig();
+	const auto& vp = hw.GetScreenViewport();
+	const auto& vp0 = vp.viewports[0];
+	const auto& clip = hw.GetClipControl();
+	const auto& mode = hw.GetModeControl();
+	const auto& scan = hw.GetScanModeControl();
+	const auto& masks = hw.GetAaMaskControl();
+	const auto& blend = hw.GetBlendControl(0);
+	const auto debug = buffer.GetDebugSnapshot();
+	const auto scissor = calc_final_scissor(
+	    vp, scan, {cb.attrib2.width + 1u, cb.attrib2.height + 1u}, 0);
+	const uint64_t coverage_flags =
+	    static_cast<uint64_t>(mode.cull_front) |
+	    (static_cast<uint64_t>(mode.cull_back) << 1u) |
+	    (static_cast<uint64_t>(mode.face) << 2u) |
+	    (static_cast<uint64_t>(mode.poly_mode) << 3u) |
+	    (static_cast<uint64_t>(mode.polymode_front_ptype) << 8u) |
+	    (static_cast<uint64_t>(mode.polymode_back_ptype) << 12u) |
+	    (static_cast<uint64_t>(mode.vtx_window_offset_enable) << 16u) |
+	    (static_cast<uint64_t>(clip.clip_disable) << 17u) |
+	    (static_cast<uint64_t>(clip.dx_clip_space) << 18u) |
+	    (static_cast<uint64_t>(clip.min_z_clip_disable) << 19u) |
+	    (static_cast<uint64_t>(clip.max_z_clip_disable) << 20u) |
+	    (static_cast<uint64_t>(clip.force_viewport_index_from_vs_enable) << 21u) |
+	    (static_cast<uint64_t>(scan.msaa_enable) << 22u) |
+	    (static_cast<uint64_t>(scan.vport_scissor_enable) << 23u) |
+	    (static_cast<uint64_t>(clip.user_clip_planes) << 24u) |
+	    (static_cast<uint64_t>(clip.user_clip_plane_mode) << 32u);
 	const uint64_t flags =
 	    static_cast<uint64_t>(rc.copy_depth_to_color) |
 	    (static_cast<uint64_t>(rc.copy_stencil_to_color) << 1u) |
@@ -65,8 +95,7 @@ static void TraceDepthCopyState(const CommandBuffer& buffer) {
 	    (static_cast<uint64_t>(z.depth_view.depth_write_disable) << 16u) |
 	    (static_cast<uint64_t>(z.depth_view.stencil_write_disable) << 17u);
 	const auto pair = [](uint32_t a, uint32_t b) { return (static_cast<uint64_t>(a) << 32u) | b; };
-	using Key = std::array<uint64_t, 17>;
-	const Key key {
+	auto key = std::to_array<uint64_t>({
 	    flags,
 	    pair(static_cast<uint32_t>(z.z_info.format), static_cast<uint32_t>(z.stencil_info.format)),
 	    pair(z.size.x_max, z.size.y_max), pair(z.size.valid, z.z_info.num_samples),
@@ -81,8 +110,20 @@ static void TraceDepthCopyState(const CommandBuffer& buffer) {
 	    pair(z.z_read_base_addr == cb.base.addr, z.stencil_read_base_addr == cb.base.addr),
 	    pair(z.depth_view.current_mip_level, cb.view.current_mip_level),
 	    pair(cb.attrib3.dimension, cb.attrib3.depth),
-	};
-	// Surface addresses rotate. Retain one example of each operation/format/shader combination.
+	    pair(debug.op, static_cast<uint32_t>(ucfg.GetPrimType())),
+	    pair(debug.args[0], debug.args[1]), pair(debug.args[2], debug.args[3]), debug.arg4,
+	    vs.es_regs.data_addr, vs.gs_regs.data_addr, ucfg.GetIndexOffset(),
+	    pair(std::bit_cast<uint32_t>(vp0.xscale), std::bit_cast<uint32_t>(vp0.xoffset)),
+	    pair(std::bit_cast<uint32_t>(vp0.yscale), std::bit_cast<uint32_t>(vp0.yoffset)),
+	    pair(std::bit_cast<uint32_t>(vp0.zscale), std::bit_cast<uint32_t>(vp0.zoffset)),
+	    pair(scissor.left, scissor.top), pair(scissor.right, scissor.bottom),
+	    pair(vp.transform_control, vp.clip_rect_rule),
+	    pair(vp.window_offset_x, vp.window_offset_y), pair(vp.hw_offset_x, vp.hw_offset_y),
+	    coverage_flags, pair(hw.GetColorControl().op, blend.enable),
+	    pair(masks.masks[0], masks.masks[1]), pair(masks.shader_sample_exclusion, masks.observed),
+	});
+	using Key = decltype(key);
+	// Surface addresses rotate; retain distinct format, shader, and draw-coverage states.
 	static std::mutex mutex;
 	static std::array<Key, 64> configurations {};
 	static uint32_t count = 0;
@@ -134,6 +175,46 @@ static void TraceDepthCopyState(const CommandBuffer& buffer) {
 	     hw.GetRenderTargetMask() & 0xfu, sh.m_cbShaderMask & 0xfu, sh.target_output_mode[0], hw.GetColorControl().mode,
 	     static_cast<unsigned>(z.z_read_base_addr == cb.base.addr),
 	     static_cast<unsigned>(z.stencil_read_base_addr == cb.base.addr));
+	LOGF("DepthCopyTrace[%u]: es=0x%016" PRIx64 " gs=0x%016" PRIx64
+	     " prim=%u index_offset=%u submit=%" PRIu64 "\n",
+	     id, vs.es_regs.data_addr, vs.gs_regs.data_addr, static_cast<unsigned>(ucfg.GetPrimType()),
+	     ucfg.GetIndexOffset(), debug.submit_id);
+	// At ResolveRenderDepthTarget, DrawAuto/DrawIndex have recorded their arguments but have
+	// not entered ExecutePreparedDraw (which reuses these fields for phase diagnostics).
+	// Indirect draws call the same entry points; their origin is not retained in this snapshot.
+	if (debug.op == static_cast<uint32_t>(CommandBufferDebugOp::DrawIndexAuto) && debug.args[1] == 0) {
+		LOGF("DepthCopyTrace[%u]: draw=auto origin=unrecorded count=%u instances=%u"
+		     " first_vertex=%u first_instance=%" PRIu64 "\n",
+		     id, debug.args[0], debug.args[3], debug.args[2], debug.arg4);
+	} else if (debug.op == static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex) &&
+	           debug.args[1] == 0 && debug.args[2] == 1) {
+		LOGF("DepthCopyTrace[%u]: draw=indexed origin=unrecorded count=%u instances=%u"
+		     " index_addr=0x%016" PRIx64 " index_type/base_vertex/first_instance=unrecorded\n",
+		     id, debug.args[0], debug.args[3], debug.arg4);
+	} else {
+		LOGF("DepthCopyTrace[%u]: draw=unknown op=%u args=%u/%u/%u/%u/0x%016" PRIx64 "\n",
+		     id, debug.op, debug.args[0], debug.args[1], debug.args[2], debug.args[3], debug.arg4);
+	}
+	LOGF("DepthCopyTrace[%u]: viewport0_scale=(%.9g,%.9g,%.9g) offset=(%.9g,%.9g,%.9g)"
+	     " transform=0x%x scissor0=(%d,%d)-(%d,%d) clip_rule=0x%x"
+	     " window_offset=%d/%d hw_offset=%u/%u\n",
+	     id, vp0.xscale, vp0.yscale, vp0.zscale, vp0.xoffset, vp0.yoffset, vp0.zoffset,
+	     vp.transform_control, scissor.left, scissor.top, scissor.right, scissor.bottom,
+	     vp.clip_rect_rule, vp.window_offset_x, vp.window_offset_y, vp.hw_offset_x, vp.hw_offset_y);
+	LOGF("DepthCopyTrace[%u]: cull=%u/%u face=%u polygon=%u/%u/%u vertex_window_offset=%u"
+	     " clip_disable=%u dx_clip=%u z_clip_disable=%u/%u force_vs_viewport=%u"
+	     " user_clip=%u/%u msaa=%u viewport_scissor=%u color_op=0x%x blend=%u"
+	     " aa_masks=0x%08x/0x%08x ps_sample_exclusion=0x%08x masks_observed=0x%x\n",
+	     id, static_cast<unsigned>(mode.cull_front), static_cast<unsigned>(mode.cull_back),
+	     static_cast<unsigned>(mode.face), mode.poly_mode, mode.polymode_front_ptype,
+	     mode.polymode_back_ptype, static_cast<unsigned>(mode.vtx_window_offset_enable),
+	     static_cast<unsigned>(clip.clip_disable), static_cast<unsigned>(clip.dx_clip_space),
+	     static_cast<unsigned>(clip.min_z_clip_disable), static_cast<unsigned>(clip.max_z_clip_disable),
+	     static_cast<unsigned>(clip.force_viewport_index_from_vs_enable), clip.user_clip_planes,
+	     clip.user_clip_plane_mode, static_cast<unsigned>(scan.msaa_enable),
+	     static_cast<unsigned>(scan.vport_scissor_enable), hw.GetColorControl().op,
+	     static_cast<unsigned>(blend.enable), masks.masks[0], masks.masks[1],
+	     masks.shader_sample_exclusion, masks.observed);
 }
 
 [[noreturn]] static void DepthFatal(const char* format, ...) {

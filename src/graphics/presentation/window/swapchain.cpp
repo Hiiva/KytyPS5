@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -448,6 +449,56 @@ struct Presenter::Impl {
 		frames.SetFormat(swapchain.Format());
 	}
 
+    void TraceResolvedSurface(const ImageInfo& requested, ImageId selected,
+                              const Image& image, const char* path) {
+        static const bool enabled = [] {
+            const char* value = std::getenv("KYTY_VR_SOURCE_TRACE");
+            return value != nullptr && value[0] == '1' && value[1] == '\0';
+        }();
+        if (!enabled) {
+            return;
+        }
+        static std::atomic<uint32_t> calls {0};
+        if (calls.load(std::memory_order_relaxed) >= 16384u) {
+            return;
+        }
+        const uint32_t call = calls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (call > 16384u || (call > 4u && (call & 255u) > 1u)) {
+            return;
+        }
+        const auto clock_ms = static_cast<uint64_t>(std::chrono::duration_cast<
+            std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        const auto presented = window.loop.presented_frames.load(std::memory_order_relaxed);
+        auto& cache = renderer.GetTextureCache();
+        ImageId rendered_id {};
+        const bool rendered_found = cache.FindRenderedPanelImage(requested, &rendered_id);
+        const auto& info = image.info;
+        LOGF("Hmd2 source trace surface call=%u frame=%" PRIu64 " host_ms=%" PRIu64
+             " clock_ms=%" PRIu64 " path=%s request=%016" PRIx64 " request_extent=%ux%u request_fmt=%u"
+             " selected=%u gpu=%016" PRIx64 " extent=%ux%u host_extent=%ux%u guest_fmt=%u host_fmt=%u"
+             " tile=%u levels=%u layers=%u samples=%u bytes=%" PRIu64
+             " registered=%d dirty=%d gpu_modified=%d buffer_modified=%d target=%d storage=%d tick=%" PRIu64
+             " rendered_found=%d rendered_id=%u\n",
+             call, presented, static_cast<uint64_t>(SDL_GetTicks()), clock_ms, path,
+             requested.data.address, requested.extent.width, requested.extent.height,
+             static_cast<uint32_t>(requested.pixel_format), selected.index, info.data.address,
+             info.extent.width, info.extent.height, image.backing.extent.width, image.backing.extent.height,
+             static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(image.backing.format),
+             static_cast<uint32_t>(info.tile_mode), info.resources.levels, info.resources.layers,
+             info.samples, info.data.size, image.registered, image.IsCpuDirty(), image.IsGpuModified(),
+             image.IsBufferModified(), image.usage.render_target, image.usage.storage, image.tick_accessed_last,
+             rendered_found, rendered_found ? rendered_id.index : 0u);
+        if (rendered_found && rendered_id != selected) {
+            const auto& alternative = cache.GetImage(rendered_id);
+            LOGF("Hmd2 source trace alternative call=%u id=%u gpu=%016" PRIx64
+                 " extent=%ux%u host_fmt=%u dirty=%d gpu_modified=%d tick=%" PRIu64 "\n",
+                 call, rendered_id.index, alternative.info.data.address,
+                 alternative.info.extent.width, alternative.info.extent.height,
+                 static_cast<uint32_t>(alternative.backing.format), alternative.IsCpuDirty(),
+                 alternative.IsGpuModified(), alternative.tick_accessed_last);
+        }
+    }
+
 	Image& ResolveSurface(const ImageInfo& info, const ImageId* direct_source = nullptr) {
 		TextureCache::ImageDesc desc {};
 		desc.info                  = info;
@@ -466,6 +517,7 @@ struct Presenter::Impl {
 			auto& image = cache.GetImage(*direct_source);
 			image.usage.video_out = true;
 			cache.UpdateImage(*direct_source);
+            TraceResolvedSurface(info, *direct_source, image, "direct");
 			return image;
 		}
         if (std::getenv("KYTY_VR_DUMP_IMAGES") != nullptr) {
@@ -479,6 +531,7 @@ struct Presenter::Impl {
 		auto&      image      = cache.GetImage(image_id);
 		image.usage.video_out = true;
 		cache.UpdateImage(image_id);
+        TraceResolvedSurface(info, image_id, image, "video-out");
 		return image;
 	}
 	void Present();
@@ -1260,6 +1313,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
                 right.usage.video_out = true;
                 cache.UpdateImage(left_id);
                 cache.UpdateImage(right_id);
+                m_impl->TraceResolvedSurface(info, left_id, left, "stereo-left");
+                m_impl->TraceResolvedSurface(info, right_id, right, "stereo-right");
                 frame->Configure(m_impl->window.graphic_ctx,
                                  {4000u, 2040u}, initial_format);
                 frame->BlitStereo(buffer, left, right);

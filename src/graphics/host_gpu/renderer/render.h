@@ -114,6 +114,16 @@ public:
 	void EndRendering() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	struct DebugSnapshot {
+		uint32_t op;
+		uint64_t submit_id;
+		std::array<uint32_t, 4> args;
+		uint64_t arg4;
+	};
+	[[nodiscard]] DebugSnapshot GetDebugSnapshot() const noexcept {
+		return {m_debug_op, m_debug_submit_id,
+		        {m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3}, m_debug_arg4};
+	}
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }

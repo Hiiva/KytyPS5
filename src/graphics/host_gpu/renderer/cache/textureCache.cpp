@@ -552,6 +552,29 @@ bool TextureCache::FindReprojectionEyePair(ImageId* left, ImageId* right) const 
     *right = ids[pair->right_index];
     return true;
 }
+bool TextureCache::FindRenderedPanelImage(const ImageInfo& panel, ImageId* selected) const {
+    if (selected == nullptr || panel.data.address == 0) {
+        return false;
+    }
+    uint64_t newest_tick = 0;
+    bool found = false;
+    m_slot_images.ForEach([&](ImageId id, const Image& image) {
+        const auto& info = image.info;
+        if (!image.registered || image.backing.image == nullptr ||
+            !image.usage.render_target || !image.IsGpuModified() || info.IsDepth() ||
+            info.data.address != panel.data.address ||
+            info.extent.width != panel.extent.width ||
+            info.extent.height != panel.extent.height ||
+            info.pixel_format != panel.pixel_format ||
+            (found && image.tick_accessed_last <= newest_tick)) {
+            return;
+        }
+        *selected = id;
+        newest_tick = image.tick_accessed_last;
+        found = true;
+    });
+    return found;
+}
 void TextureCache::DumpReprojectionCandidates() const {
     uint32_t candidates = 0;
     m_slot_images.ForEach([&](ImageId id, const Image& image) {

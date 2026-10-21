@@ -286,8 +286,26 @@ KYTY_HW_CTX_PARSER(HwCtxSetCentroidPriority) {
 	return num_values;
 }
 
-static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
-                                      [[maybe_unused]] uint32_t value) {}
+static void HwCtxCaptureAaMaskRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+	auto control = cp.GetCtx().GetAaMaskControl();
+	switch (cmd_offset) {
+		case Pm4::PA_SC_AA_MASK_X0Y0_X1Y0:
+			control.masks[0] = value;
+			control.observed |= 1u;
+			break;
+		case Pm4::PA_SC_AA_MASK_X0Y1_X1Y1:
+			control.masks[1] = value;
+			control.observed |= 2u;
+			break;
+		case Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK:
+			control.shader_sample_exclusion = value;
+			control.observed |= 4u;
+			break;
+		default: return;
+	}
+	// Retain guest state for diagnostics; pipeline sample-mask behavior is unchanged.
+	cp.GetCtx().SetAaMaskControl(control);
+}
 
 static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
 
@@ -517,7 +535,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaMask) {
 	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 
 	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset + i, buffer[i]);
+		HwCtxCaptureAaMaskRegister(cp, cmd_offset + i, buffer[i]);
 	}
 
 	return num_values;
@@ -3503,16 +3521,16 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 
 	g_hw_ctx_indirect_func[Pm4::PA_SC_AA_MASK_X0Y0_X1Y0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
+		HwCtxCaptureAaMaskRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SC_AA_MASK_X0Y1_X1Y1] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
+		HwCtxCaptureAaMaskRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_VTX_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreVtxControl(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
+		HwCtxCaptureAaMaskRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SC_BINNER_CNTL_0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnorePaScExtendedControl(cmd_offset, value);
