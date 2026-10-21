@@ -25,16 +25,30 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef min
+#undef max
+#else
+#include <unistd.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -72,15 +86,67 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 	}
 }
 
-std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
+std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties,
+                                std::string_view development_key) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
 	for (size_t i = 0; i < VK_UUID_SIZE; i++) {
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+	std::string revision = KYTY_GIT_REVISION;
+	if (!development_key.empty()) {
+		revision += ":dev:";
+		revision += development_key;
+	}
+	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", revision,
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+}
+
+std::string NormalizeDriverCacheDevelopmentKey(std::string_view key) {
+	if (key.size() != 64) {
+		return {};
+	}
+	std::string normalized;
+	normalized.reserve(key.size());
+	for (const char c: key) {
+		if (c >= '0' && c <= '9') {
+			normalized += c;
+		} else if (c >= 'a' && c <= 'f') {
+			normalized += c;
+		} else if (c >= 'A' && c <= 'F') {
+			normalized += static_cast<char>(c - 'A' + 'a');
+		} else {
+			return {};
+		}
+	}
+	return normalized;
+}
+
+std::filesystem::path DriverCacheTemporaryPath(const std::filesystem::path& destination,
+                                             const void* cache_instance) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const auto process_id = GetCurrentProcessId();
+#else
+	const auto process_id = getpid();
+#endif
+	auto temporary = destination;
+	temporary += "." + std::to_string(process_id) + "." +
+	             std::to_string(reinterpret_cast<uintptr_t>(cache_instance)) + ".tmp";
+	return temporary;
+}
+
+bool ReplaceDriverCacheFile(const std::filesystem::path& temporary,
+                            const std::filesystem::path& destination) {
+	// Both paths are in the same directory. Never delete the last valid cache first.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return MoveFileExW(temporary.c_str(), destination.c_str(),
+	                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+	std::error_code error;
+	std::filesystem::rename(temporary, destination, error);
+	return !error;
+#endif
 }
 
 std::string PipelineCacheTitleId() {
@@ -513,12 +579,23 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
 		return;
 	}
-	if (git_hash.ends_with("-dirty")) {
+	if (const char* key = std::getenv("KYTY_DEV_PIPELINE_CACHE_SHA256"); key != nullptr && *key != '\0') {
+		m_driver_cache_dev_key = NormalizeDriverCacheDevelopmentKey(key);
+		if (m_driver_cache_dev_key.empty()) {
+			PipelineCacheLog("Vulkan pipeline cache: ignored invalid development executable SHA256");
+		}
+	}
+	if (git_hash.ends_with("-dirty") && m_driver_cache_dev_key.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
 		return;
 	}
 
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	m_driver_cache_path = std::filesystem::path("_PipelineCache");
+	if (!m_driver_cache_dev_key.empty()) {
+		m_driver_cache_path /= "dev";
+		m_driver_cache_path /= m_driver_cache_dev_key;
+	}
+	m_driver_cache_path /= title_id + ".bin";
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -530,7 +607,8 @@ void PipelineCache::InitializeDriverCache() {
 	if (cache_exists) {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
-		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(),
+		                                             m_driver_cache_dev_key);
 		if (file_size >= signature.size() + sizeof(uint64_t) &&
 		    file_size <= std::numeric_limits<uint32_t>::max()) {
 			std::string cached_signature(signature.size(), '\0');
@@ -577,18 +655,39 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	if (!initial_data.empty()) {
+		m_driver_cache_saved_hash = XXH3_64bits(initial_data.data(), initial_data.size());
+		m_driver_cache_saved_size = initial_data.size();
 		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {}", initial_data.size(),
 		                 path);
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+	m_driver_cache_checkpoint = std::chrono::steady_clock::now();
 }
 
 void PipelineCache::Save() {
-	if (m_driver_cache == nullptr) {
+	if (m_driver_cache == nullptr || !WriteDriverCache(false)) {
 		return;
 	}
+	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	m_driver_cache = nullptr;
+}
 
+void PipelineCache::Checkpoint() {
+	// Called only after a new pipeline succeeds, under the owning render-context mutex.
+	// Development runs may terminate before shutdown; keep the live driver cache usable.
+	if (m_driver_cache == nullptr || m_driver_cache_dev_key.empty()) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_driver_cache_checkpoint < std::chrono::seconds(60)) {
+		return;
+	}
+	m_driver_cache_checkpoint = now; // Bound failed attempts too.
+	WriteDriverCache(true);
+}
+
+bool PipelineCache::WriteDriverCache(bool only_if_changed) {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -609,18 +708,21 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
-	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+	if (only_if_changed && m_driver_cache_saved_size == payload.size() &&
+	    m_driver_cache_saved_hash == payload_hash) {
+		return true;
+	}
+	auto prefix = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_driver_cache_dev_key);
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
-	auto temp_path = m_driver_cache_path;
-	temp_path += ".tmp";
+	const auto temp_path = DriverCacheTemporaryPath(m_driver_cache_path, this);
 	Common::File file;
 	uint32_t     prefix_written  = 0;
 	uint32_t     payload_written = 0;
@@ -631,15 +733,16 @@ void PipelineCache::Save() {
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
 	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
+	    !ReplaceDriverCacheFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	m_driver_cache_saved_hash = payload_hash;
+	m_driver_cache_saved_size = payload.size();
+	return true;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -986,6 +1089,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 
+	Checkpoint();
 	return *iter->second;
 }
 
@@ -1014,6 +1118,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
 
+	Checkpoint();
 	return *iter->second;
 }
 } // namespace Libs::Graphics

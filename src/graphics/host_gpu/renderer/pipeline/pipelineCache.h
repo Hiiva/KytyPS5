@@ -8,10 +8,12 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 
@@ -169,15 +171,21 @@ private:
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
 
-	GraphicContext&               m_graphics;
-	std::unique_ptr<ProgramCache> m_program_cache;
-	vk::PipelineCache             m_driver_cache = nullptr;
-	std::filesystem::path         m_driver_cache_path;
+	GraphicContext&                      m_graphics;
+	std::unique_ptr<ProgramCache>         m_program_cache;
+	vk::PipelineCache                    m_driver_cache = nullptr;
+	std::filesystem::path                m_driver_cache_path;
+	std::string                          m_driver_cache_dev_key;
+	std::chrono::steady_clock::time_point m_driver_cache_checkpoint;
+	uint64_t                             m_driver_cache_saved_hash = 0;
+	size_t                               m_driver_cache_saved_size = 0;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
 	void InitializeDriverCache();
+	bool WriteDriverCache(bool only_if_changed);
+	void Checkpoint();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
