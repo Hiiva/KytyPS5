@@ -205,6 +205,10 @@ private:
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
+	void TracePanelDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
+	                    const DrawEmitInfo& emit, const DrawRenderState& state,
+	                    const RenderState& rendering,
+	                    std::span<PreparedBindings* const> stages);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -226,6 +230,10 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	uint32_t                             m_panel_trace_draws = 0;
+	uint32_t                             m_panel_capture_index = 0;
+	uint32_t                             m_panel_capture_misses = 0;
+	uint64_t                             m_panel_capture_bytes = 0;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

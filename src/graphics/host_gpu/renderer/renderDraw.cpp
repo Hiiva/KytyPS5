@@ -35,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +45,8 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -1030,6 +1033,393 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+namespace {
+
+template <typename Handle>
+uint64_t PanelNativeHandle(Handle handle) {
+	using Native = typename Handle::CType;
+	if constexpr (std::is_pointer_v<Native>) {
+		return reinterpret_cast<uintptr_t>(static_cast<Native>(handle));
+	} else {
+		return static_cast<uint64_t>(static_cast<Native>(handle));
+	}
+}
+
+uint32_t PanelCaptureTexelBytes(vk::Format format) {
+	// Raw captures retain the native encoding; no color conversion or format guessing.
+	switch (format) {
+		case vk::Format::eR8Unorm:
+		case vk::Format::eR8Uint: return 1;
+		case vk::Format::eR8G8Unorm:
+		case vk::Format::eR16Unorm:
+		case vk::Format::eR16Sfloat: return 2;
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eR8G8B8A8Uint:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eE5B9G9R9UfloatPack32:
+		case vk::Format::eR16G16Sfloat:
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eR32Uint: return 4;
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR32G32Sfloat: return 8;
+		case vk::Format::eR32G32B32A32Sfloat: return 16;
+		default: return 0;
+	}
+}
+
+bool PanelImagesOverlap(const Image& a, const Image& b) {
+	if (a.backing.image == b.backing.image) return true;
+	for (const auto left: {a.info.data, a.info.stencil, a.info.metadata.range}) {
+		for (const auto right: {b.info.data, b.info.stencil, b.info.metadata.range}) {
+			if (!left.Empty() && !right.Empty() &&
+			    ImageRangeOverlaps(left.address, left.size, right.address, right.size)) return true;
+		}
+	}
+	return false;
+}
+
+struct PanelInputReadback {
+	VmaAllocator allocator = nullptr;
+	VkBuffer buffer = VK_NULL_HANDLE;
+	VmaAllocation allocation = nullptr;
+	void* mapped = nullptr;
+	~PanelInputReadback() {
+		if (mapped != nullptr) vmaUnmapMemory(allocator, allocation);
+		if (buffer != VK_NULL_HANDLE) vmaDestroyBuffer(allocator, buffer, allocation);
+	}
+};
+
+bool QueuePanelInputCapture(CommandBuffer& command, Image& image, uint32_t bytes,
+                            const std::string& path, std::string metadata) {
+	auto readback = std::make_unique<PanelInputReadback>();
+	readback->allocator = command.GetGraphics().allocator;
+	VkBufferCreateInfo buffer_info {};
+	buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	buffer_info.size = bytes;
+	buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VmaAllocationCreateInfo allocation_info {};
+	allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+	allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+	allocation_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+	const auto result = vmaCreateBuffer(readback->allocator, &buffer_info, &allocation_info,
+	                                    &readback->buffer, &readback->allocation, nullptr);
+	if (result != VK_SUCCESS) {
+		LOGF("PanelDraw capture allocation failed: result=%d bytes=%u\n", static_cast<int>(result), bytes);
+		return false;
+	}
+	// Eligibility requires one native mip/layer and no split state. Restore the exact
+	// stage/access/layout with GetBarriers, since Transit derives a broader stage mask.
+	const auto previous = image.backing.state;
+	const vk::BufferImageCopy copy {0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+	                               {0, 0, 0}, image.backing.extent};
+	image.Download(std::span {&copy, 1}, readback->buffer, 0, bytes);
+	vk::BufferMemoryBarrier2 host_barrier {};
+	host_barrier.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+	host_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	host_barrier.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+	host_barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	host_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	host_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	host_barrier.buffer = readback->buffer;
+	host_barrier.offset = 0;
+	host_barrier.size = bytes;
+	const auto restore = image.GetBarriers(previous.layout, previous.access_mask,
+	                                       previous.pl_stage, {});
+	vk::DependencyInfo dependency {};
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers = &host_barrier;
+	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(restore.size());
+	dependency.pImageMemoryBarriers = restore.data();
+	command.Handle().pipelineBarrier2(dependency);
+	auto& scheduler = command.GetContext().GetCommandScheduler();
+	const auto tick = scheduler.CurrentTick();
+	metadata += fmt::format("capture file={} bytes={} row_bytes={} native_format={} ({}) "
+	                        "extent={}x{} tick={} layout={} access={:x} stage={:x}\n",
+	                        path, bytes, bytes / image.backing.extent.height,
+	                        static_cast<uint32_t>(image.backing.format), vk::to_string(image.backing.format),
+	                        image.backing.extent.width, image.backing.extent.height, tick,
+	                        static_cast<uint32_t>(previous.layout),
+	                        static_cast<uint64_t>(previous.access_mask),
+	                        static_cast<uint64_t>(previous.pl_stage));
+	// The normal deferred queue retains the dedicated allocation until this tick is
+	// complete. Shutdown submits and drains that queue before the allocator is destroyed.
+	scheduler.DeferOperation([readback = std::move(readback), path, metadata = std::move(metadata), bytes]() {
+		uint32_t written = 0;
+		bool saved = false;
+		if (vmaMapMemory(readback->allocator, readback->allocation, &readback->mapped) == VK_SUCCESS &&
+		    readback->mapped != nullptr &&
+		    vmaInvalidateAllocation(readback->allocator, readback->allocation, 0, bytes) == VK_SUCCESS) {
+			Common::File raw;
+			if (raw.Create(path)) {
+				raw.Write(readback->mapped, bytes, &written);
+				saved = written == bytes && raw.Flush();
+			}
+		}
+		Common::File info;
+		bool metadata_saved = false;
+		if (info.Create(path + ".txt")) {
+			const auto text = metadata + fmt::format("saved={} written={}\n", saved, written);
+			uint32_t count = 0;
+			info.Write(text.data(), static_cast<uint32_t>(text.size()), &count);
+			metadata_saved = count == text.size() && info.Flush();
+		}
+		LOGF("PanelDraw capture complete: file=%s bytes=%u saved=%d metadata=%d\n",
+		     path.c_str(), bytes, saved, metadata_saved);
+	});
+	LOGF("PanelDraw capture queued: file=%s bytes=%u tick=%" PRIu64 "\n", path.c_str(), bytes, tick);
+	return true;
+}
+
+} // namespace
+
+void RenderExecutor::TracePanelDraw(uint64_t submit_id, CommandBuffer& buffer,
+                                    const DrawCallInfo& draw, const DrawEmitInfo& emit,
+                                    const DrawRenderState& state,
+                                    const RenderState& rendering,
+                                    std::span<PreparedBindings* const> stages) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VR_PANEL_DRAW_TRACE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (!enabled || m_panel_trace_draws >= 16384u) return;
+	auto& cache = m_context.GetTextureCache();
+	uint32_t presented_mask = 0;
+	for (uint32_t i = 0; i < state.color_count; ++i) {
+		const auto* image = cache.m_slot_images.try_get(state.color_info[i].image_id);
+		if (image != nullptr && image->usage.video_out) presented_mask |= 1u << i;
+	}
+	if (presented_mask == 0) return;
+	const auto call = ++m_panel_trace_draws;
+	static const std::string capture_prefix = [] {
+		const char* value = std::getenv("KYTY_VR_PANEL_DRAW_CAPTURE_PREFIX");
+		return value != nullptr && std::strlen(value) <= 2048 ? std::string(value) : std::string {};
+	}();
+	constexpr std::array<uint32_t, 2> capture_milestones {128u, 1024u};
+	const bool capture_due = !capture_prefix.empty() && m_panel_capture_index < capture_milestones.size() &&
+	                         call >= capture_milestones[m_panel_capture_index];
+	const bool trace_due = call <= 8u || (call & 255u) <= 1u;
+	if (!trace_due && !capture_due) return;
+	// Download ends dynamic rendering. Never split a pass whose clear load operation
+	// could be replayed when an otherwise identical following draw begins rendering.
+	const bool rendering_clear = rendering.depth_stencil_attachment.depth_clear ||
+	    rendering.depth_stencil_attachment.stencil_clear ||
+	    std::any_of(rendering.color_attachments.begin(), rendering.color_attachments.end(),
+	                [](const auto& attachment) { return attachment.is_clear; });
+	const auto& hw = buffer.GetRegisters();
+	const auto& sh = hw.GetShaderRegisters();
+	const auto clock_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	    std::chrono::steady_clock::now().time_since_epoch()).count());
+	std::string record = fmt::format(
+	    "PanelDraw call={} submit={} frame={} tick={} clock_ms={} draw={} primitive={} count={} instances={} "
+	    "vertex_offset={} first_vertex={} first_instance={} presented_mask={:x} target_mask={:x} "
+	    "shader_mask={:x} color_mode={} rendering_clear={} es={:016x} gs={:016x} ps={:016x}\n",
+	    call, submit_id, m_context.GetGpu().GetFrameNum(), m_context.GetCommandScheduler().CurrentTick(),
+	    clock_ms, draw.Name(),
+	    static_cast<uint32_t>(buffer.GetUserConfig().GetPrimType()), draw.index_count, draw.instance_count,
+	    emit.vertex_offset, emit.first_vertex, emit.first_instance, presented_mask, hw.GetRenderTargetMask(),
+	    sh.m_cbShaderMask, hw.GetColorControl().mode, rendering_clear,
+	    buffer.GetShaders().GetVs().es_regs.data_addr,
+	    buffer.GetShaders().GetVs().gs_regs.data_addr, buffer.GetShaders().GetPs().ps_regs.data_addr);
+	// video_out marks the exact cache image selected by the presenter. Explicit preview
+	// paths can mark other images too; addresses/IDs correlate with the surface trace.
+	for (uint32_t i = 0; i < state.color_count; ++i) {
+		const auto& target = state.color_info[i];
+		const auto* image = cache.m_slot_images.try_get(target.image_id);
+		if (image == nullptr) continue;
+		const auto& view = target.desc.view_info;
+		record += fmt::format(
+		    "PanelDraw target call={} slot={} presented={} id={} native={:016x} guest={:016x} "
+		    "cached={:016x} guest_fmt={} native_fmt={} view_fmt={} extent={}x{} native_extent={}x{} "
+		    "mip={}:{} layer={}:{} guest_mip={} guest_layer={}\n",
+		    call, target.target_slot, image->usage.video_out, target.image_id.index,
+		    PanelNativeHandle(image->backing.image), target.desc.info.data.address, image->info.data.address,
+		    static_cast<uint32_t>(target.desc.info.guest_format), static_cast<uint32_t>(image->backing.format),
+		    static_cast<uint32_t>(view.format), target.Extent().width, target.Extent().height,
+		    image->backing.extent.width, image->backing.extent.height, view.base_level, view.level_count,
+		    view.base_layer, view.layer_count, target.guest_mip_level, target.guest_array_layer);
+	}
+	struct Candidate {
+		Image* image;
+		const TextureBinding* binding;
+		const ImageViewInfo* view;
+		const ShaderRecompiler::IR::ImageResource* resource;
+		uint32_t stage;
+		uint32_t index;
+	};
+	std::array<Candidate, 16> candidates {};
+	uint32_t candidate_count = 0;
+	uint32_t image_lines = 0;
+	bool uncertain_writes = false;
+	for (uint32_t stage_index = 0; stage_index < stages.size(); ++stage_index) {
+		const auto& prepared = *stages[stage_index];
+		const auto& program = *prepared.runtime->program;
+		const auto& snapshot = *prepared.runtime->resources;
+		uncertain_writes |= program.has_address_writes ||
+		    std::any_of(program.info.buffers.begin(), program.info.buffers.end(),
+		                [](const auto& resource) { return resource.written; });
+		record += fmt::format("PanelDraw stage call={} index={} stage={} hash={:016x} images={} "
+		                      "samplers={} pairs={} address_writes={}\n", call, stage_index,
+		                      static_cast<uint32_t>(program.stage), program.shader_hash,
+		                      prepared.images.size(), program.info.samplers.size(),
+		                      program.info.sampled_pairs.size(), program.has_address_writes);
+		const auto count = std::min({prepared.images.size(), program.info.images.size(), snapshot.images.size()});
+		uint32_t shown = 0;
+		for (uint32_t i = 0; i < count && image_lines < candidates.size(); ++i, ++image_lines, ++shown) {
+			const auto& binding = prepared.images[i];
+			const auto& resource = program.info.images[i];
+			const auto& value = snapshot.images[i];
+			const auto& words = value.dwords;
+			ShaderTextureResource descriptor {};
+			std::memcpy(descriptor.fields, words.data(), sizeof(descriptor.fields));
+			record += fmt::format(
+			    "PanelDraw descriptor call={} stage={} image={} binding={} class={} read={} written={} "
+			    "first_pc={:x} r128={} words={} tsharp={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x} "
+			    "address={:016x} format={} extent={}x{} tile={} swizzle={:03x}\n",
+			    call, stage_index, i, resource.descriptor_index, static_cast<uint32_t>(resource.resource_class),
+			    resource.read, resource.written, resource.first_use_pc, resource.r128, value.dword_count,
+			    words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
+			    descriptor.Base40(), static_cast<uint32_t>(descriptor.Format()), descriptor.Width5() + 1u,
+			    descriptor.Height5() + 1u, static_cast<uint32_t>(descriptor.TileMode()), descriptor.DstSelXYZW());
+			auto* image = cache.m_slot_images.try_get(binding.image_id);
+			if (image == nullptr) {
+				record += fmt::format("PanelDraw input call={} stage={} image={} state=missing-cache-image\n",
+				                      call, stage_index, i);
+				continue;
+			}
+			const auto found = std::find_if(image->views.begin(), image->views.end(),
+			    [&](const auto& native) { return native.view == binding.image_view; });
+			const auto* actual_view = found == image->views.end() ? nullptr : &found->info;
+			const auto& view = actual_view != nullptr ? *actual_view : binding.desc.view_info;
+			record += fmt::format(
+			    "PanelDraw input call={} stage={} image={} id={} native={:016x} view={:016x} "
+			    "actual_view={} requested={:016x} cached={:016x} native_fmt={} requested_view_fmt={} view_fmt={} "
+			    "native_extent={}x{}x{} samples={} levels={} layers={} mip={}:{} layer={}:{} aspect={:x} "
+			    "mapping={},{},{},{} layout={} dirty={}/{}/{} dynamic_views={}\n",
+			    call, stage_index, i, binding.image_id.index, PanelNativeHandle(image->backing.image),
+			    PanelNativeHandle(binding.image_view), actual_view != nullptr, binding.desc.info.data.address,
+			    image->info.data.address, static_cast<uint32_t>(image->backing.format),
+			    static_cast<uint32_t>(binding.desc.view_info.format), static_cast<uint32_t>(view.format),
+			    image->backing.extent.width, image->backing.extent.height, image->backing.extent.depth,
+			    image->backing.samples, image->backing.mip_levels, image->backing.layers,
+			    view.base_level, view.level_count, view.base_layer, view.layer_count,
+			    static_cast<uint32_t>(view.aspect), static_cast<uint32_t>(view.mapping.r),
+			    static_cast<uint32_t>(view.mapping.g), static_cast<uint32_t>(view.mapping.b),
+			    static_cast<uint32_t>(view.mapping.a), static_cast<uint32_t>(binding.layout),
+			    image->IsCpuDirty(), image->IsBufferModified(), image->IsGpuModified(), binding.mip_views.size());
+			candidates[candidate_count++] = {image, &binding, actual_view, &resource, stage_index, i};
+		}
+		if (shown != prepared.images.size()) {
+			record += fmt::format("PanelDraw truncated call={} stage={} shown_images={} total_images={}\n",
+			                      call, stage_index, shown, prepared.images.size());
+		}
+		const auto pair_count = std::min<size_t>(program.info.sampled_pairs.size(), 8u);
+		for (uint32_t i = 0; i < pair_count; ++i) {
+			const auto& pair = program.info.sampled_pairs[i];
+			if (pair.sampler >= program.info.samplers.size()) continue;
+			const auto index = program.info.samplers[pair.sampler].snapshot_index;
+			if (index >= snapshot.samplers.size()) continue;
+			const auto& value = snapshot.samplers[index];
+			record += fmt::format("PanelDraw pair call={} stage={} image={} sampler={} first_pc={:x} "
+			                      "words={} sampler_raw={:08x},{:08x},{:08x},{:08x}\n", call,
+			                      stage_index, pair.image, pair.sampler, pair.first_use_pc, value.dword_count,
+			                      value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3]);
+		}
+		if (pair_count != program.info.sampled_pairs.size()) {
+			record += fmt::format("PanelDraw truncated call={} stage={} shown_pairs={} total_pairs={}\n",
+			                      call, stage_index, pair_count, program.info.sampled_pairs.size());
+		}
+	}
+	if (trace_due) LOGF("%s", record.c_str());
+	if (!capture_due) return;
+	constexpr uint64_t set_limit = 64u * 1024u * 1024u;
+	constexpr uint64_t total_limit = 2u * set_limit;
+	uint64_t set_bytes = 0;
+	std::array<vk::Image, 2> captured {};
+	uint32_t captured_count = 0;
+	const char* reason = rendering_clear ? "rendering-clear-would-be-replayed"
+	                   : uncertain_writes ? "shader-buffer-or-address-writes" : "no-sampled-input";
+	for (uint32_t i = 0; !rendering_clear && !uncertain_writes && i < candidate_count &&
+	                       captured_count < captured.size(); ++i) {
+		const auto& candidate = candidates[i];
+		const auto& resource = *candidate.resource;
+		auto& image = *candidate.image;
+		const auto& backing = image.backing;
+		const auto* view = candidate.view;
+		if (resource.resource_class != ShaderRecompiler::IR::ImageResourceClass::Sampled ||
+		    !resource.read || resource.written || candidate.binding->desc.type != TextureCache::BindingType::Texture) continue;
+		if (view == nullptr || view->aspect != vk::ImageAspectFlagBits::eColor ||
+		    view->type != vk::ImageViewType::e2D || view->base_level != 0 || view->level_count != 1 ||
+		    view->base_layer != 0 || view->layer_count != 1 || candidate.binding->mip_views.size() > 1 ||
+		    backing.image == nullptr || !image.registered || image.depth_id || image.info.IsDepth() ||
+		    backing.image_type != vk::ImageType::e2D || backing.samples != 1 || backing.mip_levels != 1 ||
+		    backing.layers != 1 || image.info.resources.levels != 1 || image.info.resources.layers != 1 ||
+		    !backing.subresource_states.empty() || backing.state.layout == vk::ImageLayout::eUndefined ||
+		    backing.state.layout == vk::ImageLayout::ePreinitialized ||
+		    !(backing.usage & vk::ImageUsageFlagBits::eTransferSrc) || backing.extent.depth != 1 ||
+		    backing.extent.width == 0 || backing.extent.height == 0 ||
+		    backing.extent.width > 8192 || backing.extent.height > 8192) {
+			reason = "unsupported-native-image-or-view";
+			continue;
+		}
+		if (std::find(captured.begin(), captured.end(), backing.image) != captured.end()) continue;
+		bool overlaps = false;
+		for (uint32_t target = 0; target < state.color_count; ++target) {
+			const auto* other = cache.m_slot_images.try_get(state.color_info[target].image_id);
+			overlaps |= other != nullptr && PanelImagesOverlap(image, *other);
+		}
+		if (const auto* depth = cache.m_slot_images.try_get(state.depth_info.image_id); depth != nullptr) {
+			overlaps |= PanelImagesOverlap(image, *depth);
+		}
+		for (const auto* stage: stages) {
+			for (const auto& binding: stage->images) {
+				if (binding.desc.type != TextureCache::BindingType::Storage) continue;
+				const auto* other = cache.m_slot_images.try_get(binding.image_id);
+				overlaps |= other != nullptr && PanelImagesOverlap(image, *other);
+			}
+		}
+		if (overlaps) {
+			reason = "input-overlaps-render-or-storage-write";
+			continue;
+		}
+		const auto texel_bytes = PanelCaptureTexelBytes(backing.format);
+		const uint64_t bytes = static_cast<uint64_t>(backing.extent.width) * backing.extent.height * texel_bytes;
+		if (bytes == 0 || bytes > set_limit || bytes > set_limit - set_bytes ||
+		    bytes > total_limit - m_panel_capture_bytes) {
+			reason = "unsupported-native-format-or-byte-cap";
+			continue;
+		}
+		const auto path = fmt::format("{}-draw{}-stage{}-image{}-{:016x}.bin", capture_prefix,
+		                              call, candidate.stage, candidate.index, PanelNativeHandle(backing.image));
+		const auto metadata = record + fmt::format("selected stage={} image={} milestone={}\n",
+		    candidate.stage, candidate.index, capture_milestones[m_panel_capture_index]);
+		if (!QueuePanelInputCapture(buffer, image, static_cast<uint32_t>(bytes), path, metadata)) {
+			reason = "staging-allocation-failed";
+			continue;
+		}
+		captured[captured_count++] = backing.image;
+		set_bytes += bytes;
+		m_panel_capture_bytes += bytes;
+	}
+	if (captured_count != 0) {
+		if (!trace_due) LOGF("%s", record.c_str());
+		LOGF("PanelDraw capture set: call=%u milestone=%u inputs=%u bytes=%" PRIu64
+		     " total_bytes=%" PRIu64 " input_cap=2 set_cap=%" PRIu64 "\n", call,
+		     capture_milestones[m_panel_capture_index], captured_count, set_bytes, m_panel_capture_bytes, set_limit);
+		++m_panel_capture_index;
+		m_panel_capture_misses = 0;
+	} else if (++m_panel_capture_misses <= 4u || (m_panel_capture_misses & 255u) == 0) {
+		LOGF("PanelDraw capture deferred: call=%u milestone=%u candidates=%u reason=%s misses=%u\n",
+		     call, capture_milestones[m_panel_capture_index], candidate_count, reason, m_panel_capture_misses);
+	}
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1174,6 +1564,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
+	TracePanelDraw(submit_id, buffer, draw, emit, state, rendering, stages);
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
