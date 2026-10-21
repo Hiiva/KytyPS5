@@ -1554,11 +1554,11 @@ int KYTY_SYSV_ABI PadVrControllerReadState(int handle, void* state_out) {
     std::memcpy(bytes, &buttons, sizeof(buttons));
     // Horizon's native Sense reader consumes the left/right trigger axes at
     // +8/+9. The other hand's field stays zero from the record initialization.
-    // A keyboard or scripted digital trigger must be fully pressed.
+    // Preserve all positive analog travel; only a digital-only press is full.
     const uint32_t trigger_button = side == 0 ? PAD_BUTTON_L2 : PAD_BUTTON_R2;
     const size_t trigger_offset = side == 0 ? 8u : 9u;
     bytes[trigger_offset] = static_cast<uint8_t>(
-        std::clamp(trigger > 32 ? trigger :
+        std::clamp(trigger > 0 ? trigger :
                    (buttons & trigger_button) != 0 ? 255 : trigger, 0, 255));
     static std::array<std::atomic<uint32_t>, 2> previous_buttons {};
     if (previous_buttons[static_cast<size_t>(side)].exchange(buttons, std::memory_order_relaxed) != buttons) {

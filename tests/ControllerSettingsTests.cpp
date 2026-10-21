@@ -256,6 +256,19 @@ void TestVirtualSenseInput() {
 			          ((ReadSense(right).buttons & 0x4000u) != 0) == down,
 			      "native Cross press/release did not remain on the right Sense");
 		}
+		// Low physical travel sets the digital button too, but its analog
+		// event must retain the actual travel across the old 32/33 boundary.
+		for (int travel: {1, 32, 33}) {
+			const float normalized = travel / 255.0f;
+			SetAxis(1, Axis::TriggerLeft, travel);
+			check_triggers(normalized, 0.0f);
+			SetAxis(1, Axis::TriggerRight, travel);
+			check_triggers(normalized, normalized);
+			SetAxis(1, Axis::TriggerLeft, 0);
+			check_triggers(0.0f, normalized);
+			SetAxis(1, Axis::TriggerRight, 0);
+			check_triggers(0.0f, 0.0f);
+		}
 		SetAxis(1, Axis::TriggerLeft, 102);
 		SetAxis(1, Axis::TriggerRight, 204);
 		check_triggers(0.4f, 0.8f);
