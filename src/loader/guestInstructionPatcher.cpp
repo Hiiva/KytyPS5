@@ -154,6 +154,13 @@ static_assert(offsetof(HorizonKismetTraceBuffer, reserved) == 0);
 static_assert(offsetof(HorizonKismetTraceBuffer, records) == 8);
 static_assert(sizeof(HorizonKismetTraceBuffer) == 8 + HorizonTraceCapacity * 64);
 
+// These diagnostics stay outside file layout 1 and keep counting after it fills.
+struct HorizonKismetTracePollCounters {
+	std::atomic<u32> skylight {0};
+	std::atomic<u32> intro_tick {0};
+	std::atomic<u32> intro_overlay {0};
+};
+
 // A file-backed section retains completed guest writes after process termination,
 // independently of the periodic logger and exception handling. No guest-path flush
 // is needed for process-crash readback; this is not a power-loss durability journal.
@@ -252,9 +259,14 @@ static std::atomic_bool                          g_horizon_trace_active {false};
 static std::mutex                               g_horizon_trace_drain_mutex;
 static u64                                      g_horizon_trace_module = 0;
 static u32                                      g_horizon_trace_drained = 0;
+static HorizonKismetTracePollCounters            g_horizon_trace_polls;
+static bool                                     g_horizon_trace_gameplay = false;
+static u32                                      g_horizon_trace_poll_drain_tick = 0;
+static std::array<u32, 3>                        g_horizon_trace_last_poll_totals {};
 
 void GenerateHorizonKismetTrace(Xbyak::CodeGenerator& generator,
-                               HorizonKismetTraceBuffer* buffer, const void* continuation) {
+                               HorizonKismetTraceBuffer* buffer, const void* continuation,
+                               bool gameplay_trace) {
 	Xbyak::Label done, script_size_matched, reserve;
 	// No SIMD, floating-point, TLS, calls, or guest red-zone writes. Save every
 	// GPR except rsp, which is restored exactly by the paired stack operations.
@@ -265,8 +277,10 @@ void GenerateHorizonKismetTrace(Xbyak::CodeGenerator& generator,
 	for (const auto& reg: saved) generator.push(reg);
 
 	generator.mov(r10, reinterpret_cast<u64>(&buffer->reserved));
-	generator.cmp(dword[r10], HorizonTraceCapacity);
-	generator.jae(done, Xbyak::CodeGenerator::T_NEAR);
+	if (!gameplay_trace) {
+		generator.cmp(dword[r10], HorizonTraceCapacity);
+		generator.jae(done, Xbyak::CodeGenerator::T_NEAR);
+	}
 	generator.mov(r8, ptr[r12 + 0x10]); // FFrame::Node, used by the stolen instruction.
 	generator.test(r8, r8);
 	generator.jz(done, Xbyak::CodeGenerator::T_NEAR);
@@ -274,13 +288,20 @@ void GenerateHorizonKismetTrace(Xbyak::CodeGenerator& generator,
 	generator.cmp(edx, 14119);
 	generator.je(script_size_matched, Xbyak::CodeGenerator::T_NEAR);
 	generator.cmp(edx, 24737);
+	if (gameplay_trace) {
+		generator.je(script_size_matched, Xbyak::CodeGenerator::T_NEAR);
+		generator.cmp(edx, 23527);
+		generator.je(script_size_matched, Xbyak::CodeGenerator::T_NEAR);
+		generator.cmp(edx, 1053);
+	}
 	generator.jne(done, Xbyak::CodeGenerator::T_NEAR);
 	generator.L(script_size_matched);
 	generator.mov(r9, ptr[r8 + 0x60]); // UStruct::Script.Data.
 	generator.test(r9, r9);
 	generator.jz(done, Xbyak::CodeGenerator::T_NEAR);
-	// Both verified graphs start PushExecutionFlow(Num-3), ComputedJump:
-	// movement 4c 24 37 00 00 4e; calibration 4c 9e 60 00 00 4e.
+	// Every accepted graph has this verified PushExecutionFlow(Num-3), ComputedJump prefix:
+	// movement 4c 24 37 00 00 4e; calibration 4c 9e 60 00 00 4e;
+	// game mode 4c e4 5b 00 00 4e; river intro 4c 1a 04 00 00 4e.
 	generator.cmp(Xbyak::util::byte[r9], 0x4c);
 	generator.jne(done, Xbyak::CodeGenerator::T_NEAR);
 	generator.lea(ecx, ptr[rdx - 3]);
@@ -291,6 +312,41 @@ void GenerateHorizonKismetTrace(Xbyak::CodeGenerator& generator,
 	generator.mov(esi, dword[rbp - 0x6c]);
 	generator.cmp(esi, edx); // Unsigned comparison also rejects negative entries.
 	generator.jae(done, Xbyak::CodeGenerator::T_NEAR);
+
+	if (gameplay_trace) {
+		Xbyak::Label check_intro, check_overlay, count_poll, increment_poll, poll_ready;
+		generator.cmp(edx, 23527);
+		generator.jne(check_intro, Xbyak::CodeGenerator::T_NEAR);
+		generator.cmp(esi, 0x05ea); // GameMode: resume IsSkyLightBaking polling.
+		generator.jne(poll_ready, Xbyak::CodeGenerator::T_NEAR);
+		generator.mov(r11, reinterpret_cast<u64>(&g_horizon_trace_polls.skylight));
+		generator.jmp(count_poll, Xbyak::CodeGenerator::T_NEAR);
+		generator.L(check_intro);
+		generator.cmp(edx, 1053);
+		generator.jne(poll_ready, Xbyak::CodeGenerator::T_NEAR);
+		generator.cmp(esi, 0x02e1); // River intro ReceiveTick.
+		generator.jne(check_overlay, Xbyak::CodeGenerator::T_NEAR);
+		generator.mov(r11, reinterpret_cast<u64>(&g_horizon_trace_polls.intro_tick));
+		generator.jmp(count_poll, Xbyak::CodeGenerator::T_NEAR);
+		generator.L(check_overlay);
+		generator.cmp(esi, 0x03e3); // River intro UpdateOverlay.
+		generator.jne(poll_ready, Xbyak::CodeGenerator::T_NEAR);
+		generator.mov(r11, reinterpret_cast<u64>(&g_horizon_trace_polls.intro_overlay));
+		generator.L(count_poll);
+		generator.mov(eax, dword[r11]);
+		generator.L(increment_poll);
+		generator.cmp(eax, UINT32_MAX);
+		generator.je(done, Xbyak::CodeGenerator::T_NEAR);
+		generator.lea(ecx, ptr[rax + 1]);
+		generator.lock();
+		generator.cmpxchg(dword[r11], ecx);
+		generator.jne(increment_poll, Xbyak::CodeGenerator::T_NEAR);
+		generator.cmp(ecx, 8);
+		generator.jbe(poll_ready, Xbyak::CodeGenerator::T_NEAR);
+		generator.test(ecx, 63);
+		generator.jne(done, Xbyak::CodeGenerator::T_NEAR);
+		generator.L(poll_ready);
+	}
 
 	// Saturating reservation: no overwrite or counter wrap after the fixed limit.
 	generator.mov(eax, dword[r10]);
@@ -2018,8 +2074,10 @@ bool InstallHorizonKismetTrace(uint64_t module_addr, uint64_t module_size) {
 	if (displacement < INT32_MIN || displacement > INT32_MAX) {
 		return reject("instruction trampoline is outside rel32 range");
 	}
+	const char* gameplay_value = std::getenv("KYTY_HORIZON_KISMET_GAMEPLAY_TRACE");
+	const bool gameplay_trace = gameplay_value != nullptr && std::strcmp(gameplay_value, "1") == 0;
 	Xbyak::ClearError();
-	GenerateHorizonKismetTrace(generator, buffer, reinterpret_cast<const void*>(continuation));
+	GenerateHorizonKismetTrace(generator, buffer, reinterpret_cast<const void*>(continuation), gameplay_trace);
 	const auto rollback = [&] {
 		generator.reset();
 		generator.setSize(begin);
@@ -2047,15 +2105,19 @@ bool InstallHorizonKismetTrace(uint64_t module_addr, uint64_t module_size) {
 	g_horizon_trace_buffer = buffer;
 	g_horizon_trace_storage = std::move(storage);
 	g_horizon_trace_module = module_addr;
+	g_horizon_trace_gameplay = gameplay_trace;
 	g_horizon_trace_active.store(true, std::memory_order_release);
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Horizon Kismet trace installed: hook=0x{:016x} trampoline=0x{:016x} bytes={} "
 	    "counter=0x{:016x} records=0x{:016x} capacity={} record_size=64 layout=1 "
-	    "file_backed={} file_size={} records_offset=8 script_nums=14119,24737\n",
+	    "file_backed={} file_size={} records_offset=8 script_nums=14119,24737{} gameplay_trace={} "
+	    "gameplay_poll_sampling={}\n",
 	    reinterpret_cast<u64>(hook), trampoline, trampoline_size,
 	    reinterpret_cast<u64>(&g_horizon_trace_buffer->reserved),
 	    reinterpret_cast<u64>(g_horizon_trace_buffer->records.data()), HorizonTraceCapacity,
-	    g_horizon_trace_storage->IsFileBacked(), sizeof(HorizonKismetTraceBuffer)));
+	    g_horizon_trace_storage->IsFileBacked(), sizeof(HorizonKismetTraceBuffer),
+	    gameplay_trace ? ",23527,1053" : "", gameplay_trace,
+	    gameplay_trace ? "game_mode:05ea,river_intro:02e1/03e3:first8_then_every64" : "off"));
 	return true;
 }
 
@@ -2066,15 +2128,41 @@ void DrainHorizonKismetTrace() {
 	for (u32 count = 0; count < 64 && g_horizon_trace_drained < HorizonTraceCapacity; ++count) {
 		const auto& record = g_horizon_trace_buffer->records[g_horizon_trace_drained];
 		if (record.committed.load(std::memory_order_acquire) != g_horizon_trace_drained + 1) break;
+		const char* graph = "unknown";
+		switch (record.script_num) {
+			case 14119: graph = "movement"; break;
+			case 24737: graph = "calibration"; break;
+			case 23527: graph = "game_mode"; break;
+			case 1053: graph = "river_intro"; break;
+		}
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "Horizon Kismet event: seq={} graph={} entry=0x{:04x} object=0x{:016x} "
 		    "node=0x{:016x} frame=0x{:016x} script=0x{:016x} code=0x{:016x} rbp=0x{:016x}\n",
-		    g_horizon_trace_drained + 1, record.script_num == 14119 ? "movement" : "calibration",
+		    g_horizon_trace_drained + 1, graph,
 		    record.entry, record.object, record.node, record.frame, record.script, record.code,
 		    record.native_frame));
 		++g_horizon_trace_drained;
 		if (g_horizon_trace_drained == HorizonTraceCapacity) {
-			Log::WriteToConsoleAndLog("Horizon Kismet trace capacity reached: 2048 events; recording stopped\n");
+			Log::WriteToConsoleAndLog(g_horizon_trace_gameplay
+			    ? "Horizon Kismet trace capacity reached: 2048 events; event recording stopped; gameplay poll counters continue\n"
+			    : "Horizon Kismet trace capacity reached: 2048 events; recording stopped\n");
+		}
+	}
+	if (g_horizon_trace_gameplay) {
+		++g_horizon_trace_poll_drain_tick;
+		const std::array<u32, 3> totals {
+		    g_horizon_trace_polls.skylight.load(std::memory_order_relaxed),
+		    g_horizon_trace_polls.intro_tick.load(std::memory_order_relaxed),
+		    g_horizon_trace_polls.intro_overlay.load(std::memory_order_relaxed)};
+		if (totals != g_horizon_trace_last_poll_totals &&
+		    ((g_horizon_trace_poll_drain_tick & 255) == 0 ||
+		     g_horizon_trace_last_poll_totals == std::array<u32, 3> {})) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Horizon Kismet gameplay poll totals: game_mode_05ea={} river_intro_02e1={} "
+			    "river_intro_03e3={} reserved={} capacity=2048 (saturating; first8 then every64 recorded)\n",
+			    totals[0], totals[1], totals[2],
+			    g_horizon_trace_buffer->reserved.load(std::memory_order_relaxed)));
+			g_horizon_trace_last_poll_totals = totals;
 		}
 	}
 }

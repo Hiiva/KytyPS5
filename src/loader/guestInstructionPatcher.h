@@ -58,6 +58,12 @@ void UnregisterGuestInstructionPatchModule(void* module_ptr);
 
 // Opt-in diagnostic for the verified PPSA05666 eboot only. The loader installs
 // before guest execution; the guest hook records without calling host code.
+// KYTY_HORIZON_KISMET_TRACE=1 enables calibration/movement. Additionally setting
+// KYTY_HORIZON_KISMET_GAMEPLAY_TRACE=1 includes the verified game-mode and river-intro
+// graphs. GameMode entry 0x05ea and intro entries 0x02e1/0x03e3 record their first 8
+// invocations, then every 64th; separate saturating poll counters keep advancing
+// after the shared record capacity fills and are reported periodically by Drain.
+// Other entries retain normal tracing; the record layout and capacity do not change.
 // On Windows, KYTY_HORIZON_KISMET_TRACE_FILE optionally names a new file in an
 // existing directory. CREATE_NEW preserves older captures; any file error rejects
 // installation. Without a path, trace storage remains in memory only.
