@@ -68,6 +68,10 @@ public:
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
+	// Copies one depth/stencil aspect into the matching scalar color format without conversion.
+	// Unsupported inputs return false before recording commands or changing image layouts.
+	[[nodiscard]] bool CopyDepthStencilToColor(Image& source, Buffer& buffer,
+	                                          const vk::ImageCopy& region);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {

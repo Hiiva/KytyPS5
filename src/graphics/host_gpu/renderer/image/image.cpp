@@ -560,6 +560,102 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
+bool Image::CopyDepthStencilToColor(Image& source, Buffer& buffer, const vk::ImageCopy& region) {
+	const auto aspect = region.srcSubresource.aspectMask;
+	uint32_t bytes_per_texel = 0;
+	if (aspect == vk::ImageAspectFlagBits::eDepth && backing.format == vk::Format::eR32Sfloat &&
+	    (source.backing.format == vk::Format::eD32Sfloat ||
+	     source.backing.format == vk::Format::eD32SfloatS8Uint)) {
+		bytes_per_texel = 4;
+	} else if (aspect == vk::ImageAspectFlagBits::eStencil &&
+	           backing.format == vk::Format::eR8Uint &&
+	           (source.backing.format == vk::Format::eS8Uint ||
+	            source.backing.format == vk::Format::eD32SfloatS8Uint)) {
+		bytes_per_texel = 1;
+	}
+	// Buffer transfers represent the selected aspect of D32/S8 as D32_SFLOAT or S8_UINT.
+	// A direct cross-aspect image copy would require additional host Vulkan features.
+	if (bytes_per_texel == 0 || buffer.Handle() == nullptr || backing.image == nullptr ||
+	    source.backing.image == nullptr || backing.image == source.backing.image ||
+	    &m_scheduler != &source.m_scheduler || backing.samples != 1 || source.backing.samples != 1 ||
+	    backing.image_type != vk::ImageType::e2D || source.backing.image_type != vk::ImageType::e2D ||
+	    region.dstSubresource.aspectMask != vk::ImageAspectFlagBits::eColor ||
+	    region.srcSubresource.layerCount != 1 || region.dstSubresource.layerCount != 1 ||
+	    region.srcSubresource.mipLevel >= source.backing.mip_levels ||
+	    region.dstSubresource.mipLevel >= backing.mip_levels ||
+	    region.srcSubresource.baseArrayLayer >= source.backing.layers ||
+	    region.dstSubresource.baseArrayLayer >= backing.layers ||
+	    region.srcOffset.x < 0 || region.srcOffset.y < 0 || region.srcOffset.z != 0 ||
+	    region.dstOffset.x < 0 || region.dstOffset.y < 0 || region.dstOffset.z != 0 ||
+	    region.extent.width == 0 || region.extent.height == 0 || region.extent.depth != 1) {
+		return false;
+	}
+	const auto fits = [&](const VulkanImage& image, const vk::ImageSubresourceLayers& subresource,
+	                      const vk::Offset3D& offset) {
+		const auto width = std::max(image.extent.width >> subresource.mipLevel, 1u);
+		const auto height = std::max(image.extent.height >> subresource.mipLevel, 1u);
+		return static_cast<uint64_t>(offset.x) + region.extent.width <= width &&
+		       static_cast<uint64_t>(offset.y) + region.extent.height <= height;
+	};
+	const uint64_t row_size = static_cast<uint64_t>(region.extent.width) * bytes_per_texel;
+	const uint32_t rows_per_copy = CopyRows(row_size, region.extent.height, buffer.Size());
+	if (!fits(source.backing, region.srcSubresource, region.srcOffset) ||
+	    !fits(backing, region.dstSubresource, region.dstOffset) || rows_per_copy == 0) {
+		return false;
+	}
+
+	m_scheduler.EndRendering();
+	const auto command = m_scheduler.Current().Handle();
+	const ImageSubresourceRange source_range {region.srcSubresource.mipLevel, 1,
+	                                         region.srcSubresource.baseArrayLayer, 1};
+	const ImageSubresourceRange destination_range {region.dstSubresource.mipLevel, 1,
+	                                              region.dstSubresource.baseArrayLayer, 1};
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+	               source_range, command);
+	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	        destination_range, command);
+
+	vk::BufferMemoryBarrier2 barrier {};
+	barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.dstStageMask = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer = buffer.Handle();
+	vk::DependencyInfo dependency {};
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers = &barrier;
+	for (uint32_t row = 0; row < region.extent.height;) {
+		const auto rows = std::min(rows_per_copy, region.extent.height - row);
+		barrier.size = row_size * rows;
+		// The scratch range may still be read by the preceding stripe or copy operation.
+		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		command.pipelineBarrier2(dependency);
+		vk::BufferImageCopy source_copy {};
+		source_copy.imageSubresource = region.srcSubresource;
+		source_copy.imageOffset = {region.srcOffset.x,
+		                          region.srcOffset.y + static_cast<int32_t>(row), 0};
+		source_copy.imageExtent = {region.extent.width, rows, 1};
+		command.copyImageToBuffer(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                          buffer.Handle(), source_copy);
+		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		command.pipelineBarrier2(dependency);
+		vk::BufferImageCopy destination_copy {};
+		destination_copy.imageSubresource = region.dstSubresource;
+		destination_copy.imageOffset = {region.dstOffset.x,
+		                               region.dstOffset.y + static_cast<int32_t>(row), 0};
+		destination_copy.imageExtent = source_copy.imageExtent;
+		command.copyBufferToImage(buffer.Handle(), backing.image, vk::ImageLayout::eTransferDstOptimal,
+		                          destination_copy);
+		row += rows;
+	}
+	Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead,
+	        destination_range, command);
+	return true;
+}
+
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);

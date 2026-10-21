@@ -39053,6 +39053,306 @@ void CheckImageTransitionState(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+void CheckDepthStencilColorCopy(RenderContext &renderer) {
+  constexpr const char *name = "DepthStencilColorCopy";
+  constexpr std::array<uint32_t, 6> copied_depth{
+      0x00000000u, 0x3e800000u, 0x3f000001u,
+      0x3f400000u, 0x3f7fffffu, 0x3f800000u};
+  constexpr std::array<uint8_t, 6> copied_stencil{
+      0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff};
+  // These are independent pixel oracles for source (2,2) and destination
+  // (2,1), both 3x2 rectangles in a 7x5 mip.
+  constexpr std::array<size_t, 6> source_pixels{16, 17, 18, 23, 24, 25};
+  constexpr std::array<size_t, 6> destination_pixels{9, 10, 11, 16, 17, 18};
+  constexpr uint32_t depth_sentinel = std::bit_cast<uint32_t>(-7.25f);
+  constexpr uint8_t stencil_sentinel = 0xd6;
+  auto &context = renderer.GetGraphics();
+
+  for (const bool combined : {true, false}) {
+    const uint32_t selected_mip = combined ? 0u : 1u;
+    const uint32_t levels = selected_mip + 1;
+    const uint32_t width = 7u << selected_mip;
+    const uint32_t height = 5u << selected_mip;
+    const char *case_name = combined ? "D32S8 mip0" : "D32 mip1";
+    CommandScheduler scheduler(renderer, context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    const auto MakeInfo = [&](vk::Format format, uint32_t bytes) {
+      ImageInfo info{};
+      info.pixel_format = format;
+      info.guest_format = bytes == 4 ? Prospero::BufferFormat::k32Float
+                                    : Prospero::BufferFormat::k8UInt;
+      info.type = Prospero::ImageType::kColor2D;
+      info.extent = {width, height, 1};
+      info.resources = {levels, 2};
+      info.pitch = width;
+      info.bytes_per_block = bytes;
+      info.samples = 1;
+      info.tile_mode = Prospero::TileMode::kLinear;
+      return info;
+    };
+    auto source_info = MakeInfo(combined ? vk::Format::eD32SfloatS8Uint
+                                         : vk::Format::eD32Sfloat, 4);
+    Image source(context, scheduler, source_info);
+    Image depth_color(context, scheduler, MakeInfo(vk::Format::eR32Sfloat, 4));
+    Image stencil_color(context, scheduler, MakeInfo(vk::Format::eR8Uint, 1));
+    auto one_d_info = MakeInfo(vk::Format::eR32Sfloat, 4);
+    one_d_info.type = Prospero::ImageType::kColor1D;
+    one_d_info.extent = {7, 1, 1};
+    one_d_info.resources = {1, 1};
+    one_d_info.pitch = 7;
+    Image one_d_color(context, scheduler, one_d_info);
+    StreamBuffer upload(context, scheduler, MemoryUsage::Upload, 65536);
+    StreamBuffer download(context, scheduler, MemoryUsage::Download, 65536);
+    // One D32 row fits; two do not. Both aspect copies reuse this same buffer
+    // without an intervening submission or CPU wait.
+    Buffer scratch(context, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 12);
+    Buffer too_small(context, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 8);
+
+    struct Plane {
+      Image *image;
+      vk::ImageAspectFlagBits aspect;
+      uint32_t mip;
+      uint32_t layer;
+      vk::Extent3D extent;
+      std::string label;
+      std::vector<uint8_t> expected;
+    };
+    std::vector<Plane> planes;
+    size_t depth_output = 0;
+    size_t stencil_output = 0;
+    const auto AddPlane = [&](Image &image, vk::ImageAspectFlagBits aspect,
+                              uint32_t mip, uint32_t layer, vk::Extent3D extent,
+                              const char *label, const auto &pixels) {
+      const auto *bytes = reinterpret_cast<const uint8_t *>(pixels.data());
+      planes.push_back({&image, aspect, mip, layer, extent,
+                        std::string(case_name) + " " + label + " mip" +
+                            std::to_string(mip) + " layer" + std::to_string(layer),
+                        {bytes, bytes + pixels.size() * sizeof(pixels[0])}});
+      return planes.size() - 1;
+    };
+    for (uint32_t mip = 0; mip < levels; ++mip) {
+      const vk::Extent3D extent{width >> mip, height >> mip, 1};
+      const size_t count = extent.width * extent.height;
+      for (uint32_t layer = 0; layer < 2; ++layer) {
+        std::vector<uint32_t> depth_pixels(count);
+        std::vector<uint8_t> stencil_pixels(count);
+        for (size_t i = 0; i < count; ++i) {
+          depth_pixels[i] = 0x3e000000u + (mip * 2 + layer) * 0x00100000u +
+                            static_cast<uint32_t>(i) * 257u;
+          stencil_pixels[i] = static_cast<uint8_t>(17u + layer * 53u + i * 37u);
+        }
+        if (mip == selected_mip && layer == 1) {
+          for (size_t i = 0; i < source_pixels.size(); ++i) {
+            depth_pixels[source_pixels[i]] = copied_depth[i];
+            stencil_pixels[source_pixels[i]] = copied_stencil[i];
+          }
+        }
+        AddPlane(source, vk::ImageAspectFlagBits::eDepth, mip, layer, extent,
+                 "source depth", depth_pixels);
+        if (combined) {
+          AddPlane(source, vk::ImageAspectFlagBits::eStencil, mip, layer, extent,
+                   "source stencil", stencil_pixels);
+        }
+        const auto depth_index = AddPlane(
+            depth_color, vk::ImageAspectFlagBits::eColor, mip, layer, extent,
+            "color float", std::vector<uint32_t>(count, depth_sentinel));
+        const auto stencil_index = AddPlane(
+            stencil_color, vk::ImageAspectFlagBits::eColor, mip, layer, extent,
+            "color byte", std::vector<uint8_t>(count, stencil_sentinel));
+        if (mip == selected_mip && layer == 0) {
+          depth_output = depth_index;
+          stencil_output = stencil_index;
+        }
+      }
+    }
+    AddPlane(one_d_color, vk::ImageAspectFlagBits::eColor, 0, 0, {7, 1, 1},
+             "rejected 1D destination", std::vector<uint32_t>(7, depth_sentinel));
+
+    const auto TransferRegion = [](const Plane &plane, uint64_t offset) {
+      vk::BufferImageCopy copy{};
+      copy.bufferOffset = offset;
+      copy.imageSubresource = {plane.aspect, plane.mip, plane.layer, 1};
+      copy.imageExtent = plane.extent;
+      return copy;
+    };
+    for (const auto &plane : planes) {
+      const auto [data, offset] = upload.Map(plane.expected.size(), 4);
+      Require(name, plane.label.c_str(), data != nullptr, "upload allocation failed");
+      std::memcpy(data, plane.expected.data(), plane.expected.size());
+      upload.Commit();
+      const auto copy = TransferRegion(plane, offset);
+      plane.image->Upload(std::span{&copy, 1}, upload.Handle(), offset,
+                          plane.expected.size());
+    }
+
+    vk::ImageCopy region{};
+    region.srcSubresource = {vk::ImageAspectFlagBits::eDepth, selected_mip, 1, 1};
+    region.srcOffset = {2, 2, 0};
+    region.dstSubresource = {vk::ImageAspectFlagBits::eColor, selected_mip, 0, 1};
+    region.dstOffset = {2, 1, 0};
+    region.extent = {3, 2, 1};
+    const auto SameState = [](const VulkanImageState &a, const VulkanImageState &b) {
+      return a.pl_stage == b.pl_stage && a.access_mask == b.access_mask &&
+             a.layout == b.layout;
+    };
+    const auto Reject = [&](const char *label, Image &destination, Image &input,
+                            Buffer &buffer, const vk::ImageCopy &copy) {
+      const auto source_state = input.backing.state;
+      const auto source_subresources = input.backing.subresource_states;
+      const auto destination_state = destination.backing.state;
+      const auto destination_subresources = destination.backing.subresource_states;
+      Require(name, (std::string(case_name) + " rejects " + label).c_str(),
+              !destination.CopyDepthStencilToColor(input, buffer, copy),
+              "unsupported request was accepted");
+      Require(name, (std::string(case_name) + " unchanged state for " + label).c_str(),
+              SameState(source_state, input.backing.state) &&
+                  SameState(destination_state, destination.backing.state) &&
+                  std::equal(source_subresources.begin(), source_subresources.end(),
+                             input.backing.subresource_states.begin(),
+                             input.backing.subresource_states.end(), SameState) &&
+                  std::equal(destination_subresources.begin(),
+                             destination_subresources.end(),
+                             destination.backing.subresource_states.begin(),
+                             destination.backing.subresource_states.end(), SameState),
+              "rejected request changed an image layout or access state");
+    };
+    Reject("source color format", depth_color, stencil_color, scratch, region);
+    Reject("destination integer format", stencil_color, source, scratch, region);
+    Reject("insufficient scratch", depth_color, source, too_small, region);
+    for (uint32_t invalid = 0; invalid < 11; ++invalid) {
+      auto bad = region;
+      const char *label = "";
+      switch (invalid) {
+      case 0:
+        label = "combined source aspects";
+        bad.srcSubresource.aspectMask |= vk::ImageAspectFlagBits::eStencil;
+        break;
+      case 1:
+        label = "destination depth aspect";
+        bad.dstSubresource.aspectMask = vk::ImageAspectFlagBits::eDepth;
+        break;
+      case 2:
+        label = "empty region";
+        bad.extent.height = 0;
+        break;
+      case 3:
+        label = "negative source offset";
+        bad.srcOffset.x = -1;
+        break;
+      case 4:
+        label = "source overrun";
+        bad.srcOffset.x = 6;
+        break;
+      case 5:
+        label = "destination overrun";
+        bad.dstOffset.y = 4;
+        break;
+      case 6:
+        label = "multiple layers";
+        bad.srcSubresource.baseArrayLayer = 0;
+        bad.srcSubresource.layerCount = bad.dstSubresource.layerCount = 2;
+        break;
+      case 7:
+        label = "invalid mip";
+        bad.srcSubresource.mipLevel = levels;
+        break;
+      case 8:
+        label = "invalid layer";
+        bad.dstSubresource.baseArrayLayer = 2;
+        break;
+      case 9:
+        label = "nonzero z offset";
+        bad.srcOffset.z = 1;
+        break;
+      case 10:
+        label = "overflow-sized region";
+        bad.extent.width = UINT32_MAX;
+        break;
+      }
+      Reject(label, depth_color, source, scratch, bad);
+    }
+    auto one_d_region = region;
+    one_d_region.dstSubresource.mipLevel = 0;
+    one_d_region.dstOffset.y = 0;
+    one_d_region.extent.height = 1;
+    Reject("1D destination", one_d_color, source, scratch, one_d_region);
+
+    std::unique_ptr<Image> multisample;
+    if (combined) {
+      auto ms_info = source_info;
+      ms_info.resources = {1, 1};
+      ms_info.samples = 4;
+      auto usage = DepthTargetImageUsage();
+      if (context.attachment_feedback_loop_enabled)
+        usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+      vk::ImageFormatProperties properties{};
+      if (context.GetImageFormatProperties(ms_info.pixel_format, vk::ImageType::e2D,
+              vk::ImageTiling::eOptimal, usage, {}, &properties) == vk::Result::eSuccess &&
+          (properties.sampleCounts & vk::SampleCountFlagBits::e4)) {
+        multisample = std::make_unique<Image>(context, scheduler, ms_info);
+        auto ms_region = region;
+        ms_region.srcSubresource.baseArrayLayer = 0;
+        Reject("multisample source", depth_color, *multisample, scratch, ms_region);
+      } else {
+        std::printf("[skip]    %s multisample rejection: host lacks D32S8 4x\n", name);
+      }
+    }
+
+    struct Readback {
+      uint8_t *data;
+      uint64_t offset;
+      std::string label;
+      std::vector<uint8_t> expected;
+    };
+    std::vector<Readback> checks;
+    const auto QueueReadbacks = [&](const char *phase) {
+      for (const auto &plane : planes) {
+        const auto [data, offset] = download.Map(plane.expected.size(), 4);
+        Require(name, plane.label.c_str(), data != nullptr, "download allocation failed");
+        download.Commit();
+        const auto copy = TransferRegion(plane, offset);
+        plane.image->Download(std::span{&copy, 1}, download.Handle(), offset,
+                              plane.expected.size());
+        checks.push_back({data, offset, std::string(phase) + " " + plane.label,
+                          plane.expected});
+      }
+    };
+    // Capture rejected-call results before later successful copies can overwrite
+    // the same rectangle and hide an unintended write.
+    QueueReadbacks("after rejection");
+    Require(name, case_name,
+            depth_color.CopyDepthStencilToColor(source, scratch, region),
+            "supported depth-to-R32F copy was rejected");
+    for (size_t i = 0; i < destination_pixels.size(); ++i) {
+      std::memcpy(planes[depth_output].expected.data() +
+                      destination_pixels[i] * sizeof(uint32_t),
+                  &copied_depth[i], sizeof(uint32_t));
+    }
+    if (combined) {
+      auto stencil_region = region;
+      stencil_region.srcSubresource.aspectMask = vk::ImageAspectFlagBits::eStencil;
+      Require(name, "S8 to R8UI",
+              stencil_color.CopyDepthStencilToColor(source, scratch, stencil_region),
+              "supported stencil-to-R8UI copy was rejected");
+      for (size_t i = 0; i < destination_pixels.size(); ++i)
+        planes[stencil_output].expected[destination_pixels[i]] = copied_stencil[i];
+    }
+    QueueReadbacks("after copy");
+    scheduler.Finish();
+    for (const auto &check : checks) {
+      download.Invalidate(check.offset, check.expected.size());
+      Require(name, check.label.c_str(),
+              std::memcmp(check.data, check.expected.data(), check.expected.size()) == 0,
+              "GPU pixels differ: copy precision, bounds, source, or subresource preservation failed");
+    }
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckDepthTextureEncoding() {
   const ShaderTextureResource disabled_sampler_tweaks{{
       0x05135600u,
@@ -43692,6 +43992,11 @@ int main(int argc, char **argv) {
     CheckImageTransitionState(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-stencil-color-copy-only") == 0) {
+    VulkanHarness vulkan;
+    CheckDepthStencilColorCopy(vulkan.RuntimeRenderer());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-rebind-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
@@ -43762,6 +44067,7 @@ int main(int argc, char **argv) {
   CheckRenderTargetFormatContract();
   CheckSampledColorViews();
   CheckImageTransitionState(vulkan.RuntimeRenderer());
+  CheckDepthStencilColorCopy(vulkan.RuntimeRenderer());
   CheckSampledDepthResource();
   CheckDepthTextureEncoding();
   vulkan.CheckSamplerBorderColors();
