@@ -12,6 +12,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -209,6 +210,47 @@ private:
 	                    const DrawEmitInfo& emit, const DrawRenderState& state,
 	                    const RenderState& rendering,
 	                    std::span<PreparedBindings* const> stages);
+	struct PanelCaptureState {
+		uint32_t index = 0;
+		uint32_t misses = 0;
+		uint64_t bytes = 0;
+	};
+	struct PanelSourceWatch {
+		ImageId image_id;
+		vk::Image native = nullptr;
+		ImageViewInfo view;
+		GuestRange data;
+		GuestRange stencil;
+		GuestRange metadata;
+	};
+	struct PanelProducerMatch {
+		uint32_t images = 0;
+		uint32_t buffer_aliases = 0;
+		uint32_t metadata_aliases = 0;
+		bool unattributed_writes = false;
+		[[nodiscard]] bool Any() const { return (images | buffer_aliases | metadata_aliases) != 0; }
+	};
+	void TracePanelBindings(const char* label, uint32_t call, CommandBuffer& buffer,
+	                        std::string record, std::span<const RenderColorInfo> colors,
+	                        ImageId depth, std::span<PreparedBindings* const> stages,
+	                        bool rendering_clear, bool trace_due, const std::string* capture_prefix,
+	                        uint32_t milestone, PanelCaptureState& capture);
+	[[nodiscard]] static bool PanelProducerTraceEnabled();
+	void ObservePanelSources(const CommandBuffer& buffer, std::span<PreparedBindings* const> stages);
+	[[nodiscard]] uint32_t MatchPanelSourceImage(ImageId id, const ImageViewInfo& view) const;
+	[[nodiscard]] uint32_t MatchPanelSourceRange(GuestRange range, bool metadata) const;
+	[[nodiscard]] PanelProducerMatch MatchPanelProducerWrites(
+	    std::span<const RenderColorInfo> colors, std::span<PreparedBindings* const> stages) const;
+	[[nodiscard]] bool TracePanelProducerWindow(const CommandBuffer& buffer, uint32_t frame, const PanelProducerMatch& match);
+	void TracePanelProducerDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
+	                            const DrawEmitInfo& emit, const DrawRenderState& state,
+	                            const RenderState& rendering, std::span<PreparedBindings* const> stages);
+	void TracePanelProducerDispatch(uint64_t submit_id, CommandBuffer& buffer, PreparedBindings& bindings,
+	                                std::array<uint32_t, 3> groups, uint32_t mode, bool async_compute,
+	                                vk::Buffer indirect_buffer = nullptr, uint64_t indirect_offset = 0);
+	void TracePanelProducerShortcut(const CommandBuffer& buffer, const char* operation, GuestRange range,
+	                                uint64_t shader_hash, uint32_t value, bool metadata = false,
+	                                ImageId image = {}, const ImageViewInfo* view = nullptr);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -231,9 +273,18 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	uint32_t                             m_panel_trace_draws = 0;
-	uint32_t                             m_panel_capture_index = 0;
-	uint32_t                             m_panel_capture_misses = 0;
-	uint64_t                             m_panel_capture_bytes = 0;
+	PanelCaptureState                    m_panel_capture;
+	PanelCaptureState                    m_producer_capture;
+	std::array<PanelSourceWatch, 8>        m_panel_sources {};
+	uint32_t                             m_panel_source_count = 0;
+	uint32_t                             m_panel_source_logs = 0;
+	uint32_t                             m_producer_first_frame = UINT32_MAX;
+	uint32_t                             m_producer_frame = UINT32_MAX;
+	uint32_t                             m_producer_order = 0;
+	uint32_t                             m_producer_matches = 0;
+	uint32_t                             m_producer_emitted = 0;
+	uint32_t                             m_producer_unattributed = 0;
+	bool                                 m_producer_window = false;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

@@ -74,6 +74,8 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 				if (cache.ClearMeta(descriptor.Base48())) {
+					TracePanelProducerShortcut(buffer, "compute-metadata-clear", {descriptor.Base48(), 1},
+					                           program.shader_hash, UINT32_MAX, true);
 					return true;
 				}
 			}
@@ -174,6 +176,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		vk::ClearValue clear {};
 		clear.depthStencil = vk::ClearDepthStencilValue {0.0f, fill.value};
 		cache.ClearImage(command, binding.image_id, image.backing.format, range, clear);
+		TracePanelProducerShortcut(command, "compute-stencil-clear", destination, program.shader_hash,
+		                           fill.value, false, binding.image_id, &view);
 		return true;
 	}
 	ShaderBufferResource descriptor;
@@ -186,6 +190,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
 		return false;
 	}
+	TracePanelProducerShortcut(command, "compute-buffer-clear", {descriptor.Base48(), size},
+	                           program.shader_hash, packed_clear);
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
 		LOGF("GraphicsRenderDispatchDirect: compute image clear shader=0x%016" PRIx64
@@ -434,6 +440,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	TracePanelProducerDispatch(submit_id, buffer, bindings, {thread_group_x, thread_group_y, thread_group_z}, mode, async_compute);
 	ResetBindings();
 }
 
@@ -494,6 +501,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	TracePanelProducerDispatch(submit_id, buffer, bindings, {}, mode, async_compute, args_buffer->Handle(), args_offset);
 	ResetBindings();
 }
 
