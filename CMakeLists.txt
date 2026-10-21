@@ -524,6 +524,11 @@ add_executable(hmd2_tracker_pose_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(hmd2_tracker_pose_tests PRIVATE ${inc_headers})
 
+add_executable(virtual_head_position_tests EXCLUDE_FROM_ALL
+    "${KYTY_TESTS_DIR}/VirtualHeadPositionTests.cpp"
+)
+target_include_directories(virtual_head_position_tests PRIVATE ${inc_headers})
+
 add_executable(hmd2_layer_descriptor_tests EXCLUDE_FROM_ALL
     "${KYTY_TESTS_DIR}/Hmd2LayerDescriptorTests.cpp"
 )
@@ -653,6 +658,7 @@ if(BUILD_TESTING)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME horizon_calibration_patch COMMAND $<TARGET_FILE:horizon_calibration_patch_tests>)
 	add_test(NAME hmd2_tracker_pose COMMAND $<TARGET_FILE:hmd2_tracker_pose_tests>)
+	add_test(NAME virtual_head_position COMMAND $<TARGET_FILE:virtual_head_position_tests>)
 	add_test(NAME hmd2_layer_descriptor COMMAND $<TARGET_FILE:hmd2_layer_descriptor_tests>)
 	add_test(NAME vr_eye_pair COMMAND $<TARGET_FILE:vr_eye_pair_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
@@ -741,6 +747,7 @@ if(BUILD_TESTING)
 		controller_settings_tests
 		horizon_calibration_patch_tests
 		hmd2_tracker_pose_tests
+		virtual_head_position_tests
 		hmd2_layer_descriptor_tests
 		vr_eye_pair_tests
 		save_data_memory_tests

@@ -13,6 +13,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
+#include "libs/virtualHeadPosition.h"
 
 #include <algorithm>
 #include <array>
@@ -197,6 +198,9 @@ static Common::Mutex g_virtual_head_mutex;
 static float g_virtual_head_yaw   = 0.0f;
 static float g_virtual_head_pitch = 0.0f;
 static uint64_t g_virtual_head_updated_us = 0u;
+static VirtualHeadPosition::State g_virtual_head_position;
+static uint64_t g_virtual_head_pose_epoch_us = 0u;
+static bool g_virtual_head_pose_epoch_set = false;
 static float g_virtual_hand_reach[2] = {0.45f, 0.45f};
 static float g_virtual_hand_aim_yaw[2] = {-0.15f, 0.15f};
 static float g_virtual_hand_aim_pitch[2] = {0.14f, 0.14f};
@@ -378,11 +382,41 @@ void VirtualHeadResetPose() {
     g_virtual_head_yaw        = 0.0f;
     g_virtual_head_pitch      = 0.0f;
     g_virtual_head_updated_us = 0u;
+    g_virtual_head_position.ResetPosition();
     g_virtual_hand_reach[0] = 0.45f;
     g_virtual_hand_reach[1] = 0.45f;
     g_virtual_hand_position = {};
     VirtualHandResetAimLocked();
-    LOGF("Virtual PS VR2: headset orientation recentered\n");
+    LOGF("Virtual PS VR2: headset position/orientation and hands reset\n");
+}
+
+static const VirtualHeadPosition::Script& VirtualHeadPoseScript() {
+    static const VirtualHeadPosition::Script script = [] {
+        const char* value = std::getenv("KYTY_VR_HEAD_POSE_SCRIPT");
+        const auto parsed = VirtualHeadPosition::ParseScript(value != nullptr ? value : "");
+        if (!parsed) {
+            LOGF("Virtual head pose script: invalid finite input sequence; disabled\n");
+            return VirtualHeadPosition::Script {};
+        }
+        if (parsed->count != 0) {
+            LOGF("Virtual head pose script: %zu input steps, tracker-metre offsets and yaw/pitch radians\n",
+                 parsed->count);
+        }
+        return *parsed;
+    }();
+    return script;
+}
+
+void VirtualHeadMovePosition(float right_m, float up_m, float forward_m) {
+    if (!Config::VrEnabled() || !std::isfinite(right_m) || !std::isfinite(up_m) ||
+        !std::isfinite(forward_m)) {
+        return;
+    }
+    float head_position[3], head_orientation[4];
+    VirtualHeadGetPose(head_position, head_orientation);
+    const auto delta = RotateVirtualVector(head_orientation, {right_m, up_m, -forward_m});
+    Common::LockGuard lock(g_virtual_head_mutex);
+    (void)g_virtual_head_position.Move(delta);
 }
 
 void VirtualHeadGetPose(float position[3], float orientation[4]) {
@@ -411,6 +445,8 @@ void VirtualHeadGetPose(float position[3], float orientation[4]) {
     const uint64_t now = LibKernel::KernelGetProcessTime();
     float yaw = 0.0f;
     float pitch = 0.0f;
+    VirtualHeadPosition::Offset head_offset {};
+    const auto& pose_script = VirtualHeadPoseScript();
     {
         Common::LockGuard lock(g_virtual_head_mutex);
         if (g_virtual_head_updated_us != 0u && now >= g_virtual_head_updated_us) {
@@ -422,6 +458,24 @@ void VirtualHeadGetPose(float position[3], float orientation[4]) {
                 g_virtual_head_pitch - stick_y * turn_rate * dt, -1.48353f, 1.48353f);
         }
         g_virtual_head_updated_us = now;
+        if (pose_script.count != 0) {
+            if (!g_virtual_head_pose_epoch_set) {
+                g_virtual_head_pose_epoch_us = now;
+                g_virtual_head_pose_epoch_set = true;
+            }
+            const uint64_t elapsed_ms = now >= g_virtual_head_pose_epoch_us
+                ? (now - g_virtual_head_pose_epoch_us) / 1000u : 0u;
+            if (g_virtual_head_position.ApplyDue(pose_script, elapsed_ms) != 0) {
+                const auto& step = pose_script.steps[g_virtual_head_position.next_step - 1];
+                g_virtual_head_yaw = step.yaw;
+                g_virtual_head_pitch = step.pitch;
+                LOGF("Virtual head pose script step=%zu elapsed_ms=%" PRIu64
+                     " offset=(%.3f,%.3f,%.3f) yaw=%.3f pitch=%.3f\n",
+                     g_virtual_head_position.next_step, elapsed_ms,
+                     step.offset[0], step.offset[1], step.offset[2], step.yaw, step.pitch);
+            }
+        }
+        head_offset = g_virtual_head_position.offset;
         yaw = g_virtual_head_yaw;
         pitch = g_virtual_head_pitch;
     }
@@ -431,9 +485,9 @@ void VirtualHeadGetPose(float position[3], float orientation[4]) {
     const float cp = std::cos(pitch * 0.5f);
     const float sp = std::sin(pitch * 0.5f);
 
-    position[0] = 0.0f;
-    position[1] = VIRTUAL_HEAD_HEIGHT;
-    position[2] = 0.0f;
+    position[0] = head_offset[0];
+    position[1] = VIRTUAL_HEAD_HEIGHT + head_offset[1];
+    position[2] = head_offset[2];
     orientation[0] = cy * sp;
     orientation[1] = sy * cp;
     orientation[2] = -sy * sp;

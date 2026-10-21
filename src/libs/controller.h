@@ -78,6 +78,8 @@ int  GetActiveControllerId();
 // Software-only PS VR2 headset pose driven by desktop mouse/right stick.
 // Getter is thread-safe: guest VR polling and SDL input run on different threads.
 void VirtualHeadMouseMotion(float dx, float dy);
+// Move the head in view-relative metres; the resulting tracker position persists.
+void VirtualHeadMovePosition(float right_m, float up_m, float forward_m);
 void VirtualHeadResetPose();
 void VirtualHeadGetPose(float position[3], float orientation[4]);
 void VirtualHandGetPose(int side, float position[3], float orientation[4]);

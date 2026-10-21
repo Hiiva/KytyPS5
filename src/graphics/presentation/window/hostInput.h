@@ -15,6 +15,7 @@ void               HostInputMouseButton(uint8_t mouse_button, bool down);
 void               HostInputMouseWheel(float wheel_steps, bool left_modifier);
 void               HostInputToggleMouseToJoystick();
 void               HostInputToggleMouseToHead();
+void               HostInputToggleMouseToHeadPosition();
 void               HostInputToggleMouseToHand(int side);
 void               HostInputToggleMouseToHandPosition(int side);
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms);
