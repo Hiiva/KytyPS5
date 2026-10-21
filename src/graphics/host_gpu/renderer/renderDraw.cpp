@@ -1086,6 +1086,54 @@ const PanelUpstreamOptions& GetPanelUpstreamOptions() {
 	return options;
 }
 
+struct PanelUpstreamCaptureFilter {
+	// Keep logical selection inside the existing bounded per-draw image list.
+	static constexpr uint32_t MaxImageIndex = 15u;
+	bool enabled = true;
+	bool exact = false;
+	uint64_t ps_hash = 0;
+	uint32_t image_index = 0;
+};
+
+const PanelUpstreamCaptureFilter& GetPanelUpstreamCaptureFilter() {
+	static const PanelUpstreamCaptureFilter options = [] {
+		PanelUpstreamCaptureFilter result;
+		const char* hash = std::getenv("KYTY_VR_PANEL_UPSTREAM_CAPTURE_PS_HASH");
+		const char* index = std::getenv("KYTY_VR_PANEL_UPSTREAM_CAPTURE_IMAGE_INDEX");
+		if (hash == nullptr && index == nullptr) return result;
+		const auto disabled = [&](const char* reason) {
+			result.enabled = false;
+			LOGF("PanelProducer capture disabled: reason=%s ancestry-tracing-unchanged\n", reason);
+			return result;
+		};
+		if (hash == nullptr || index == nullptr) return disabled("capture-filter-requires-both-ps-hash-and-image-index");
+		if (std::strlen(hash) != 16u) return disabled("capture-ps-hash-must-be-16-hex-digits");
+		for (uint32_t i = 0; i < 16u; ++i) {
+			const char c = hash[i];
+			const uint32_t digit = c >= '0' && c <= '9' ? c - '0'
+			    : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16u;
+			if (digit >= 16u) return disabled("capture-ps-hash-must-be-16-hex-digits");
+			result.ps_hash = (result.ps_hash << 4u) | digit;
+		}
+		if (*index == '\0') return disabled("capture-image-index-must-be-decimal-0-through-15");
+		for (; *index != '\0'; ++index) {
+			if (*index < '0' || *index > '9') return disabled("capture-image-index-must-be-decimal-0-through-15");
+			const uint32_t digit = static_cast<uint32_t>(*index - '0');
+			if (result.image_index > PanelUpstreamCaptureFilter::MaxImageIndex / 10u ||
+			    (result.image_index == PanelUpstreamCaptureFilter::MaxImageIndex / 10u &&
+			     digit > PanelUpstreamCaptureFilter::MaxImageIndex % 10u))
+				return disabled("capture-image-index-must-be-decimal-0-through-15");
+			result.image_index = result.image_index * 10u + digit;
+		}
+		result.exact = true;
+		LOGF("PanelProducer capture filter: mode=exact-pixel-input ps=%016" PRIx64
+		     " logical_image=%u index_scope=program.info.images image_index_max=%u ancestry-tracing-unchanged\n",
+		     result.ps_hash, result.image_index, PanelUpstreamCaptureFilter::MaxImageIndex);
+		return result;
+	}();
+	return options;
+}
+
 template <typename Handle>
 uint64_t PanelNativeHandle(Handle handle) {
 	using Native = typename Handle::CType;
@@ -1583,9 +1631,11 @@ void RenderExecutor::TracePanelProducerDraw(uint64_t submit_id, CommandBuffer& b
 	const std::array<uint32_t, 2> milestones = upstream.enabled
 	    ? upstream.capture_frames : std::array<uint32_t, 2> {128u, 1024u};
 	const uint32_t capture_images = upstream.enabled ? match.images & PanelUpstreamWatchMask : match.images;
+	const auto& capture_filter = GetPanelUpstreamCaptureFilter();
 	// Reuse the same pending sets and byte budget. Clears/no-input/ineligible draws do
 	// not consume a set; a later eligible native child writer can still provide it.
-	const bool capture_due = capture_images != 0 && !prefix.empty() && m_producer_capture.index < milestones.size() &&
+	const bool capture_due = capture_filter.enabled && capture_images != 0 && !prefix.empty() &&
+	                         m_producer_capture.index < milestones.size() &&
 	                         frame >= milestones[m_producer_capture.index];
 	if (!trace_due && !capture_due) return;
 	const auto& hw = buffer.GetRegisters();
@@ -1749,7 +1799,9 @@ void RenderExecutor::TracePanelBindings(const char* label, uint32_t call, Comman
 	                                      bool rendering_clear, bool trace_due, const std::string* capture_prefix,
 	                                      uint32_t milestone, PanelCaptureState& capture) {
 	auto& cache = m_context.GetTextureCache();
-	const bool capture_due = capture_prefix != nullptr;
+	const auto* capture_filter = std::strcmp(label, "PanelProducer") == 0 ? &GetPanelUpstreamCaptureFilter() : nullptr;
+	const bool exact_capture = capture_filter != nullptr && capture_filter->exact;
+	const bool capture_due = capture_prefix != nullptr && (capture_filter == nullptr || capture_filter->enabled);
 	// video_out marks the exact cache image selected by the presenter. Explicit preview
 	// paths can mark other images too; addresses/IDs correlate with the surface trace.
 	for (uint32_t i = 0; i < colors.size(); ++i) {
@@ -1775,6 +1827,7 @@ void RenderExecutor::TracePanelBindings(const char* label, uint32_t call, Comman
 		const ShaderRecompiler::IR::ImageResource* resource;
 		uint32_t stage;
 		uint32_t index;
+		uint64_t shader_hash;
 	};
 	std::array<Candidate, 16> candidates {};
 	uint32_t candidate_count = 0;
@@ -1874,7 +1927,12 @@ void RenderExecutor::TracePanelBindings(const char* label, uint32_t call, Comman
 			    static_cast<uint32_t>(view.mapping.g), static_cast<uint32_t>(view.mapping.b),
 			    static_cast<uint32_t>(view.mapping.a), static_cast<uint32_t>(binding.layout),
 			    image->IsCpuDirty(), image->IsBufferModified(), image->IsGpuModified(), binding.mip_views.size());
-			candidates[candidate_count++] = {image, &binding, actual_view, &resource, stage_index, i};
+			// Trace every binding as before; selection uses this actual program and its
+			// logical image index, never a descriptor-kind bank slot.
+			if (!exact_capture || (program.stage == ShaderType::Pixel && program.shader_hash == capture_filter->ps_hash &&
+			                       i == capture_filter->image_index)) {
+				candidates[candidate_count++] = {image, &binding, actual_view, &resource, stage_index, i, program.shader_hash};
+			}
 		}
 		if (shown != prepared.images.size()) {
 			record += fmt::format("{} truncated call={} stage={} shown_images={} total_images={}\n", label,
@@ -1905,7 +1963,8 @@ void RenderExecutor::TracePanelBindings(const char* label, uint32_t call, Comman
 	std::array<vk::Image, 2> captured {};
 	uint32_t captured_count = 0;
 	const char* reason = rendering_clear ? "rendering-clear-would-be-replayed"
-	                   : uncertain_writes ? "shader-buffer-or-address-writes" : "no-sampled-input";
+	                   : uncertain_writes ? "shader-buffer-or-address-writes"
+	                   : exact_capture ? "capture-filter-no-resolved-pixel-input" : "no-sampled-input";
 	for (uint32_t i = 0; !rendering_clear && !uncertain_writes && i < candidate_count &&
 	                       captured_count < captured.size(); ++i) {
 		const auto& candidate = candidates[i];
@@ -1914,7 +1973,10 @@ void RenderExecutor::TracePanelBindings(const char* label, uint32_t call, Comman
 		const auto& backing = image.backing;
 		const auto* view = candidate.view;
 		if (resource.resource_class != ShaderRecompiler::IR::ImageResourceClass::Sampled ||
-		    !resource.read || resource.written || candidate.binding->desc.type != TextureCache::BindingType::Texture) continue;
+		    !resource.read || resource.written || candidate.binding->desc.type != TextureCache::BindingType::Texture) {
+			if (exact_capture) reason = "selected-input-is-not-read-only-sampled-texture";
+			continue;
+		}
 		if (view == nullptr || view->aspect != vk::ImageAspectFlagBits::eColor ||
 		    view->type != vk::ImageViewType::e2D || view->base_level != 0 || view->level_count != 1 ||
 		    view->base_layer != 0 || view->layer_count != 1 || candidate.binding->mip_views.size() > 1 ||
@@ -1958,8 +2020,14 @@ void RenderExecutor::TracePanelBindings(const char* label, uint32_t call, Comman
 		}
 		const auto path = fmt::format("{}-draw{}-stage{}-image{}-{:016x}.bin", *capture_prefix,
 		                              call, candidate.stage, candidate.index, PanelNativeHandle(backing.image));
-		const auto metadata = record + fmt::format("selected stage={} image={} milestone={}\n",
+		auto metadata = record + fmt::format("selected stage={} image={} milestone={}\n",
 		    candidate.stage, candidate.index, milestone);
+		if (exact_capture) {
+			metadata += fmt::format("selected_filter mode=exact-pixel-input requested_ps={:016x} "
+			    "requested_logical_image={} actual_ps={:016x} actual_logical_image={} descriptor_binding={} "
+			    "index_scope=program.info.images\n", capture_filter->ps_hash, capture_filter->image_index,
+			    candidate.shader_hash, candidate.index, resource.descriptor_index);
+		}
 		if (!QueuePanelInputCapture(buffer, image, static_cast<uint32_t>(bytes), path, metadata, label)) {
 			reason = "staging-allocation-failed";
 			continue;

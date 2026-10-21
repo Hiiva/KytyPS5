@@ -177,9 +177,19 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+bool ShaderBinaryDumpEnabled() {
+	// Save the compiler's existing immutable code snapshots without enabling the
+	// much more verbose per-command graphics diagnostics.
+	static const bool binary_only = [] {
+		const char* value = std::getenv("KYTY_SHADER_BINARY_DUMP");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return binary_only || Config::GraphicsDebugDumpEnabled();
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!ShaderBinaryDumpEnabled()) {
 		return;
 	}
 	static std::atomic_int id = 0;
@@ -197,7 +207,7 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!ShaderBinaryDumpEnabled()) {
 		return;
 	}
 	EXIT_IF(code.empty());
