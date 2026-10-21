@@ -1208,6 +1208,7 @@ bool PanelImagesOverlap(const Image& a, const Image& b) {
 struct PanelGpuScalarCaptureOptions {
 	bool enabled = false;
 	bool hdr_uv = false;
+	bool composite = false;
 	std::string prefix;
 	std::array<uint32_t, 2> milestones {2048u, 3072u};
 };
@@ -1216,11 +1217,20 @@ const PanelGpuScalarCaptureOptions& GetPanelGpuScalarCaptureOptions() {
 	static const PanelGpuScalarCaptureOptions options = [] {
 		PanelGpuScalarCaptureOptions result;
 		const char* value = std::getenv("KYTY_VR_PANEL_GPU_SCALAR_CAPTURE");
-		if (value == nullptr || std::strcmp(value, "1") != 0) return result;
+		const bool tone_enabled = value != nullptr && std::strcmp(value, "1") == 0;
+		const char* composite = std::getenv("KYTY_VR_PANEL_GPU_COMPOSITE_CAPTURE");
+		const bool composite_enabled = composite != nullptr && std::strcmp(composite, "1") == 0;
+		if (!tone_enabled && !composite_enabled) return result;
 		const auto disabled = [&](const char* reason) {
 			LOGF("PanelProducer GPU scalar capture disabled: reason=%s existing-diagnostics-unchanged\n", reason);
 			return result;
 		};
+		if (tone_enabled && composite_enabled)
+			return disabled("mutually-exclusive-tone-and-composite-modes");
+		const char* hdr_uv = std::getenv("KYTY_VR_PANEL_GPU_SCALAR_CAPTURE_HDR_UV");
+		const bool hdr_uv_enabled = hdr_uv != nullptr && std::strcmp(hdr_uv, "1") == 0;
+		if (composite_enabled && hdr_uv_enabled)
+			return disabled("composite-mode-rejects-hdr-uv-companion");
 		const char* producer = std::getenv("KYTY_VR_PANEL_PRODUCER_TRACE");
 		if (producer == nullptr || std::strcmp(producer, "1") != 0)
 			return disabled("requires-producer-trace");
@@ -1231,14 +1241,22 @@ const PanelGpuScalarCaptureOptions& GetPanelGpuScalarCaptureOptions() {
 			return disabled("requires-nonempty-prefix-at-most-2048-bytes");
 		result.prefix = prefix;
 		result.milestones = upstream.capture_frames;
-		const char* hdr_uv = std::getenv("KYTY_VR_PANEL_GPU_SCALAR_CAPTURE_HDR_UV");
-		result.hdr_uv = hdr_uv != nullptr && std::strcmp(hdr_uv, "1") == 0;
+		result.hdr_uv = hdr_uv_enabled;
+		result.composite = composite_enabled;
 		result.enabled = true;
-		LOGF("PanelProducer GPU scalar capture enabled: ps=83b1c2d863c50cf3 resource=1 binding=1 "
-		     "byte_offset=2168 bytes=4 timing=before-draw capture_frames=%u,%u max_captures=2 "
-		     "max_raw_bytes=%u max_decisions=64 cutoff_frame=4096 guest_reads=0 image-budget-unchanged=1 "
-		     "hdr_uv_companion=%d companion_recipe=83b1c2d863c50cf3:0:0:48 primary-first=1\n",
-		     result.milestones[0], result.milestones[1], result.hdr_uv ? 104u : 8u, result.hdr_uv);
+		if (result.composite) {
+			LOGF("PanelProducer GPU composite capture enabled: ps=8f4f493f4d30416d resource=3 binding=3 "
+			     "byte_offset=0 bytes=28 timing=before-draw capture_frames=%u,%u max_captures=2 "
+			     "max_raw_bytes=152 max_decisions=64 cutoff_frame=4096 guest_reads=0 image-budget-unchanged=1 "
+			     "companion_recipe=8f4f493f4d30416d:0:0:48 primary-first=1\n",
+			     result.milestones[0], result.milestones[1]);
+		} else {
+			LOGF("PanelProducer GPU scalar capture enabled: ps=83b1c2d863c50cf3 resource=1 binding=1 "
+			     "byte_offset=2168 bytes=4 timing=before-draw capture_frames=%u,%u max_captures=2 "
+			     "max_raw_bytes=%u max_decisions=64 cutoff_frame=4096 guest_reads=0 image-budget-unchanged=1 "
+			     "hdr_uv_companion=%d companion_recipe=83b1c2d863c50cf3:0:0:48 primary-first=1\n",
+			     result.milestones[0], result.milestones[1], result.hdr_uv ? 104u : 8u, result.hdr_uv);
+		}
 		return result;
 	}();
 	return options;
@@ -1527,11 +1545,15 @@ bool QueuePanelInputCapture(CommandBuffer& command, Image& image, uint32_t bytes
 } // namespace
 
 const RenderExecutor::PanelGpuScalarRecipe* RenderExecutor::GetPanelGpuScalarRecipe(PanelGpuScalarKind kind) {
-	static constexpr PanelGpuScalarRecipe common_rgb {1u, 0x40u, 4384u, 2168u, 4u};
-	static constexpr PanelGpuScalarRecipe hdr_uv {0u, 0x10u, 128u, 0u, 48u};
+	static constexpr PanelGpuScalarRecipe common_rgb {0x83b1c2d863c50cf3ull, 1u, 0x40u, 4384u, 2168u, 4u};
+	static constexpr PanelGpuScalarRecipe hdr_uv {0x83b1c2d863c50cf3ull, 0u, 0x10u, 128u, 0u, 48u};
+	static constexpr PanelGpuScalarRecipe composite_controls {0x8f4f493f4d30416dull, 3u, 0x1d0u, 48u, 0u, 28u};
+	static constexpr PanelGpuScalarRecipe composite_uv {0x8f4f493f4d30416dull, 0u, 0x10u, 48u, 0u, 48u};
 	switch (kind) {
 	case PanelGpuScalarKind::CommonRgb: return &common_rgb;
 	case PanelGpuScalarKind::HdrUv: return &hdr_uv;
+	case PanelGpuScalarKind::CompositeControls: return &composite_controls;
+	case PanelGpuScalarKind::CompositeUv: return &composite_uv;
 	default: return nullptr;
 	}
 }
@@ -1548,6 +1570,20 @@ const char* RenderExecutor::PlanPanelGpuHdrUvCapture(
 	const RenderState& rendering, std::span<PreparedBindings* const> stages,
 	PanelGpuScalarPlan& plan) const {
 	return PlanPanelGpuCapture(PanelGpuScalarKind::HdrUv, buffer, colors, depth, rendering, stages, plan);
+}
+
+const char* RenderExecutor::PlanPanelGpuCompositeControlsCapture(
+	const CommandBuffer& buffer, std::span<const RenderColorInfo> colors, ImageId depth,
+	const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	PanelGpuScalarPlan& plan) const {
+	return PlanPanelGpuCapture(PanelGpuScalarKind::CompositeControls, buffer, colors, depth, rendering, stages, plan);
+}
+
+const char* RenderExecutor::PlanPanelGpuCompositeUvCapture(
+	const CommandBuffer& buffer, std::span<const RenderColorInfo> colors, ImageId depth,
+	const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	PanelGpuScalarPlan& plan) const {
+	return PlanPanelGpuCapture(PanelGpuScalarKind::CompositeUv, buffer, colors, depth, rendering, stages, plan);
 }
 
 const char* RenderExecutor::PlanPanelGpuCapture(
@@ -1588,7 +1624,7 @@ const char* RenderExecutor::PlanPanelGpuCapture(
 		                [](const auto& binding) { return binding.desc.type == TextureCache::BindingType::Storage; }))
 			return "bound-storage-image-or-unknown-write";
 	}
-	if (pixel == nullptr || pixel->runtime->program->shader_hash != 0x83b1c2d863c50cf3ull)
+	if (pixel == nullptr || pixel->runtime->program->shader_hash != recipe->pixel_hash)
 		return "missing-exact-pixel-recipe";
 	const auto& program = *pixel->runtime->program;
 	const auto& snapshot = *pixel->runtime->resources;
@@ -1693,11 +1729,29 @@ bool RenderExecutor::QueuePanelGpuHdrUvReadback(
 	return QueuePanelGpuReadback(PanelGpuScalarKind::HdrUv, buffer, plan, std::move(completion));
 }
 
+bool RenderExecutor::QueuePanelGpuCompositeControlsReadback(
+	CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
+	Common::UniqueFunction<void, bool, PanelGpuCompositeControlWords>&& completion) {
+	if (!completion || plan.kind != PanelGpuScalarKind::CompositeControls) return false;
+	return QueuePanelGpuReadback(PanelGpuScalarKind::CompositeControls, buffer, plan,
+	    [completion = std::move(completion)](bool success, PanelGpuScalarWords words) mutable {
+		    PanelGpuCompositeControlWords controls {};
+		    std::copy_n(words.begin(), controls.size(), controls.begin());
+		    completion(success, controls);
+	    });
+}
+
+bool RenderExecutor::QueuePanelGpuCompositeUvReadback(
+	CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
+	Common::UniqueFunction<void, bool, PanelGpuScalarWords>&& completion) {
+	return QueuePanelGpuReadback(PanelGpuScalarKind::CompositeUv, buffer, plan, std::move(completion));
+}
+
 bool RenderExecutor::QueuePanelGpuReadback(
 	PanelGpuScalarKind kind, CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
 	Common::UniqueFunction<void, bool, PanelGpuScalarWords>&& completion) {
 	const auto* recipe = GetPanelGpuScalarRecipe(kind);
-	if (recipe == nullptr || plan.kind != kind) return false;
+	if (recipe == nullptr || plan.kind != kind || recipe->selected_size > sizeof(PanelGpuScalarWords)) return false;
 	if (buffer.IsInvalid() || &buffer.GetContext() != &m_context || !completion ||
 	    plan.guest_size != recipe->declared_size || plan.native.range != recipe->declared_size ||
 	    (plan.native.offset & 3u) != 0u ||
@@ -1789,6 +1843,8 @@ uint32_t RenderExecutor::CapturePanelGpuScalarBeforeDraw(
 	const DrawEmitInfo& emit, const DrawRenderState& state, const RenderState& rendering,
 	std::span<PreparedBindings* const> stages) {
 	const auto& options = GetPanelGpuScalarCaptureOptions();
+	if (options.composite)
+		return CapturePanelGpuCompositeBeforeDraw(submit_id, buffer, draw, emit, state, rendering, stages);
 	const uint64_t max_raw_bytes = options.hdr_uv ? 104u : 8u;
 	if (!options.enabled || m_gpu_scalar_capture.index >= options.milestones.size() ||
 	    !PanelScalarRangeFits(m_gpu_scalar_capture.bytes, 4u, max_raw_bytes) || m_gpu_scalar_decisions >= 64u ||
@@ -1940,6 +1996,133 @@ uint32_t RenderExecutor::CapturePanelGpuScalarBeforeDraw(
 	if (!queued) return 0;
 	++m_gpu_scalar_capture.index;
 	m_gpu_scalar_capture.bytes += 4u + (hdr_uv_queued ? 48u : 0u);
+	m_gpu_scalar_last_frame = frame;
+	return sequence;
+}
+
+uint32_t RenderExecutor::CapturePanelGpuCompositeBeforeDraw(
+	uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
+	const DrawEmitInfo& emit, const DrawRenderState& state, const RenderState& rendering,
+	std::span<PreparedBindings* const> stages) {
+	const auto& options = GetPanelGpuScalarCaptureOptions();
+	constexpr uint64_t max_raw_bytes = 152u;
+	if (!options.enabled || !options.composite || m_gpu_scalar_capture.index >= options.milestones.size() ||
+	    !PanelScalarRangeFits(m_gpu_scalar_capture.bytes, 28u, max_raw_bytes) || m_gpu_scalar_decisions >= 64u ||
+	    !GuestGpu::IsGpuThread() || m_upstream_source_count == 0)
+		return 0;
+	const auto frame = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+	const auto milestone = options.milestones[m_gpu_scalar_capture.index];
+	if (frame > 4096u || frame < milestone || frame == m_gpu_scalar_last_frame) return 0;
+	const bool exact_pixel = std::any_of(stages.begin(), stages.end(), [](const auto* prepared) {
+		return prepared != nullptr && prepared->runtime != nullptr && *prepared->runtime &&
+		       prepared->runtime->program->stage == ShaderType::Pixel &&
+		       prepared->runtime->program->shader_hash == 0x8f4f493f4d30416dull;
+	});
+	if (!exact_pixel) return 0;
+	const auto colors = std::span {state.color_info, state.color_count};
+	const auto match = MatchPanelProducerWrites(colors, stages);
+	if ((match.images & PanelUpstreamWatchMask) == 0) return 0;
+	++m_gpu_scalar_decisions;
+	PanelGpuScalarPlan plan;
+	const auto* reason = PlanPanelGpuCompositeControlsCapture(buffer, colors, state.depth_info.image_id,
+	                                                        rendering, stages, plan);
+	if (reason != nullptr) {
+		LOGF("PanelProducer GPU scalar decision: mode=composite frame=%u submit=%" PRIu64
+		     " milestone=%u decision=%u state=skipped reason=%s composite_uv_state=not-attempted\n",
+		     frame, submit_id, milestone, m_gpu_scalar_decisions, reason);
+		return 0;
+	}
+	const uint32_t sequence = m_gpu_scalar_capture.index + 1u;
+	const auto tick = m_context.GetCommandScheduler().CurrentTick();
+	const auto queue_capture = [&](const PanelGpuScalarPlan& selected, bool uv) {
+		const auto kind = uv ? PanelGpuScalarKind::CompositeUv : PanelGpuScalarKind::CompositeControls;
+		if (selected.kind != kind) return false;
+		const uint32_t bytes = uv ? 48u : 28u;
+		const char* kind_name = uv ? "composite-uv" : "composite-controls";
+		const char* role = uv ? "scene-input13-UV-constants" : "scene-mix-distortion-bias-controls";
+		const auto path = fmt::format("{}-scalar{}-{}-frame{}-submit{}-tick{}.bin",
+		                             options.prefix, sequence, kind_name, frame, submit_id, tick);
+		std::string metadata = fmt::format(
+		    "PanelGpuScalar sequence={} milestone={} frame={} submit={} tick={} timing=before-draw "
+		    "origin=gpu-buffer-copy kind={} role={} bytes={}",
+		    sequence, milestone, frame, submit_id, tick, kind_name, role, bytes);
+		if (uv) metadata += " primary_queued=1";
+		metadata += fmt::format(
+		    " stage={} ps=8f4f493f4d30416d resource={} binding={} first_pc={:x} source_images={:x}\n"
+		    "draw={} count={} instances={} vertex_offset={} first_vertex={} first_instance={}\n"
+		    "sharp={:08x},{:08x},{:08x},{:08x} packed_offset_word={:08x} "
+		    "guest={:016x} resolved_bytes={} native={:016x} offset={} range={} selected_byte_offset=0 "
+		    "selected_native_offset={} owner_size={} owner={}\n",
+		    selected.stage_index, uv ? 0u : 3u, uv ? 0u : 3u, uv ? 0x10u : 0x1d0u, match.images,
+		    draw.Name(), draw.index_count, draw.instance_count, emit.vertex_offset, emit.first_vertex, emit.first_instance,
+		    selected.sharp[0], selected.sharp[1], selected.sharp[2], selected.sharp[3], selected.packed_offset_word,
+		    selected.guest_address, selected.guest_size, PanelNativeHandle(selected.native.buffer),
+		    selected.native.offset, selected.native.range, selected.selected_offset, selected.owner_size,
+		    selected.stream ? "stream" : "registered-cache");
+		metadata += uv
+		    ? "interpretation=raw-dwords-authoritative float_words=0,1,2,3,4,5,6,7,10,11 uint_words=8,9 "
+		      "remap-branches-and-distortion-unmeasured=1 sampled-RGB-unproved=1\n"
+		    : "interpretation=raw-dwords-authoritative float_words=0,4,6 remaining_words=uninterpreted "
+		      "t_word=0 distortion_mix_word=4 bias_word=6\n";
+		auto completion = [path, metadata = std::move(metadata), sequence, frame, tick, bytes, kind_name]
+		                  (bool readback_ok, auto words) {
+			uint32_t written = 0;
+			bool saved = false;
+			if (readback_ok && sizeof(words) == bytes) {
+				Common::File raw;
+				if (raw.Create(path)) {
+					raw.Write(words.data(), bytes, &written);
+					saved = written == bytes && raw.Flush();
+				}
+			}
+			auto text = metadata + fmt::format("gpu_completed=1 readback_ok={} saved={} written={}",
+			                                   readback_ok, saved, written);
+			if (readback_ok) {
+				text += " dwords=";
+				for (uint32_t i = 0; i < words.size(); ++i)
+					text += fmt::format("{}{:08x}", i == 0 ? "" : ",", words[i]);
+			}
+			text += "\n";
+			Common::File info;
+			bool metadata_saved = false;
+			if (info.Create(path + ".txt")) {
+				uint32_t count = 0;
+				info.Write(text.data(), static_cast<uint32_t>(text.size()), &count);
+				metadata_saved = count == text.size() && info.Flush();
+			}
+			LOGF("PanelProducer GPU scalar complete: sequence=%u kind=%s frame=%u tick=%" PRIu64
+			     " file=%s gpu_completed=1 readback_ok=%d saved=%d metadata=%d bytes=%u\n",
+			     sequence, kind_name, frame, tick, path.c_str(), readback_ok, saved, metadata_saved, written);
+		};
+		if (uv) return QueuePanelGpuCompositeUvReadback(buffer, selected, std::move(completion));
+		return QueuePanelGpuCompositeControlsReadback(buffer, selected, std::move(completion));
+	};
+	const bool queued = queue_capture(plan, false);
+	bool uv_queued = false;
+	const char* uv_reason = "primary-not-queued";
+	PanelGpuScalarPlan uv_plan;
+	if (queued) {
+		uv_reason = PanelScalarRangeFits(m_gpu_scalar_capture.bytes + 28u, 48u, max_raw_bytes)
+		                ? PlanPanelGpuCompositeUvCapture(buffer, colors, state.depth_info.image_id,
+		                                                rendering, stages, uv_plan)
+		                : "raw-byte-budget";
+		if (uv_reason == nullptr) {
+			uv_queued = queue_capture(uv_plan, true);
+			uv_reason = uv_queued ? "ok" : "owner-changed-or-allocation-failed";
+		}
+	}
+	LOGF("PanelProducer GPU scalar decision: mode=composite frame=%u submit=%" PRIu64
+	     " milestone=%u decision=%u sequence=%u state=%s reason=%s native=%016" PRIx64
+	     " selected_offset=%" PRIu64 " bytes=28 tick=%" PRIu64
+	     " composite_uv_state=%s composite_uv_reason=%s composite_uv_native=%016" PRIx64
+	     " composite_uv_selected_offset=%" PRIu64 " composite_uv_bytes=%u\n",
+	     frame, submit_id, milestone, m_gpu_scalar_decisions, sequence, queued ? "queued" : "skipped",
+	     queued ? "ok" : "owner-changed-or-allocation-failed", PanelNativeHandle(plan.native.buffer),
+	     plan.selected_offset, tick, uv_queued ? "queued" : "skipped", uv_reason,
+	     PanelNativeHandle(uv_plan.native.buffer), uv_plan.selected_offset, uv_queued ? 48u : 0u);
+	if (!queued) return 0;
+	++m_gpu_scalar_capture.index;
+	m_gpu_scalar_capture.bytes += 28u + (uv_queued ? 48u : 0u);
 	m_gpu_scalar_last_frame = frame;
 	return sequence;
 }
@@ -2300,10 +2483,13 @@ void RenderExecutor::TracePanelProducerDraw(uint64_t submit_id, CommandBuffer& b
 	}();
 	const std::array<uint32_t, 2> milestones = upstream.enabled
 	    ? upstream.capture_frames : std::array<uint32_t, 2> {128u, 1024u};
-	const uint32_t capture_images = upstream.enabled ? match.images & PanelUpstreamWatchMask : match.images;
 	const auto& capture_filter = GetPanelUpstreamCaptureFilter();
+	const bool capture_parent = upstream.enabled && capture_filter.exact && upstream.parent_ps_hash != 0 &&
+	                            capture_filter.ps_hash == upstream.parent_ps_hash;
+	const uint32_t capture_images = upstream.enabled
+	    ? match.images & (capture_parent ? PanelPrimaryWatchMask : PanelUpstreamWatchMask) : match.images;
 	// Reuse the same pending sets and byte budget. Clears/no-input/ineligible draws do
-	// not consume a set; a later eligible native child writer can still provide it.
+	// not consume a set. Only an exact configured parent filter selects primary writers.
 	const bool capture_due = capture_filter.enabled && capture_images != 0 && !prefix.empty() &&
 	                         m_producer_capture.index < milestones.size() &&
 	                         frame >= milestones[m_producer_capture.index];
@@ -2332,6 +2518,12 @@ void RenderExecutor::TracePanelProducerDraw(uint64_t submit_id, CommandBuffer& b
 		record += fmt::format("PanelProducer ancestry call={} primary_images={:x} upstream_images={:x} "
 		    "capture_depth=1 parent_ps={:016x}\n", m_producer_order,
 		    match.images & PanelPrimaryWatchMask, match.images & PanelUpstreamWatchMask, upstream.parent_ps_hash);
+	}
+	if (capture_due) {
+		record += fmt::format("PanelProducer capture_scope call={} capture_scope={} selected_depth={} "
+		    "depth_kind=writer ancestry_trace_depth={} capture_images={:x}\n", m_producer_order,
+		    upstream.enabled ? (capture_parent ? "exact-parent-writer" : "upstream-writer") : "legacy-watch-writer",
+		    upstream.enabled ? (capture_parent ? "0" : "1") : "untracked", upstream.enabled ? 1u : 0u, capture_images);
 	}
 	record += fmt::format("PanelProducer coverage call={} viewport0_scale={},{},{} offset={},{},{} scissor0={},{},{},{} "
 	    "cull={}/{} depth_test={} depth_write={} depth_compare={} stencil_test={} clip_disable={}\n",

@@ -425,6 +425,35 @@ struct RenderExecutorTestAccess {
     return executor.QueuePanelGpuHdrUvReadback(command, plan, std::move(completion));
   }
 
+  static const char *PlanPanelGpuCompositeControlsCapture(const RenderExecutor &executor,
+      const CommandBuffer &command, std::span<const RenderColorInfo> colors,
+      ImageId depth, const RenderState &rendering,
+      std::span<PreparedBindings *const> stages, PanelGpuScalarPlan &plan) {
+    return executor.PlanPanelGpuCompositeControlsCapture(
+        command, colors, depth, rendering, stages, plan);
+  }
+
+  static const char *PlanPanelGpuCompositeUvCapture(const RenderExecutor &executor,
+      const CommandBuffer &command, std::span<const RenderColorInfo> colors,
+      ImageId depth, const RenderState &rendering,
+      std::span<PreparedBindings *const> stages, PanelGpuScalarPlan &plan) {
+    return executor.PlanPanelGpuCompositeUvCapture(
+        command, colors, depth, rendering, stages, plan);
+  }
+
+  static bool QueuePanelGpuCompositeControlsReadback(RenderExecutor &executor,
+      CommandBuffer &command, const PanelGpuScalarPlan &plan,
+      Common::UniqueFunction<void, bool, std::array<uint32_t, 7>> completion) {
+    return executor.QueuePanelGpuCompositeControlsReadback(
+        command, plan, std::move(completion));
+  }
+
+  static bool QueuePanelGpuCompositeUvReadback(RenderExecutor &executor,
+      CommandBuffer &command, const PanelGpuScalarPlan &plan,
+      Common::UniqueFunction<void, bool, std::array<uint32_t, 12>> completion) {
+    return executor.QueuePanelGpuCompositeUvReadback(command, plan, std::move(completion));
+  }
+
   static std::array<uint64_t, 5> PanelGpuScalarCaptureState(
       const RenderExecutor &executor) {
     return {executor.m_gpu_scalar_capture.index, executor.m_gpu_scalar_capture.misses,
@@ -16269,6 +16298,16 @@ public:
         0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u,
         0x80000000u, 0x7fc01234u, 0x3e800000u, 0x3f000000u,
         0x40a00000u, 0x40c00000u, 0x40e00000u, 0x41000000u};
+    constexpr uint64_t composite_guest = guest + 0x400;
+    constexpr uint64_t composite_uv_guest = guest + 0x500;
+    constexpr uint64_t composite_declared_bytes = 48;
+    constexpr std::array<uint32_t, 7> composite_a{
+        0x3f400000u, 0x80000000u, 0x7fc05678u, 0x01234567u,
+        0x3f000000u, 0x7f800000u, 0x3f800000u};
+    constexpr std::array<uint32_t, 12> composite_uv_a{
+        0x3e000000u, 0x3e800000u, 0x3f400000u, 0x3fc00000u,
+        0x80000000u, 0x7fc09876u, 0x00000001u, 0x40400000u,
+        0x40800000u, 0x40a00000u, 0x40c00000u, 0x40e00000u};
     constexpr uint32_t gpu_a = 0x3e800000u, gpu_b = 0x3f600000u;
     constexpr uint32_t guest_c = 0x3f200000u;
     constexpr uint32_t left_guard = 0x12345678u, right_guard = 0x89abcdefu;
@@ -16301,6 +16340,10 @@ public:
         static_cast<uint32_t>(guest >> 32u) | 0x00100000u, 0x112u, 0x0004dfacu}};
     ShaderBufferResource uv_descriptor{{static_cast<uint32_t>(uv_guest),
         static_cast<uint32_t>(uv_guest >> 32u) | 0x00100000u, 8u, 0x0004dfacu}};
+    ShaderBufferResource composite_descriptor{{static_cast<uint32_t>(composite_guest),
+        static_cast<uint32_t>(composite_guest >> 32u) | 0x00100000u, 3u, 0x0004dfacu}};
+    ShaderBufferResource composite_uv_descriptor{{static_cast<uint32_t>(composite_uv_guest),
+        static_cast<uint32_t>(composite_uv_guest >> 32u) | 0x00100000u, 3u, 0x0004dfacu}};
     GraphicsCase fragment_case;
     std::optional<CompiledShader> compiled_fragment;
     if (RasterizationSupported()) {
@@ -16333,6 +16376,17 @@ public:
       owner->Fill(uv_native_offset + i * 4u, 4, uv_a[i]);
     }
     owner->Fill(uv_native_offset + sizeof(uv_a), 4, right_guard);
+    const auto composite_native_offset = native_offset + (composite_guest - guest);
+    const auto composite_uv_native_offset = native_offset + (composite_uv_guest - guest);
+    const auto FillGuarded = [&](uint64_t offset, const auto &words) {
+      owner->Fill(offset - 4, 4, left_guard);
+      for (uint32_t i = 0; i < words.size(); ++i) {
+        owner->Fill(offset + i * 4u, 4, words[i]);
+      }
+      owner->Fill(offset + sizeof(words), 4, right_guard);
+    };
+    FillGuarded(composite_native_offset, composite_a);
+    FillGuarded(composite_uv_native_offset, composite_uv_a);
     const auto unrelated_id = cache.FindBuffer(base + 0x8000, 16);
 
     using Plan = RenderExecutorTestAccess::PanelGpuScalarPlan;
@@ -16384,6 +16438,56 @@ public:
         uv_plan.selected_offset == uv_native_offset && !uv_plan.stream &&
         uv_plan.guest_address == uv_guest && uv_plan.guest_size == uv_declared_bytes,
         "HDR UV planner lost the exact 128-byte descriptor or first 48-byte selection");
+
+    // The composite recipes use their own exact shader/resource identities but
+    // share this tick's cached source and the existing real fragment ordering test.
+    Fixture composite_fixture;
+    composite_fixture.program.stage = ShaderType::Pixel;
+    composite_fixture.program.shader_hash = 0x8f4f493f4d30416dull;
+    composite_fixture.program.info.buffers.resize(4);
+    composite_fixture.snapshot.buffers.resize(4);
+    composite_fixture.prepared.buffer_sources.resize(4);
+    composite_fixture.prepared.buffers.resize(4);
+    composite_fixture.prepared.shader_data.resize(1);
+    for (const auto index : {0u, 3u}) {
+      auto &info = composite_fixture.program.info.buffers[index];
+      info.descriptor_index = index;
+      info.first_use_pc = index == 3 ? 0x1d0 : 0x10;
+      info.read = info.scalar = true;
+      auto &sharp = composite_fixture.snapshot.buffers[index];
+      sharp.dword_count = 4;
+      const auto &source = index == 3 ? composite_descriptor : composite_uv_descriptor;
+      std::copy_n(source.fields, 4, sharp.dwords.begin());
+      const auto address = index == 3 ? composite_guest : composite_uv_guest;
+      const auto offset = index == 3 ? composite_native_offset : composite_uv_native_offset;
+      composite_fixture.prepared.buffer_sources[index] = {
+          address, composite_declared_bytes, unrelated_id};
+      composite_fixture.prepared.buffers[index] = {
+          owner->Handle(), offset, composite_declared_bytes};
+    }
+    ShaderStageRuntime composite_runtime{
+        &composite_fixture.program, &composite_fixture.snapshot};
+    composite_fixture.prepared.runtime = &composite_runtime;
+    std::array<PreparedBindings *, 1> composite_stages{&composite_fixture.prepared};
+    Plan composite_plan, composite_uv_plan;
+    Require(name, "exact composite controls plan",
+        RenderExecutorTestAccess::PlanPanelGpuCompositeControlsCapture(
+            executor, command, {}, {}, {}, composite_stages, composite_plan) == nullptr &&
+        composite_plan.native.buffer == owner->Handle() &&
+        composite_plan.native.offset == composite_native_offset &&
+        composite_plan.selected_offset == composite_native_offset && !composite_plan.stream &&
+        composite_plan.guest_address == composite_guest &&
+        composite_plan.guest_size == composite_declared_bytes,
+        "28-byte controls planner lost the exact resource3 descriptor or owner");
+    Require(name, "exact composite UV plan",
+        RenderExecutorTestAccess::PlanPanelGpuCompositeUvCapture(
+            executor, command, {}, {}, {}, composite_stages, composite_uv_plan) == nullptr &&
+        composite_uv_plan.native.buffer == owner->Handle() &&
+        composite_uv_plan.native.offset == composite_uv_native_offset &&
+        composite_uv_plan.selected_offset == composite_uv_native_offset && !composite_uv_plan.stream &&
+        composite_uv_plan.guest_address == composite_uv_guest &&
+        composite_uv_plan.guest_size == composite_declared_bytes,
+        "48-byte composite UV planner accepted the wrong extent or native owner");
 
     RenderColorInfo color{};
     color.desc.type = BindingType::RenderTarget;
@@ -16549,11 +16653,113 @@ public:
           "HDR UV queue accepted a changed range, owner, or packed adjustment");
     }
 
+    const auto RejectComposite = [&](const char *label, const char *expected,
+                                     bool is_uv, auto mutate) {
+      auto bad = composite_fixture;
+      ShaderStageRuntime bad_runtime{&bad.program, &bad.snapshot};
+      bad.prepared.runtime = &bad_runtime;
+      const uint32_t index = is_uv ? 0u : 3u;
+      mutate(bad, index);
+      std::array<PreparedBindings *, 1> bad_stages{&bad.prepared};
+      Plan rejected = is_uv ? composite_uv_plan : composite_plan;
+      const auto *reason = is_uv
+          ? RenderExecutorTestAccess::PlanPanelGpuCompositeUvCapture(
+                executor, command, bad.colors, {}, bad.rendering, bad_stages, rejected)
+          : RenderExecutorTestAccess::PlanPanelGpuCompositeControlsCapture(
+                executor, command, bad.colors, {}, bad.rendering, bad_stages, rejected);
+      Require(name, label, reason && std::strcmp(reason, expected) == 0 &&
+          rejected.native.buffer == nullptr && rejected.guest_size == 0 &&
+          rejected.selected_offset == 0, "invalid composite request retained a capture plan");
+      const bool queued = is_uv
+          ? RenderExecutorTestAccess::QueuePanelGpuCompositeUvReadback(executor, command, rejected,
+                [&](bool, std::array<uint32_t, 12>) { ++unexpected_callbacks; })
+          : RenderExecutorTestAccess::QueuePanelGpuCompositeControlsReadback(executor, command, rejected,
+                [&](bool, std::array<uint32_t, 7>) { ++unexpected_callbacks; });
+      Require(name, "composite rejection preserves source and recording", !queued &&
+          scheduler.CurrentTick() == tick && command.Handle() == native_command &&
+          capture_state == RenderExecutorTestAccess::PanelGpuScalarCaptureState(executor) &&
+          cache.FindRegisteredBuffer(guest, declared_bytes) == owner &&
+          cache.HasGpuDirtyBytes(guest, declared_bytes),
+          "rejection queued work, consumed a slot, or refreshed the native source");
+    };
+    for (const bool is_uv : {false, true}) {
+      RejectComposite("composite shader identity", "missing-exact-pixel-recipe", is_uv,
+          [](auto &f, uint32_t) { f.program.shader_hash = 0x83b1c2d863c50cf3ull; });
+      RejectComposite("composite pixel stage", "missing-exact-pixel-recipe", is_uv,
+          [](auto &f, uint32_t) { f.program.stage = ShaderType::Vertex; });
+      RejectComposite("composite resource mapping", "recipe-mapping-or-access", is_uv,
+          [](auto &f, uint32_t i) { f.program.info.buffers[i].descriptor_index ^= 1u; });
+      RejectComposite("composite first-use instruction", "recipe-mapping-or-access", is_uv,
+          [](auto &f, uint32_t i) { f.program.info.buffers[i].first_use_pc += 4; });
+      RejectComposite("composite exact descriptor extent", "descriptor-or-resolved-range", is_uv,
+          [](auto &f, uint32_t i) { f.snapshot.buffers[i].dwords[2] = 8; });
+      RejectComposite("composite exact descriptor flags", "descriptor-or-resolved-range", is_uv,
+          [](auto &f, uint32_t i) { f.snapshot.buffers[i].dwords[3] ^= 1u; });
+      RejectComposite("composite resolved range", "descriptor-or-resolved-range", is_uv,
+          [](auto &f, uint32_t i) { ++f.prepared.buffer_sources[i].address; });
+      RejectComposite("composite packed adjustment", "nonzero-packed-offset", is_uv,
+          [](auto &f, uint32_t i) { f.prepared.shader_data[0] = 1u << (i * 8u); });
+      RejectComposite("composite undersized native range", "native-range", is_uv,
+          [](auto &f, uint32_t i) { f.prepared.buffers[i].range = i == 3 ? 27 : 47; });
+      RejectComposite("composite native owner", "unproved-native-owner", is_uv,
+          [](auto &f, uint32_t i) { f.prepared.buffers[i].offset += 4; });
+      RejectComposite("composite attachment overlap", "attachment-overlap", is_uv,
+          [&](auto &f, uint32_t i) {
+            f.colors = {color};
+            f.colors[0].desc.info.metadata.range = {
+                i == 3 ? composite_guest : composite_uv_guest, 4};
+          });
+      RejectComposite("composite load clear", "rendering-load-clear", is_uv,
+          [](auto &f, uint32_t) { f.rendering.color_attachments[0].is_clear = true; });
+    }
+    for (const auto *wrong : {&plan, &uv_plan, &composite_uv_plan}) {
+      Require(name, "controls queue rejects other recipe kinds",
+          !RenderExecutorTestAccess::QueuePanelGpuCompositeControlsReadback(
+              executor, command, *wrong,
+              [&](bool, std::array<uint32_t, 7>) { ++unexpected_callbacks; }),
+          "28-byte controls queue accepted another recipe kind");
+    }
+    for (const auto *wrong : {&plan, &uv_plan, &composite_plan}) {
+      Require(name, "composite UV queue rejects other recipe kinds",
+          !RenderExecutorTestAccess::QueuePanelGpuCompositeUvReadback(
+              executor, command, *wrong,
+              [&](bool, std::array<uint32_t, 12>) { ++unexpected_callbacks; }),
+          "composite UV queue accepted another recipe, including the old 48-byte HDR recipe");
+    }
+    Require(name, "old common queue rejects composite controls",
+        !RenderExecutorTestAccess::QueuePanelGpuScalarReadback(executor, command, composite_plan,
+            [&](bool, uint32_t) { ++unexpected_callbacks; }),
+        "old four-byte queue accepted composite controls");
+    Require(name, "old HDR UV queue rejects composite UV",
+        !RenderExecutorTestAccess::QueuePanelGpuHdrUvReadback(executor, command, composite_uv_plan,
+            [&](bool, std::array<uint32_t, 12>) { ++unexpected_callbacks; }),
+        "equal payload size bypassed the old HDR recipe kind");
+    for (const bool is_uv : {false, true}) {
+      for (const auto change : {0u, 1u, 2u, 3u}) {
+        auto invalid = is_uv ? composite_uv_plan : composite_plan;
+        if (change == 0) invalid.selected_offset += 4;
+        if (change == 1) invalid.native.range = is_uv ? 47 : 27;
+        if (change == 2) invalid.owner_size -= 4;
+        if (change == 3) invalid.packed_offset_word = is_uv ? 1u : 0x01000000u;
+        const bool queued = is_uv
+            ? RenderExecutorTestAccess::QueuePanelGpuCompositeUvReadback(executor, command, invalid,
+                  [&](bool, std::array<uint32_t, 12>) { ++unexpected_callbacks; })
+            : RenderExecutorTestAccess::QueuePanelGpuCompositeControlsReadback(executor, command, invalid,
+                  [&](bool, std::array<uint32_t, 7>) { ++unexpected_callbacks; });
+        Require(name, "composite queue revalidates range and owner", !queued,
+            "queue accepted a changed selected offset, range, owner, or packed adjustment");
+      }
+    }
+
     uint32_t completed = 0, captured_bits = 0;
     uint32_t uv_completed = 0;
     std::array<uint32_t, 12> captured_uv{};
     bool captured_ok = false;
     bool uv_captured_ok = false;
+    uint32_t composite_completed = 0, composite_uv_completed = 0;
+    bool composite_ok = false, composite_uv_ok = false;
+    std::array<uint32_t, 7> captured_composite{};
+    std::array<uint32_t, 12> captured_composite_uv{};
     Require(name, "production capture queue",
         RenderExecutorTestAccess::QueuePanelGpuScalarReadback(executor, command, plan,
             [&](bool success, uint32_t bits) {
@@ -16568,8 +16774,23 @@ public:
               captured_uv = bits;
               ++uv_completed;
             }), "production HDR UV readback was not queued after the common scalar");
+    Require(name, "production composite controls queue",
+        RenderExecutorTestAccess::QueuePanelGpuCompositeControlsReadback(
+            executor, command, composite_plan, [&](bool success, std::array<uint32_t, 7> bits) {
+              composite_ok = success;
+              captured_composite = bits;
+              ++composite_completed;
+            }), "production 28-byte controls readback was not queued");
+    Require(name, "production composite UV queue",
+        RenderExecutorTestAccess::QueuePanelGpuCompositeUvReadback(
+            executor, command, composite_uv_plan, [&](bool success, std::array<uint32_t, 12> bits) {
+              composite_uv_ok = success;
+              captured_composite_uv = bits;
+              ++composite_uv_completed;
+            }), "production 48-byte composite UV readback was not queued");
     scheduler.PopPendingOperations();
-    Require(name, "deferred capture", completed == 0 && uv_completed == 0 && unexpected_callbacks == 0 &&
+    Require(name, "deferred capture", completed == 0 && uv_completed == 0 &&
+        composite_completed == 0 && composite_uv_completed == 0 && unexpected_callbacks == 0 &&
         scheduler.CurrentTick() == tick, "capture completed or submitted before its GPU tick");
 
     ShaderProgram vertex_shader{}, pixel_shader{};
@@ -16661,10 +16882,12 @@ public:
     }
 
     Require(name, "draw preserves deferred tick", completed == 0 && uv_completed == 0 &&
-        scheduler.CurrentTick() == tick,
+        composite_completed == 0 && composite_uv_completed == 0 && scheduler.CurrentTick() == tick,
         "fragment preparation or draw forced completion before the later GPU overwrite");
     owner->Fill(plan.selected_offset, 4, gpu_b);
     owner->Fill(uv_plan.selected_offset, sizeof(uv_a), gpu_b);
+    owner->Fill(composite_plan.selected_offset, sizeof(composite_a), gpu_b);
+    owner->Fill(composite_uv_plan.selected_offset, sizeof(composite_uv_a), gpu_b);
     Libs::Graphics::Buffer guards(m_runtime_context, scheduler,
         MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, 12);
     guards.CopyFrom(command, *owner, plan.selected_offset - 4, 0, 12,
@@ -16677,6 +16900,18 @@ public:
         vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite, {},
         vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
         vk::AccessFlagBits::eHostRead);
+    Libs::Graphics::Buffer composite_guards(m_runtime_context, scheduler,
+        MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(composite_a) + 8);
+    Libs::Graphics::Buffer composite_uv_guards(m_runtime_context, scheduler,
+        MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(composite_uv_a) + 8);
+    const auto CopyCompositeGuards = [&](auto &destination, const auto &capture, uint64_t bytes) {
+      destination.CopyFrom(command, *owner, capture.selected_offset - 4, 0, bytes + 8,
+          vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite, {},
+          vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+          vk::AccessFlagBits::eHostRead);
+    };
+    CopyCompositeGuards(composite_guards, composite_plan, sizeof(composite_a));
+    CopyCompositeGuards(composite_uv_guards, composite_uv_plan, sizeof(composite_uv_a));
     uint32_t current_guest = 0;
     Require(name, "divergent guest backing", LibKernel::Memory::TryReadBacking(
         guest + scalar_offset, &current_guest, sizeof(current_guest)) && current_guest == guest_c,
@@ -16686,9 +16921,20 @@ public:
         uv_guest, current_uv_guest.data(), sizeof(current_uv_guest)) &&
         std::ranges::all_of(current_uv_guest, [](uint32_t value) { return value == guest_c; }),
         "HDR UV diagnostic changed the guest backing");
+    const auto CheckCompositeGuest = [&](uint64_t address, auto &words) {
+      Require(name, "divergent composite guest backing", LibKernel::Memory::TryReadBacking(
+          address, words.data(), sizeof(words)) &&
+          std::ranges::all_of(words, [](uint32_t value) { return value == guest_c; }),
+          "composite diagnostic published GPU values into guest backing");
+    };
+    std::array<uint32_t, 7> current_composite_guest{};
+    std::array<uint32_t, 12> current_composite_uv_guest{};
+    CheckCompositeGuest(composite_guest, current_composite_guest);
+    CheckCompositeGuest(composite_uv_guest, current_composite_uv_guest);
     BufferCacheTestAccess::RetireBuffer(cache, owner_id);
     Require(name, "retirement waits for GPU", !cache.FindRegisteredBuffer(guest, declared_bytes) &&
-        BufferCacheTestAccess::IsBufferAllocated(cache, owner_id) && completed == 0 && uv_completed == 0,
+        BufferCacheTestAccess::IsBufferAllocated(cache, owner_id) && completed == 0 && uv_completed == 0 &&
+        composite_completed == 0 && composite_uv_completed == 0,
         "native source was destroyed before queued GPU commands completed");
     Require(name, "retired plan cannot queue",
         !RenderExecutorTestAccess::QueuePanelGpuScalarReadback(executor, command, plan,
@@ -16698,6 +16944,16 @@ public:
         !RenderExecutorTestAccess::QueuePanelGpuHdrUvReadback(executor, command, uv_plan,
             [&](bool, std::array<uint32_t, 12>) { ++unexpected_callbacks; }),
         "retired HDR UV owner remained eligible for a new capture");
+    Require(name, "retired composite controls cannot queue",
+        !RenderExecutorTestAccess::QueuePanelGpuCompositeControlsReadback(
+            executor, command, composite_plan,
+            [&](bool, std::array<uint32_t, 7>) { ++unexpected_callbacks; }),
+        "retired owner remained eligible for a controls capture");
+    Require(name, "retired composite UV cannot queue",
+        !RenderExecutorTestAccess::QueuePanelGpuCompositeUvReadback(
+            executor, command, composite_uv_plan,
+            [&](bool, std::array<uint32_t, 12>) { ++unexpected_callbacks; }),
+        "retired owner remained eligible for a composite UV capture");
     scheduler.Finish();
     scheduler.PopPendingOperations();
     guards.Invalidate(0, 12);
@@ -16719,6 +16975,25 @@ public:
         std::all_of(actual_uv_guards.begin() + 1, actual_uv_guards.end() - 1,
                     [](uint32_t value) { return value == gpu_b; }),
         "HDR UV diagnostic changed adjacent source bytes or its exact 48-byte extent");
+    Require(name, "exact composite controls capture ordering",
+        composite_completed == 1 && composite_ok && captured_composite == composite_a,
+        "controls capture lost the final word/payload bits or observed guest C/later GPU B");
+    Require(name, "exact composite UV capture ordering",
+        composite_uv_completed == 1 && composite_uv_ok && captured_composite_uv == composite_uv_a,
+        "composite UV capture lost payload bits or observed guest C/later GPU B");
+    const auto CheckCompositeGuards = [&](auto &download, auto &words) {
+      download.Invalidate(0, sizeof(words));
+      std::memcpy(words.data(), download.Mapped().data(), sizeof(words));
+      Require(name, "composite overwrite and adjacent sentinels",
+          words.front() == left_guard && words.back() == right_guard &&
+          std::all_of(words.begin() + 1, words.end() - 1,
+                      [](uint32_t value) { return value == gpu_b; }),
+          "composite readback altered the source or crossed its selected payload extent");
+    };
+    std::array<uint32_t, 9> actual_composite_guards{};
+    std::array<uint32_t, 14> actual_composite_uv_guards{};
+    CheckCompositeGuards(composite_guards, actual_composite_guards);
+    CheckCompositeGuards(composite_uv_guards, actual_composite_uv_guards);
     Require(name, "retired source reclamation",
         !BufferCacheTestAccess::IsBufferAllocated(cache, owner_id),
         "retired source was retained after the completed tick");

@@ -216,9 +216,11 @@ private:
 		uint32_t misses = 0;
 		uint64_t bytes = 0;
 	};
-	enum class PanelGpuScalarKind { CommonRgb, HdrUv };
+	enum class PanelGpuScalarKind { CommonRgb, HdrUv, CompositeControls, CompositeUv };
 	using PanelGpuScalarWords = std::array<uint32_t, 12>;
+	using PanelGpuCompositeControlWords = std::array<uint32_t, 7>;
 	struct PanelGpuScalarRecipe {
+		uint64_t pixel_hash;
 		uint32_t resource;
 		uint32_t first_pc;
 		uint32_t declared_size;
@@ -247,6 +249,14 @@ private:
 	    const CommandBuffer& buffer, std::span<const RenderColorInfo> colors, ImageId depth,
 	    const RenderState& rendering, std::span<PreparedBindings* const> stages,
 	    PanelGpuScalarPlan& plan) const;
+	[[nodiscard]] const char* PlanPanelGpuCompositeControlsCapture(
+	    const CommandBuffer& buffer, std::span<const RenderColorInfo> colors, ImageId depth,
+	    const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	    PanelGpuScalarPlan& plan) const;
+	[[nodiscard]] const char* PlanPanelGpuCompositeUvCapture(
+	    const CommandBuffer& buffer, std::span<const RenderColorInfo> colors, ImageId depth,
+	    const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	    PanelGpuScalarPlan& plan) const;
 	[[nodiscard]] const char* PlanPanelGpuCapture(
 	    PanelGpuScalarKind kind, const CommandBuffer& buffer, std::span<const RenderColorInfo> colors,
 	    ImageId depth, const RenderState& rendering, std::span<PreparedBindings* const> stages,
@@ -255,14 +265,24 @@ private:
 	[[nodiscard]] bool QueuePanelGpuScalarReadback(
 	    CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
 	    Common::UniqueFunction<void, bool, uint32_t>&& completion);
-	// The only companion recipe copies exactly twelve words from the same pixel stage.
+	// Fixed companions copy exactly twelve words from their verified pixel stage.
 	[[nodiscard]] bool QueuePanelGpuHdrUvReadback(
+	    CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
+	    Common::UniqueFunction<void, bool, PanelGpuScalarWords>&& completion);
+	[[nodiscard]] bool QueuePanelGpuCompositeControlsReadback(
+	    CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
+	    Common::UniqueFunction<void, bool, PanelGpuCompositeControlWords>&& completion);
+	[[nodiscard]] bool QueuePanelGpuCompositeUvReadback(
 	    CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
 	    Common::UniqueFunction<void, bool, PanelGpuScalarWords>&& completion);
 	[[nodiscard]] bool QueuePanelGpuReadback(
 	    PanelGpuScalarKind kind, CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
 	    Common::UniqueFunction<void, bool, PanelGpuScalarWords>&& completion);
 	[[nodiscard]] uint32_t CapturePanelGpuScalarBeforeDraw(
+	    uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
+	    const DrawEmitInfo& emit, const DrawRenderState& state, const RenderState& rendering,
+	    std::span<PreparedBindings* const> stages);
+	[[nodiscard]] uint32_t CapturePanelGpuCompositeBeforeDraw(
 	    uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	    const DrawEmitInfo& emit, const DrawRenderState& state, const RenderState& rendering,
 	    std::span<PreparedBindings* const> stages);
