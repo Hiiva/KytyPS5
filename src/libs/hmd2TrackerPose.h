@@ -15,6 +15,7 @@
 namespace Libs::Hmd2TrackerPose {
 
 inline constexpr size_t kResultBytes = 0x140u;
+inline constexpr size_t kHeadsetResultBytes = 0x16cu;
 inline constexpr float  kInterpupillaryDistance = 0.063f;
 
 struct Pose {
@@ -55,7 +56,8 @@ struct Pose {
                                std::array<float, 3> position,
                                std::array<float, 4> orientation,
                                uint64_t predicted_time, bool headset) {
-	if (out.size() < kResultBytes) {
+	const size_t required_bytes = headset ? kHeadsetResultBytes : kResultBytes;
+	if (out.size() < required_bytes) {
 		return false;
 	}
 	for (const auto coordinate : position) {
@@ -87,6 +89,12 @@ struct Pose {
 	write_pose(0xa0u, headset ? EyePosition(position, orientation, -half_ipd) : position);
 	write_pose(0xe0u, headset ? EyePosition(position, orientation, +half_ipd) : position);
 	write_pose(0x120u, position);
+	if (headset) {
+		// Horizon rotates this camera-local gaze origin and adds the camera
+		// position. The desktop center eye has no additional local offset.
+		constexpr std::array<float, 3> gaze_origin {};
+		std::memcpy(out.data() + 0x160u, gaze_origin.data(), sizeof(gaze_origin));
+	}
 	return true;
 }
 

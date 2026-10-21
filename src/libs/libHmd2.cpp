@@ -539,11 +539,13 @@ static int32_t KYTY_SYSV_ABI VrTracker2GetResult(const void* param, void* result
     if (const char* full = std::getenv("KYTY_VR_FULL_TRACKING_RESULT");
         (full != nullptr && std::strcmp(full, "1") == 0) ||
         ((handle == 2 || handle == 3) && (full == nullptr || full[0] == '\0'))) {
+        const bool headset = handle == 1;
+        const size_t result_bytes = headset ? Hmd2TrackerPose::kHeadsetResultBytes
+                                           : Hmd2TrackerPose::kResultBytes;
         if (!Graphics::HostMemoryRangeIsReadable(
                 reinterpret_cast<uint64_t>(param), 0x20u) ||
             !Graphics::HostMemoryRangeIsReadable(
-                reinterpret_cast<uint64_t>(result),
-                Hmd2TrackerPose::kResultBytes)) {
+                reinterpret_cast<uint64_t>(result), result_bytes)) {
             return ERROR_PARAMETER_NULL;
         }
         uint64_t predicted_time = 0;
@@ -551,8 +553,8 @@ static int32_t KYTY_SYSV_ABI VrTracker2GetResult(const void* param, void* result
         const std::array<float, 3> position {head_pos[0], head_pos[1], head_pos[2]};
         const std::array<float, 4> orientation {quat[0], quat[1], quat[2], quat[3]};
         if (!Hmd2TrackerPose::Write(
-                std::span<uint8_t>(out, Hmd2TrackerPose::kResultBytes), position,
-                orientation, predicted_time, handle == 1)) {
+                std::span<uint8_t>(out, result_bytes), position,
+                orientation, predicted_time, headset)) {
             return ERROR_PARAMETER_NULL;
         }
         static std::atomic<uint32_t> full_logs {0};
