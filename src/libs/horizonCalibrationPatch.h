@@ -84,12 +84,118 @@ inline constexpr Edit kAutoSaveComfortEdit {
     "oncreate", 75824259426ull,
     {0xd3, 0x06, 0x00, 0x00}, {0xd6, 0x02, 0x00, 0x00}
 };
+enum class Result { NoOverlap, Unchanged, Patched, Mismatch };
+
+// EndOfCalibrationActivation(Activate) is also called with false by CompleteStep.
+// Rewriting its wrapper to StartGame recurses through that deactivation callback.
+// Keep the wrapper and common widget setup, then replace only the true branch's
+// AnimateOnEndOfCalibration() call with StartGame(). The false branch still calls
+// AnimateOffEndOfCalibration(). Both calls have the same serialized/runtime size.
+inline constexpr uint64_t kAutoStartOnEndActivationOffset = 75823927870ull;
+[[nodiscard]] inline Result ApplyAutoStartOnEndActivation(
+    uint64_t block_offset, std::span<uint8_t> block) {
+    if (block_offset > kAutoStartOnEndActivationOffset ||
+        kAutoStartOnEndActivationOffset - block_offset >= block.size()) {
+        return Result::NoOverlap;
+    }
+    const auto at = static_cast<size_t>(kAutoStartOnEndActivationOffset - block_offset);
+    // EX_JumpIfNot(0x4fa8, K2Node_Event_Activate), true call/pop, false call/pop.
+    constexpr std::array<uint8_t, 44> before {
+        0x07, 0xa8, 0x4f, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x45, 0x52, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0x4d,
+        0x45, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0x4d
+    };
+    auto after = before;
+    after[23] = 0x08; // FName index 0x0308 = StartGame; name number remains zero.
+    after[24] = 0x03;
+    // Require the complete condition and both branches before changing any byte.
+    if (block.size() - at < before.size()) {
+        return Result::NoOverlap;
+    }
+    const auto view = block.subspan(at, before.size());
+    if (std::ranges::equal(view, after)) {
+        return Result::Unchanged;
+    }
+    if (!std::ranges::equal(view, before)) {
+        return Result::Mismatch;
+    }
+    std::ranges::copy(after, view.begin());
+    return Result::Patched;
+}
+
+// OnAnalogueOrGestureClick calls this immediately after SetupComfortButtons
+// has populated the preset button references. Select Standard synchronously
+// instead of waiting for OnAnimatedOff; retain the serialized call length.
+inline constexpr uint64_t kMovementStandardAfterSetupOffset = 75826518121ull;
+[[nodiscard]] inline Result ApplyMovementStandardAfterSetup(
+    uint64_t block_offset, std::span<uint8_t> block) {
+    if (block_offset > kMovementStandardAfterSetupOffset ||
+        kMovementStandardAfterSetupOffset - block_offset >= block.size()) {
+        return Result::NoOverlap;
+    }
+    const auto at = static_cast<size_t>(kMovementStandardAfterSetupOffset - block_offset);
+    constexpr std::array<uint8_t, 11> before {
+        0x45, 0xc9, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x27, 0x16
+    };
+    constexpr std::array<uint8_t, 11> after {
+        0x45, 0x88, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0x0b
+    };
+    // The argument removal and trailing EX_Nothing are one transaction.
+    if (block.size() - at < before.size()) {
+        return Result::NoOverlap;
+    }
+    const auto view = block.subspan(at, before.size());
+    if (std::ranges::equal(view, after)) {
+        return Result::Unchanged;
+    }
+    if (!std::ranges::equal(view, before)) {
+        return Result::Mismatch;
+    }
+    std::ranges::copy(after, view.begin());
+    return Result::Patched;
+}
+
+// OnPanelButtonAnimatedOn contains EX_Jump to a panel-only Kismet path.
+// Enter OnAnalogueSelected instead, which updates the mode and calls the
+// parent-facing movement callback above. Retain the EX_Jump opcode and
+// the following function call's opcode as signature anchors.
+inline constexpr uint64_t kMovementChoiceJump = 75826512382ull;
+[[nodiscard]] inline Result ApplyMovementChoiceJump(uint64_t block_offset,
+                                                     std::span<uint8_t> block) {
+    if (block_offset > kMovementChoiceJump ||
+        kMovementChoiceJump - block_offset >= block.size()) {
+        return Result::NoOverlap;
+    }
+    const auto at = static_cast<size_t>(kMovementChoiceJump - block_offset);
+    if (block.size() - at < 6u) {
+        return Result::NoOverlap;
+    }
+    if (block[at] != 0x06u || block[at + 5] != 0x45u) {
+        return Result::Mismatch;
+    }
+    constexpr std::array<uint8_t, 4> original {0x5c, 0x0d, 0x00, 0x00};
+    constexpr std::array<uint8_t, 4> replacement {0x81, 0x1a, 0x00, 0x00};
+    bool unchanged = true;
+    for (size_t i = 0; i < original.size(); ++i) {
+        const auto value = block[at + 1 + i];
+        if (value != original[i] && value != replacement[i]) {
+            return Result::Mismatch;
+        }
+        unchanged &= value == replacement[i];
+    }
+    if (unchanged) {
+        return Result::Unchanged;
+    }
+    std::ranges::copy(replacement, block.begin() + at + 1);
+    return Result::Patched;
+}
+
 struct Plan {
 	bool              valid = true;
 	std::vector<Edit> edits;
 };
-
-enum class Result { NoOverlap, Unchanged, Patched, Mismatch };
 
 // The shipped pak stores DefaultEngine.ini uncompressed at this exact
 // offset. This opt-in edit changes GameDefaultMap without touching the pak.

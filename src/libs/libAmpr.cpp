@@ -1176,14 +1176,48 @@ static void MaybePatchHorizonPakBlock(const std::filesystem::path& host_path,
     const char* main_menu = std::getenv("KYTY_HORIZON_MAINMENU_MAP");
     const bool override_map = main_menu != nullptr && main_menu[0] == '1' &&
                               main_menu[1] == '\0';
+    const char* end_activation = std::getenv("KYTY_HORIZON_AUTO_START_ON_END");
+    const bool auto_start = end_activation != nullptr &&
+                            end_activation[0] == '1' && end_activation[1] == '\0';
+    const char* movement_jump = std::getenv("KYTY_HORIZON_MOVEMENT_JUMP_ONLY");
+    const bool jump_movement = movement_jump != nullptr &&
+                               movement_jump[0] == '1' && movement_jump[1] == '\0';
+    const char* standard_after_setup = std::getenv("KYTY_HORIZON_STANDARD_AFTER_SETUP");
+    const bool auto_standard_after_setup = standard_after_setup != nullptr &&
+                                          standard_after_setup[0] == '1' &&
+                                          standard_after_setup[1] == '\0';
     const bool calibration_enabled = choice != nullptr && choice[0] != '\0';
-    if ((!calibration_enabled && !auto_save_comfort && !override_map) ||
+    if ((!calibration_enabled && !auto_save_comfort && !override_map &&
+         !auto_start && !jump_movement && !auto_standard_after_setup) ||
         data == nullptr || count == 0 ||
         host_path.filename() != "azimuth-ps5.pak" ||
         file_size != HorizonCalibrationPatch::kPakSize) {
         return;
     }
     const auto block = std::span<uint8_t>(data, static_cast<size_t>(count));
+    if (jump_movement) {
+        const auto jump = HorizonCalibrationPatch::ApplyMovementChoiceJump(
+            offset, block);
+        if (jump == HorizonCalibrationPatch::Result::Patched) {
+            LOGF("Horizon movement chain: animated panel jumps to AnalogueSelected\n");
+        } else if (jump == HorizonCalibrationPatch::Result::Mismatch) {
+            static std::atomic_bool warned {false};
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                LOGF("Horizon movement chain: unexpected panel jump bytecode\n");
+            }
+        }
+    }
+    if (auto_standard_after_setup) {
+        const auto result = HorizonCalibrationPatch::ApplyMovementStandardAfterSetup(offset, block);
+        if (result == HorizonCalibrationPatch::Result::Patched) {
+            LOGF("Horizon movement selection: select Standard after SetupComfortButtons\n");
+        } else if (result == HorizonCalibrationPatch::Result::Mismatch) {
+            static std::atomic_bool warned {false};
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                LOGF("Horizon movement selection: unexpected post-setup call signature\n");
+            }
+        }
+    }
     if (override_map) {
         const auto result = HorizonCalibrationPatch::ApplyMainMenuMap(offset, block);
         if (result == HorizonCalibrationPatch::Result::Patched) {
@@ -1192,6 +1226,17 @@ static void MaybePatchHorizonPakBlock(const std::filesystem::path& host_path,
             static std::atomic_bool reported {false};
             if (!reported.exchange(true, std::memory_order_relaxed)) {
                 LOGF("Horizon map override: unexpected DefaultEngine.ini bytes\n");
+            }
+        }
+    }
+    if (auto_start) {
+        const auto result = HorizonCalibrationPatch::ApplyAutoStartOnEndActivation(offset, block);
+        if (result == HorizonCalibrationPatch::Result::Patched) {
+            LOGF("Horizon final calibration activation: true branch calls StartGame; deactivation preserved\n");
+        } else if (result == HorizonCalibrationPatch::Result::Mismatch) {
+            static std::atomic_bool reported {false};
+            if (!reported.exchange(true, std::memory_order_relaxed)) {
+                LOGF("Horizon final calibration activation: unexpected conditional branch signature\n");
             }
         }
     }
