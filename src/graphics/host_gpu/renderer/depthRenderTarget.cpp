@@ -8,6 +8,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -25,9 +26,115 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <mutex>
 
 namespace Libs::Graphics {
+
+static void TraceDepthCopyState(const CommandBuffer& buffer) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VR_TRACE_DEPTH_COPY");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (!enabled) {
+		return;
+	}
+	const auto& hw = buffer.GetRegisters();
+	const auto& z  = hw.GetDepthRenderTarget();
+	const auto& rc = hw.GetRenderControl();
+	const auto& dc = hw.GetDepthControl();
+	const auto& cb = hw.GetRenderTarget(0);
+	const auto& sh = hw.GetShaderRegisters();
+	const auto ps = buffer.GetShaders().GetPs().ps_regs.data_addr;
+	const uint64_t flags =
+	    static_cast<uint64_t>(rc.copy_depth_to_color) |
+	    (static_cast<uint64_t>(rc.copy_stencil_to_color) << 1u) |
+	    (static_cast<uint64_t>(rc.copy_centroid) << 2u) |
+	    (static_cast<uint64_t>(rc.copy_sample) << 3u) |
+	    (static_cast<uint64_t>(rc.depth_clear_enable) << 7u) |
+	    (static_cast<uint64_t>(rc.stencil_clear_enable) << 8u) |
+	    (static_cast<uint64_t>(rc.depth_compress_disable) << 9u) |
+	    (static_cast<uint64_t>(rc.stencil_compress_disable) << 10u) |
+	    (static_cast<uint64_t>(rc.resummarize_enable) << 11u) |
+	    (static_cast<uint64_t>(dc.z_enable) << 12u) |
+	    (static_cast<uint64_t>(dc.z_write_enable) << 13u) |
+	    (static_cast<uint64_t>(dc.stencil_enable) << 14u) |
+	    (static_cast<uint64_t>(dc.depth_bounds_enable) << 15u) |
+	    (static_cast<uint64_t>(z.depth_view.depth_write_disable) << 16u) |
+	    (static_cast<uint64_t>(z.depth_view.stencil_write_disable) << 17u);
+	const auto pair = [](uint32_t a, uint32_t b) { return (static_cast<uint64_t>(a) << 32u) | b; };
+	using Key = std::array<uint64_t, 17>;
+	const Key key {
+	    flags,
+	    pair(static_cast<uint32_t>(z.z_info.format), static_cast<uint32_t>(z.stencil_info.format)),
+	    pair(z.size.x_max, z.size.y_max), pair(z.size.valid, z.z_info.num_samples),
+	    pair(z.depth_view.slice_start, z.depth_view.slice_max), pair(dc.zfunc, z.z_info.htile_acceleration),
+	    pair(static_cast<uint32_t>(cb.info.format), static_cast<uint32_t>(cb.info.channel_type)),
+	    pair(static_cast<uint32_t>(cb.info.channel_order), static_cast<uint32_t>(cb.attrib3.tile_mode)),
+	    pair(cb.attrib2.width, cb.attrib2.height),
+	    pair(cb.view.base_array_slice_index, cb.view.last_array_slice_index),
+	    pair(cb.attrib.num_samples, cb.attrib.num_fragments),
+	    pair(hw.GetRenderTargetMask() & 0xfu, sh.m_cbShaderMask & 0xfu),
+	    pair(sh.target_output_mode[0], hw.GetColorControl().mode), ps,
+	    pair(z.z_read_base_addr == cb.base.addr, z.stencil_read_base_addr == cb.base.addr),
+	    pair(z.depth_view.current_mip_level, cb.view.current_mip_level),
+	    pair(cb.attrib3.dimension, cb.attrib3.depth),
+	};
+	// Surface addresses rotate. Retain one example of each operation/format/shader combination.
+	static std::mutex mutex;
+	static std::array<Key, 64> configurations {};
+	static uint32_t count = 0;
+	static bool limit_logged = false;
+	const std::lock_guard lock(mutex);
+	const auto end = configurations.begin() + count;
+	if (std::find(configurations.begin(), end, key) != end) {
+		return;
+	}
+	if (count == configurations.size()) {
+		if (!limit_logged) {
+			LOGF("DepthCopyTrace: distinct-configuration limit reached (64)\n");
+			limit_logged = true;
+		}
+		return;
+	}
+	const auto id = count++;
+	configurations[id] = key;
+	LOGF("DepthCopyTrace[%u]: frame=%d ps=0x%016" PRIx64
+	     " depth=%u stencil=%u centroid=%u sample=%u clear=%u/%u decompress=%u/%u"
+	     " resummarize=%u ztest=%u zwrite=%u zfunc=%u stest=%u bounds=%u write_disable=%u/%u\n",
+	     id, buffer.GetContext().GetGpu().GetFrameNum(), ps,
+	     static_cast<unsigned>(rc.copy_depth_to_color), static_cast<unsigned>(rc.copy_stencil_to_color),
+	     static_cast<unsigned>(rc.copy_centroid), rc.copy_sample,
+	     static_cast<unsigned>(rc.depth_clear_enable), static_cast<unsigned>(rc.stencil_clear_enable),
+	     static_cast<unsigned>(rc.depth_compress_disable), static_cast<unsigned>(rc.stencil_compress_disable),
+	     static_cast<unsigned>(rc.resummarize_enable), static_cast<unsigned>(dc.z_enable),
+	     static_cast<unsigned>(dc.z_write_enable), dc.zfunc, static_cast<unsigned>(dc.stencil_enable),
+	     static_cast<unsigned>(dc.depth_bounds_enable), static_cast<unsigned>(z.depth_view.depth_write_disable),
+	     static_cast<unsigned>(z.depth_view.stencil_write_disable));
+	LOGF("DepthCopyTrace[%u]: source z=0x%016" PRIx64 "/0x%016" PRIx64
+	     " stencil=0x%016" PRIx64 "/0x%016" PRIx64
+	     " formats=%u/%u extent=%ux%u valid=%u samples=%u(enc=%u) mip=%u layers=%u..%u"
+	     " htile=0x%016" PRIx64 " enabled=%u\n",
+	     id, z.z_read_base_addr, z.z_write_base_addr, z.stencil_read_base_addr, z.stencil_write_base_addr,
+	     static_cast<unsigned>(z.z_info.format), static_cast<unsigned>(z.stencil_info.format),
+	     z.size.x_max + 1u, z.size.y_max + 1u, static_cast<unsigned>(z.size.valid),
+	     render_sample_count(z.z_info.num_samples), z.z_info.num_samples,
+	     z.depth_view.current_mip_level, z.depth_view.slice_start, z.depth_view.slice_max, z.htile_data_base_addr,
+	     static_cast<unsigned>(z.z_info.htile_acceleration));
+	LOGF("DepthCopyTrace[%u]: cb0=0x%016" PRIx64
+	     " format=%u nfmt=%u order=%u tile=%u extent=%ux%ux%u dimension=%u samples_enc=%u fragments_enc=%u"
+	     " mip=%u layers=%u..%u target_mask=0x%x shader_mask=0x%x output_mode=%u color_mode=%u alias_z=%u alias_stencil=%u\n",
+	     id, cb.base.addr, static_cast<unsigned>(cb.info.format), static_cast<unsigned>(cb.info.channel_type),
+	     static_cast<unsigned>(cb.info.channel_order), static_cast<unsigned>(cb.attrib3.tile_mode),
+	     cb.attrib2.width + 1u, cb.attrib2.height + 1u, cb.attrib3.depth + 1u, cb.attrib3.dimension,
+	     cb.attrib.num_samples, cb.attrib.num_fragments, cb.view.current_mip_level,
+	     cb.view.base_array_slice_index, cb.view.last_array_slice_index,
+	     hw.GetRenderTargetMask() & 0xfu, sh.m_cbShaderMask & 0xfu, sh.target_output_mode[0], hw.GetColorControl().mode,
+	     static_cast<unsigned>(z.z_read_base_addr == cb.base.addr),
+	     static_cast<unsigned>(z.stencil_read_base_addr == cb.base.addr));
+}
 
 [[noreturn]] static void DepthFatal(const char* format, ...) {
 	std::fputs("Depth target fatal: ", stderr);
@@ -306,6 +413,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
         if (!Config::VrEnabled()) {
             DepthFatal("unsupported copy-to-color mode");
         }
+        TraceDepthCopyState(buffer);
         static std::atomic_bool logged = false;
         if (!logged.exchange(true, std::memory_order_relaxed)) {
             LOGF("DepthTarget: VR copy-to-color mode unsupported, continuing with ordinary attachment\n");
