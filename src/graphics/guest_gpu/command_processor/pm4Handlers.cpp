@@ -2140,6 +2140,12 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// An unexpected UC offset can be a stale register table or a PM4 header
+	// embedded in an indirect buffer. Keep the default strict, but provide a
+	// bounded diagnostic and opt-in probe for later-stage game command streams.
+	const auto* const uc_table = indirect_buffer;
+	const auto* uc_probe = std::getenv("KYTY_HORIZON_PROBE_INDIRECT_UC");
+	const bool skip_unknown_uc = uc_probe != nullptr && uc_probe[0] == '1' && uc_probe[1] == '\0';
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -2156,6 +2162,17 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 			continue;
 		}
 		if (cmd_offset >= Pm4::UC_NUM) {
+			if (skip_unknown_uc) {
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 10u) {
+					LOGF("Horizon indirect UC probe: packet=0x%08" PRIx32
+					     " table=%p count=%" PRIu32 " pair=%" PRIu32
+					     " raw=0x%08" PRIx32 " val=0x%08" PRIx32 "\n",
+					     cmd_id, static_cast<const void*>(uc_table), indirect_num_dw,
+					     i, raw_cmd_offset, value);
+				}
+				continue;
+			}
 			EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
 			     "), value = 0x%08" PRIx32 "\n",
 			     cmd_offset, raw_cmd_offset, value);
@@ -2164,6 +2181,15 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];
 
 		if (pfunc == nullptr) {
+			if (skip_unknown_uc) {
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 10u) {
+					LOGF("Horizon indirect UC probe: unhandled in-range register pair=%" PRIu32
+					     " raw=0x%08" PRIx32 " val=0x%08" PRIx32 "\n",
+					     i, raw_cmd_offset, value);
+				}
+				continue;
+			}
 			auto* dump_regs = indirect_buffer - i * 2;
 			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
 				LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",

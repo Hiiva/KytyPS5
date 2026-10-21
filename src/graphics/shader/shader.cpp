@@ -381,7 +381,24 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		r.fields[1]       = sharp[1];
 		r.fields[2]       = sharp[2];
 		r.fields[3]       = sharp[3];
-		EXIT_NOT_IMPLEMENTED(r.AddTid());
+		if (r.AddTid()) {
+			const auto* probe = std::getenv("KYTY_HORIZON_PROBE_VERTEX_ADDTID");
+			if (probe == nullptr || probe[0] != '1' || probe[1] != '\0') {
+				EXIT("vertex attribute ADD_TID is unsupported: semantic=%u raw=%08" PRIx32
+				     " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "\n",
+				     in.semantic, sharp[0], sharp[1], sharp[2], sharp[3]);
+			}
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
+				LOGF("Horizon vertex ADD_TID probe: semantic=%u raw=%08" PRIx32
+				     " %08" PRIx32 " %08" PRIx32 " %08" PRIx32
+				     " fetch=%u\n",
+				     in.semantic, sharp[0], sharp[1], sharp[2], sharp[3], fetch_index);
+			}
+			// The vertex fetch path already computes an explicit vertex index. Test
+			// treating hardware ADD_TID as subsumed by that address calculation.
+			r.fields[3] &= ~(1u << 23u);
+		}
 		EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
 		if (format != Prospero::VertexAttribFormat::kInvalid) {
 			const auto                   format_raw    = static_cast<uint32_t>(format);

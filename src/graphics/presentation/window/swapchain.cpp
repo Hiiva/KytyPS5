@@ -521,9 +521,16 @@ struct Presenter::Impl {
 			return image;
 		}
         if (std::getenv("KYTY_VR_DUMP_IMAGES") != nullptr) {
-            static bool reported = false;
-            if (!reported && window.loop.presented_frames.load(std::memory_order_relaxed) >= 450) {
-                reported = true;
+            static int reported = 0;
+            const bool early = std::getenv("KYTY_VR_DUMP_IMAGES_EARLY") != nullptr;
+            const auto frame_index = window.loop.presented_frames.load(std::memory_order_relaxed);
+            const int next = !early ? (reported == 0 && frame_index >= 450 ? 1 : 0)
+                                   : (reported == 0 && frame_index >= 64 ? 1 :
+                                      reported == 1 && frame_index >= 1650 ? 2 : 0);
+            if (next > 0) {
+                reported = next;
+                LOGF("Hmd2 texture diagnostic snapshot=%d frame=%" PRIu64 "\n",
+                     next, frame_index);
                 cache.DumpReprojectionCandidates();
             }
         }
@@ -989,14 +996,27 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		region.dstOffsets[1].x               = static_cast<int>(m_extent.width);
 		region.dstOffsets[1].y               = static_cast<int>(m_extent.height);
 		region.dstOffsets[1].z               = 1;
-		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
-		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
-		                     &region, vk::Filter::eLinear);
+			vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
+			                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
+			                     &region, vk::Filter::eLinear);
 	} else {
 		const vk::ClearColorValue black {};
-		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
-		                           &black, 1, &to_transfer.subresourceRange);
-	}
+			vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
+			                           &black, 1, &to_transfer.subresourceRange);
+		}
+		if (Config::VrEnabled() && std::getenv("KYTY_VR_SWAPCHAIN_GREEN") != nullptr) {
+			static std::atomic_uint reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 8u) {
+				LOGF("VR swapchain test: source=%d overlay=%d extent=%ux%u\n",
+				     source != nullptr, draw_overlay, m_extent.width, m_extent.height);
+			}
+			vk::ClearColorValue green {};
+			green.float32[1] = 1.0f;
+			green.float32[3] = 1.0f;
+			vk_command.clearColorImage(m_images[m_image_index],
+			                           vk::ImageLayout::eTransferDstOptimal,
+			                           &green, 1, &to_transfer.subresourceRange);
+		}
 
 	vk::ImageMemoryBarrier to_present {};
 	to_present.sType               = vk::StructureType::eImageMemoryBarrier;
@@ -1407,10 +1427,49 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
     ImageInfo source = info;
     bool direct_source = false;
     ImageId candidate_image_id {};
+    // In VR the guest's desktop source is a small mirror image. The actual
+    // native panel is a separate, GPU-updated 4000x2040 render target. Discover
+    // it by format and extent rather than an unstable cache slot index.
+    if (Config::VrEnabled() && info.extent.width == 3328u &&
+        info.extent.height == 1664u) {
+        const char* panel = std::getenv("KYTY_VR_AUTO_PANEL_PREVIEW");
+        if (panel != nullptr && panel[0] == '1' && panel[1] == '\0') {
+            direct_source = m_impl->renderer.GetTextureCache()
+                .FindReprojectionCandidateByFormat(50u, 0u,
+                    &source, &candidate_image_id, 4000u, 2040u);
+            static std::atomic_uint attempts {0};
+            if (attempts.fetch_add(1u, std::memory_order_relaxed) < 5u) {
+                LOGF("Hmd2: native panel preview found=%d address=%016" PRIx64
+                     " extent=%ux%u\n", direct_source, source.data.address,
+                     source.extent.width, source.extent.height);
+            }
+        }
+    }
+    // A native PS VR2 panel buffer may also be a GPU-rendered target in the
+    // texture cache. Resolve its actual Vulkan image rather than creating an
+    // unrelated video-out alias from the same guest address.
+    if (!direct_source && Config::VrEnabled() && info.extent.width == 4000u &&
+        info.extent.height == 2040u) {
+        if (const char* native = std::getenv("KYTY_VR_NATIVE_CACHE_MIRROR");
+            native != nullptr && native[0] == '1' && native[1] == '\0') {
+            auto& cache = m_impl->renderer.GetTextureCache();
+            direct_source = cache.FindRenderedPanelImage(info, &candidate_image_id);
+            if (direct_source) {
+                source = cache.GetImage(candidate_image_id).info;
+            }
+            static std::atomic_uint attempts {0};
+            if (attempts.fetch_add(1u, std::memory_order_relaxed) < 12u) {
+                LOGF("Hmd2: native panel cache mirror found=%d address=%016" PRIx64
+                     " fmt=%u cache_id=%u\n", direct_source, info.data.address,
+                     static_cast<uint32_t>(info.pixel_format),
+                     direct_source ? candidate_image_id.index : 0u);
+            }
+        }
+    }
     // Optional mono eye preview for desktops without PS VR2 hardware.
     // The observed Horizon eye textures are RGBA8 2000x2040.
     // This does not affect normal presentation without the environment flag.
-    if (Config::VrEnabled() && info.extent.width == 3328u &&
+    if (!direct_source && Config::VrEnabled() && info.extent.width == 3328u &&
         info.extent.height == 1664u) {
         if (const char* eye = std::getenv("KYTY_VR_PREVIEW_EYE");
             eye != nullptr && (eye[0] == '0' || eye[0] == '1') &&

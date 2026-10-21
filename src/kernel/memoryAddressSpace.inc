@@ -43,9 +43,23 @@ public:
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
-		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
+		// Optional lower-commit, disk-backed memory for resource-constrained tests.
+		const char* disk_backing = std::getenv("KYTY_GUEST_DISK_BACKING");
+		const bool use_disk_backing = disk_backing != nullptr && disk_backing[0] == '1' &&
+		                              disk_backing[1] == '\0';
+		if (use_disk_backing) {
+			m_handle = CreateDiskBackedSection();
+			if (m_handle == nullptr) {
+				LOGF_COLOR(Log::Color::Red,
+				           "\t direct-memory backing: sparse temporary file section failed\n");
+				return;
+			}
+		} else {
+			m_handle = CreateFileMappingA(
+			    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+			    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu),
+			    nullptr);
+		}
 		if (m_handle == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
 			           "\t direct-memory backing: CreateFileMapping failed: 0x%08" PRIx32 "\n",
@@ -109,6 +123,10 @@ public:
 		}
 		if (m_handle != nullptr) {
 			CloseHandle(m_handle);
+		}
+		if (m_disk_file != nullptr) {
+			// FILE_FLAG_DELETE_ON_CLOSE also cleans up after forced process exit.
+			CloseHandle(m_disk_file);
 		}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		for (const auto& [_, entry]: m_maps) {
@@ -631,6 +649,59 @@ private:
 		return UnmapViewOfFile2(GetCurrentProcess(), vaddr, MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
 
+	// Keep the guest section file-backed, not a SEC_COMMIT pagefile mapping.
+	// Sparse allocation avoids reserving disk space for untouched guest pages.
+	[[nodiscard]] HANDLE CreateDiskBackedSection() {
+		wchar_t temp_dir[MAX_PATH + 1] {};
+		const DWORD dir_length = GetTempPathW(MAX_PATH, temp_dir);
+		if (dir_length == 0 || dir_length >= MAX_PATH) {
+			LOGF("\t direct-memory backing: GetTempPathW failed, error=%u\n", GetLastError());
+			return nullptr;
+		}
+		wchar_t temp_name[MAX_PATH + 1] {};
+		if (GetTempFileNameW(temp_dir, L"KDM", 0, temp_name) == 0) {
+			LOGF("\t direct-memory backing: GetTempFileNameW failed, error=%u\n", GetLastError());
+			return nullptr;
+		}
+		m_disk_file = CreateFileW(
+		    temp_name, GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE,
+		    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+		    FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+		if (m_disk_file == INVALID_HANDLE_VALUE) {
+			const DWORD error = GetLastError();
+			m_disk_file = nullptr;
+			DeleteFileW(temp_name);
+			LOGF("\t direct-memory backing: CreateFileW failed, error=%u\n", error);
+			return nullptr;
+		}
+		DWORD bytes_returned = 0;
+		if (!DeviceIoControl(m_disk_file, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0,
+		                     &bytes_returned, nullptr)) {
+			LOGF("\t direct-memory backing: FSCTL_SET_SPARSE failed, error=%u\n", GetLastError());
+			return nullptr;
+		}
+		LARGE_INTEGER end {};
+		end.QuadPart = static_cast<LONGLONG>(m_size);
+		if (!SetFilePointerEx(m_disk_file, end, nullptr, FILE_BEGIN) ||
+		    !SetEndOfFile(m_disk_file)) {
+			LOGF("\t direct-memory backing: temp file sizing failed, error=%u\n",
+			     GetLastError());
+			return nullptr;
+		}
+		HANDLE section = CreateFileMappingW(
+		    m_disk_file, nullptr, PAGE_EXECUTE_READWRITE,
+		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu),
+		    nullptr);
+		if (section == nullptr) {
+			LOGF("\t direct-memory backing: file section failed, error=%u\n", GetLastError());
+			return nullptr;
+		}
+		LOGF("\t direct-memory backing: sparse temporary file ready (%" PRIu64 " MiB)\n",
+		     m_size / (1024u * 1024u));
+		return section;
+	}
+
+	HANDLE m_disk_file = nullptr;
 	HANDLE m_handle = nullptr;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	[[nodiscard]] static uint64_t GetMappableTestSize() { return 0x4000; }

@@ -84,6 +84,56 @@ inline constexpr Edit kAutoSaveComfortEdit {
     "oncreate", 75824259426ull,
     {0xd3, 0x06, 0x00, 0x00}, {0xd6, 0x02, 0x00, 0x00}
 };
+
+// StartupGameMode::ReceiveBeginPlay can take the shipped demo branch's
+// OpenLevel(MainMenu) path, without modifying the game's pak on disk.
+inline constexpr Edit kStartupMainMenuEdit {
+    "startupmainmenu", 11557168072ull,
+    {0x95, 0x05, 0x00, 0x00}, {0x31, 0x00, 0x00, 0x00}
+};
+// BP_MovementPreferenceTutorialMenu (PPSA05666 01.004.011).
+// When its panel finishes animating, enter the Standard movement selection
+// callback instead of simply finishing the panel animation. Both wrappers
+// have the same no-argument dispatch signature.
+inline constexpr Edit kMovementAutoStandardEdit {
+    "movementstandard", 75826525367ull,
+    {0x70, 0x17, 0x00, 0x00}, {0x0b, 0x32, 0x00, 0x00}
+};
+// Trigger the Standard preset only when the movement preference widget
+// reaches FadeInComfortButtons, after mode selection and widget setup.
+inline constexpr Edit kMovementConfirmWhenReadyEdit {
+    "movementready", 75826523849ull,
+    {0xcb, 0x32, 0x00, 0x00}, {0x0b, 0x32, 0x00, 0x00}
+};
+// OnAnalogueOrGestureClick(bool) -> OnControlPresetButtonClicked broadcaster.
+// This callback chain should signal the calibration parent once the widget
+// selects its movement style, instead of leaving the submenu awaiting a click.
+inline constexpr Edit kMovementPresetNotifyEdit {
+    "movementpreset", 75826524335ull,
+    {0x96, 0x26, 0x00, 0x00}, {0x51, 0x16, 0x00, 0x00}
+};
+// OnAnalogueOrGestureClick(bool) normally opens the mode confirmation menu.
+// OnAnalogueConfirm is a no-argument event in the same ExecuteUbergraph.
+// Compare this with the direct multicast shortcut separately.
+inline constexpr Edit kMovementAnalogueConfirmEdit {
+    "movementanalogueconfirm", 75826524335ull,
+    {0x96, 0x26, 0x00, 0x00}, {0xfe, 0x1f, 0x00, 0x00}
+};
+// After selecting Analogue, let its click callback accept the Standard
+// comfort preset rather than opening the confirmation screen. This is a
+// separate experiment from accepting the Analogue movement mode alone.
+inline constexpr Edit kMovementStandardFromModeEdit {
+    "movementstandardfrommode", 75826524335ull,
+    {0x96, 0x26, 0x00, 0x00}, {0x0b, 0x32, 0x00, 0x00}
+};
+// When the movement preference widget finishes fading out its final child,
+// dispatch the parent-facing preset notification. This is deliberately after
+// mode and comfort selection, unlike the early animated-panel redirect.
+inline constexpr Edit kMovementNotifyAfterFadeEdit {
+    "movementnotifyafterfade", 75826523745ull,
+    {0x77, 0x33, 0x00, 0x00}, {0x51, 0x16, 0x00, 0x00}
+};
+
 enum class Result { NoOverlap, Unchanged, Patched, Mismatch };
 
 // EndOfCalibrationActivation(Activate) is also called with false by CompleteStep.
@@ -157,13 +207,46 @@ inline constexpr uint64_t kMovementStandardAfterSetupOffset = 75826518121ull;
     return Result::Patched;
 }
 
+// An exact-version alternative to attempting to fake every VR calibration
+// screen: leave BP_HeadsetCalibration's ReceiveBeginPlay a valid, empty
+// Kismet function. The six EX_Nothing opcodes replace EX_LocalFinalFunction's
+// entry dispatch and parameters; the original Return/EndOfScript is retained.
+inline constexpr uint64_t kDisableCalibrationBeginOffset = 75823936562ull;
+[[nodiscard]] inline Result ApplyDisableCalibrationBegin(
+    uint64_t offset, std::span<uint8_t> block) {
+    if (offset > kDisableCalibrationBeginOffset ||
+        kDisableCalibrationBeginOffset - offset >= block.size()) {
+        return Result::NoOverlap;
+    }
+    const size_t at = static_cast<size_t>(kDisableCalibrationBeginOffset - offset);
+    constexpr std::array<uint8_t, 9> before {
+        0x1d, 0x9b, 0x33, 0x00, 0x00, 0x16, 0x04, 0x0b, 0x53
+    };
+    constexpr std::array<uint8_t, 9> after {
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x04, 0x0b, 0x53
+    };
+    if (block.size() - at < before.size()) {
+        return Result::NoOverlap;
+    }
+    const auto view = block.subspan(at, before.size());
+    if (std::ranges::equal(view, after)) {
+        return Result::Unchanged;
+    }
+    if (!std::ranges::equal(view, before)) {
+        return Result::Mismatch;
+    }
+    std::ranges::copy(after, view.begin());
+    return Result::Patched;
+}
+
 // OnPanelButtonAnimatedOn contains EX_Jump to a panel-only Kismet path.
 // Enter OnAnalogueSelected instead, which updates the mode and calls the
 // parent-facing movement callback above. Retain the EX_Jump opcode and
 // the following function call's opcode as signature anchors.
 inline constexpr uint64_t kMovementChoiceJump = 75826512382ull;
 [[nodiscard]] inline Result ApplyMovementChoiceJump(uint64_t block_offset,
-                                                     std::span<uint8_t> block) {
+                                                     std::span<uint8_t> block,
+                                                     bool notify_parent = false) {
     if (block_offset > kMovementChoiceJump ||
         kMovementChoiceJump - block_offset >= block.size()) {
         return Result::NoOverlap;
@@ -176,7 +259,9 @@ inline constexpr uint64_t kMovementChoiceJump = 75826512382ull;
         return Result::Mismatch;
     }
     constexpr std::array<uint8_t, 4> original {0x5c, 0x0d, 0x00, 0x00};
-    constexpr std::array<uint8_t, 4> replacement {0x81, 0x1a, 0x00, 0x00};
+    constexpr std::array<uint8_t, 4> select_mode {0x81, 0x1a, 0x00, 0x00};
+    constexpr std::array<uint8_t, 4> notify {0x51, 0x16, 0x00, 0x00};
+    const auto& replacement = notify_parent ? notify : select_mode;
     bool unchanged = true;
     for (size_t i = 0; i < original.size(); ++i) {
         const auto value = block[at + 1 + i];
@@ -192,6 +277,52 @@ inline constexpr uint64_t kMovementChoiceJump = 75826512382ull;
     return Result::Patched;
 }
 
+// BP_HeadsetCalibration::OnComfortPresetSelected. This optional, exact-version
+// Kismet patch follows the successful comfort callback into the final-step
+// setup, then redirects its jump to StartGame. The three edits form one
+// transaction so a partly read APR block cannot leave broken bytecode.
+inline constexpr uint64_t kAutoWizardStart = 75823918508ull;
+inline constexpr uint64_t kAutoWizardEnd = 75823918657ull;
+
+[[nodiscard]] inline Result ApplyAutoWizard(uint64_t block_offset, std::span<uint8_t> block) {
+    if (block_offset > kAutoWizardStart ||
+        kAutoWizardStart - block_offset >= block.size()) {
+        return Result::NoOverlap;
+    }
+    const auto at = static_cast<size_t>(kAutoWizardStart - block_offset);
+    if (block.size() - at < kAutoWizardEnd - kAutoWizardStart) {
+        return Result::NoOverlap;
+    }
+    constexpr std::array<uint8_t, 4> original_jump {0xba, 0x0b, 0x00, 0x00};
+    constexpr std::array<uint8_t, 4> replacement_jump {0xb7, 0x4f, 0x00, 0x00};
+    // EX_EndFunctionParms before each EX_PopExecutionFlow, and EX_Jump
+    // immediately after the second, are fixed anchors for this asset build.
+    if (at == 0 || block[at - 1] != 0x16u ||
+        block[at + 1] != 0x61u ||
+        block[at + 142] != 0x16u ||
+        block[at + 144] != 0x06u) {
+        return Result::Mismatch;
+    }
+    const auto is_opcode = [](uint8_t v) { return v == 0x4du || v == 0x0bu; };
+    if (!is_opcode(block[at]) || !is_opcode(block[at + 143])) {
+        return Result::Mismatch;
+    }
+    bool unchanged = block[at] == 0x0bu && block[at + 143] == 0x0bu;
+    for (size_t i = 0; i < 4; ++i) {
+        const auto value = block[at + 145 + i];
+        if (value != original_jump[i] && value != replacement_jump[i]) {
+            return Result::Mismatch;
+        }
+        unchanged &= value == replacement_jump[i];
+    }
+    if (unchanged) {
+        return Result::Unchanged;
+    }
+    block[at] = 0x0bu;
+    block[at + 143] = 0x0bu;
+    std::ranges::copy(replacement_jump, block.begin() + at + 145);
+    return Result::Patched;
+}
 struct Plan {
 	bool              valid = true;
 	std::vector<Edit> edits;
@@ -206,6 +337,76 @@ inline constexpr std::string_view kDefaultMapOriginal =
 inline constexpr std::string_view kDefaultMapMainMenu =
     "GameDefaultMap=/Game/Maps/MainMenu.MainMenu    ";
 static_assert(kDefaultMapOriginal.size() == kDefaultMapMainMenu.size());
+
+// The next runtime-irrelevant EditorStartupMap line gives enough room to
+// directly boot the cooked RiverRideV2 persistent level. Replace both full
+// lines in the transient APR buffer, preserving the serialized byte length.
+inline constexpr std::string_view kDefaultMapAndEditorOriginal =
+    "GameDefaultMap=/Game/Maps/StartupMap.StartupMap\r\n"
+    "EditorStartupMap=/Engine/Maps/Entry.Entry\r\n";
+inline constexpr std::string_view kDefaultMapRiverRide =
+    "GameDefaultMap=/Game/Maps/RiverRideV2/RiverRideV2_Persistent."
+    "RiverRideV2_Persistent       \r\n";
+static_assert(kDefaultMapAndEditorOriginal.size() == kDefaultMapRiverRide.size());
+
+inline constexpr std::string_view kHubMapPath =
+    "/Game/Maps/Hub/Hub_Persistent.Hub_Persistent";
+
+[[nodiscard]] inline Result ApplyHubMap(uint64_t block_offset,
+                                        std::span<uint8_t> block) {
+    if (block_offset > kDefaultMapPakOffset ||
+        kDefaultMapPakOffset - block_offset >= block.size()) {
+        return Result::NoOverlap;
+    }
+    const auto at = static_cast<size_t>(kDefaultMapPakOffset - block_offset);
+    constexpr size_t patch_size = kDefaultMapAndEditorOriginal.size();
+    if (block.size() - at < patch_size) {
+        return Result::NoOverlap;
+    }
+    std::array<char, patch_size> replacement {};
+    std::fill(replacement.begin(), replacement.end() - 2, ' ');
+    const std::string_view key = "GameDefaultMap=";
+    if (key.size() + kHubMapPath.size() > patch_size - 2) {
+        return Result::Mismatch;
+    }
+    std::ranges::copy(key, replacement.begin());
+    std::ranges::copy(kHubMapPath, replacement.begin() + key.size());
+    replacement[patch_size - 2] = '\r';
+    replacement[patch_size - 1] = '\n';
+
+    const std::string_view actual(reinterpret_cast<const char*>(block.data() + at),
+                                  patch_size);
+    if (actual == std::string_view(replacement.data(), replacement.size())) {
+        return Result::Unchanged;
+    }
+    if (actual != kDefaultMapAndEditorOriginal) {
+        return Result::Mismatch;
+    }
+    std::ranges::copy(replacement, block.begin() + at);
+    return Result::Patched;
+}
+
+[[nodiscard]] inline Result ApplyRiverRideMap(uint64_t block_offset,
+                                             std::span<uint8_t> block) {
+    if (block_offset > kDefaultMapPakOffset ||
+        kDefaultMapPakOffset - block_offset >= block.size()) {
+        return Result::NoOverlap;
+    }
+    const auto at = static_cast<size_t>(kDefaultMapPakOffset - block_offset);
+    if (block.size() - at < kDefaultMapAndEditorOriginal.size()) {
+        return Result::NoOverlap;
+    }
+    const auto* ptr = reinterpret_cast<const char*>(block.data() + at);
+    const std::string_view actual(ptr, kDefaultMapAndEditorOriginal.size());
+    if (actual == kDefaultMapRiverRide) {
+        return Result::Unchanged;
+    }
+    if (actual != kDefaultMapAndEditorOriginal) {
+        return Result::Mismatch;
+    }
+    std::ranges::copy(kDefaultMapRiverRide, block.begin() + at);
+    return Result::Patched;
+}
 
 [[nodiscard]] inline Result ApplyMainMenuMap(uint64_t block_offset,
                                              std::span<uint8_t> block) {

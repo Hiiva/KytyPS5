@@ -587,14 +587,15 @@ void TextureCache::DumpReprojectionCandidates() const {
         ++candidates;
         LOGF("Hmd2 texture candidate id=%u gpu=%016" PRIx64
              " extent=%ux%u format=%u host=%u tile=%u levels=%u"
-             " layers=%u bytes=%" PRIu64 " dirty=%d\n",
+             " layers=%u bytes=%" PRIu64 " dirty=%d gpu_modified=%d target=%d tick=%" PRIu64 "\n",
              id.index, info.data.address,
              info.extent.width, info.extent.height,
              static_cast<uint32_t>(info.guest_format),
              static_cast<uint32_t>(info.pixel_format),
              static_cast<uint32_t>(info.tile_mode),
              info.resources.levels, info.resources.layers,
-             info.data.size, image.IsCpuDirty());
+             info.data.size, image.IsCpuDirty(), image.IsGpuModified(),
+             image.usage.render_target, image.tick_accessed_last);
     });
     LOGF("Hmd2: texture cache candidate count=%u\n", candidates);
 }

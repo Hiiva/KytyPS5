@@ -136,6 +136,17 @@ struct State {
     }
 
     void ResetPosition() { offset = {}; }
+
+    // F9 should return to the most recently applied scripted pose, not erase
+    // a held offset that the game still needs for an unobstructed headset.
+    // With no applied step, preserve the ordinary neutral reset behavior.
+    [[nodiscard]] const Step* ResetToLastAppliedStep(const Script& script) {
+        const Step* last = next_step != 0 && next_step <= script.count
+                               ? &script.steps[next_step - 1]
+                               : nullptr;
+        offset = last != nullptr ? last->offset : Offset {};
+        return last;
+    }
 };
 
 } // namespace Libs::VirtualHeadPosition

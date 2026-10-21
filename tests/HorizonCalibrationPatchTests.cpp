@@ -234,6 +234,69 @@ void AutoStartOnEndActivation() {
     Check(ApplyAutoStartOnEndActivation(75823934777ull, wrapper) == Result::NoOverlap &&
               wrapper == original_wrapper, "AutoEnd must preserve the activation wrapper entry");
 }
+void StartupMainMenuRedirect() {
+    const auto& edit = kStartupMainMenuEdit;
+    Check(edit.file_offset == 11557168072ull, "startup menu pak offset changed");
+    Check(edit.original == EntryBytes(0x0595u), "startup ReceiveBeginPlay entry changed");
+    Check(edit.replacement == EntryBytes(0x0031u), "startup OpenLevel entry changed");
+    auto bytes = EventBody(edit);
+    Check(Apply(edit, edit.file_offset - 1u, bytes) == Result::Patched,
+          "startup menu redirect did not apply");
+    Check(Apply(edit, edit.file_offset - 1u, bytes) == Result::Unchanged,
+          "startup menu redirect is not idempotent");
+    bytes[1] = 0x12u;
+    Check(Apply(edit, edit.file_offset - 1u, bytes) == Result::Mismatch,
+          "startup menu redirect accepted bad original bytes");
+}
+void AutoMovementStandard() {
+    const auto& edit = kMovementAutoStandardEdit;
+    Check(edit.file_offset == 75826525367ull, "movement animation pak offset changed");
+    Check(edit.original == EntryBytes(0x1770u), "movement animation graph entry changed");
+    Check(edit.replacement == EntryBytes(0x320bu), "Standard selection entry changed");
+    auto bytes = EventBody(edit);
+    Check(Apply(edit, edit.file_offset - 1u, bytes) == Result::Patched,
+          "movement auto-selection was not applied");
+    Check(Apply(edit, edit.file_offset - 1u, bytes) == Result::Unchanged,
+          "movement auto-selection is not idempotent");
+    bytes[4] = 0x04u;
+    Check(Apply(edit, edit.file_offset - 1u, bytes) == Result::Mismatch,
+          "movement auto-selection accepted invalid signature");
+}
+void AutoMovementReady() {
+    const auto& edit = kMovementConfirmWhenReadyEdit;
+    Check(edit.file_offset == 75826523849ull, "FadeInComfortButtons pak offset changed");
+    Check(edit.original == EntryBytes(0x32cbu), "movement mode-complete entry changed");
+    Check(edit.replacement == EntryBytes(0x320bu), "Standard preset entry changed");
+    auto body = EventBody(edit);
+    Check(Apply(edit, edit.file_offset - 1u, body) == Result::Patched,
+          "movement preset callback was not redirected");
+    Check(Apply(edit, edit.file_offset - 1u, body) == Result::Unchanged,
+          "movement preset callback was not idempotent");
+}
+void AutoAnalogueConfirm() {
+    const auto& edit = kMovementAnalogueConfirmEdit;
+    Check(edit.file_offset == kMovementPresetNotifyEdit.file_offset,
+          "Analogue confirmation should edit OnAnalogueOrGestureClick");
+    Check(edit.original == EntryBytes(0x2696u), "movement callback source changed");
+    Check(edit.replacement == EntryBytes(0x1ffeu), "AnalogueConfirm entry changed");
+    auto body = EventBody(edit);
+    Check(Apply(edit, edit.file_offset - 1u, body) == Result::Patched,
+          "movement AnalogueConfirm callback did not apply");
+    Check(Apply(edit, edit.file_offset - 1u, body) == Result::Unchanged,
+          "movement AnalogueConfirm was not idempotent");
+}
+void AutoStandardFromMode() {
+    const auto& edit = kMovementStandardFromModeEdit;
+    Check(edit.file_offset == kMovementAnalogueConfirmEdit.file_offset,
+          "comfort shortcut must target the analogue-mode click event");
+    Check(edit.original == EntryBytes(0x2696u), "movement mode click entry changed");
+    Check(edit.replacement == EntryBytes(0x320bu), "Standard comfort entry changed");
+    auto body = EventBody(edit);
+    Check(Apply(edit, edit.file_offset - 1u, body) == Result::Patched,
+          "movement mode-to-Standard shortcut did not apply");
+    Check(Apply(edit, edit.file_offset - 1u, body) == Result::Unchanged,
+          "movement mode-to-Standard shortcut was not idempotent");
+}
 void AutoStandardAfterSetup() {
     constexpr std::array<uint8_t, 11> original {
         0x45, 0xc9, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x27, 0x16
@@ -288,7 +351,30 @@ void AutoStandardAfterSetup() {
           "post-setup call accepted a partly patched signature");
     Check(mixed == incomplete, "partly patched post-setup signature was modified");
 }
+void AutoNotifyAfterFade() {
+    const auto& edit = kMovementNotifyAfterFadeEdit;
+    Check(edit.file_offset == 75826523745ull,
+          "movement final fade handler pak offset changed");
+    Check(edit.original == EntryBytes(0x3377u), "last fade graph entry changed");
+    Check(edit.replacement == EntryBytes(0x1651u),
+          "parent preset callback graph entry changed");
+    auto body = EventBody(edit);
+    Check(Apply(edit, edit.file_offset - 1u, body) == Result::Patched,
+          "movement final fade handler was not redirected");
+    Check(Apply(edit, edit.file_offset - 1u, body) == Result::Unchanged,
+          "movement final fade handler was not idempotent");
+}
 void AutoMovementChain() {
+    const auto& edit = kMovementPresetNotifyEdit;
+    Check(edit.file_offset == 75826524335ull, "movement preset callback offset changed");
+    Check(edit.original == EntryBytes(0x2696u), "movement callback source changed");
+    Check(edit.replacement == EntryBytes(0x1651u), "movement callback target changed");
+    auto bytes = EventBody(edit);
+    Check(Apply(edit, edit.file_offset - 1, bytes) == Result::Patched,
+          "movement preset callback did not apply");
+    Check(Apply(edit, edit.file_offset - 1, bytes) == Result::Unchanged,
+          "movement preset callback was not idempotent");
+
     std::array<uint8_t, 7> jump {0x06u, 0x5cu, 0x0du, 0, 0, 0x45u, 0};
     const auto original = jump;
     Check(ApplyMovementChoiceJump(kMovementChoiceJump, std::span(jump).first(5)) ==
@@ -303,6 +389,65 @@ void AutoMovementChain() {
     Check(jump[1] == 0x81 && jump[2] == 0x1a, "wrong movement jump destination");
     Check(ApplyMovementChoiceJump(kMovementChoiceJump, jump) == Result::Unchanged,
           "movement jump not idempotent");
+    jump = original;
+    Check(ApplyMovementChoiceJump(kMovementChoiceJump, jump, true) == Result::Patched,
+          "movement parent notification jump did not apply");
+    Check(jump[1] == 0x51 && jump[2] == 0x16,
+          "movement parent notification has wrong destination");
+    Check(ApplyMovementChoiceJump(kMovementChoiceJump, jump, true) == Result::Unchanged,
+          "movement notification jump was not idempotent");
+}
+void DisableCalibrationBegin() {
+    constexpr std::array<uint8_t, 10> original {
+        0x1d, 0x9b, 0x33, 0, 0, 0x16, 0x04, 0x0b, 0x53, 0
+    };
+    auto bytes = original;
+    Check(ApplyDisableCalibrationBegin(kDisableCalibrationBeginOffset, bytes) ==
+          Result::Patched, "calibration BeginPlay was not disabled");
+    for (size_t i = 0; i < 6; ++i) {
+        Check(bytes[i] == 0x0b, "calibration stub must use EX_Nothing");
+    }
+    Check(bytes[6] == 0x04 && bytes[7] == 0x0b && bytes[8] == 0x53,
+          "calibration stub must retain the valid Return/EndOfScript");
+    Check(ApplyDisableCalibrationBegin(kDisableCalibrationBeginOffset, bytes) ==
+          Result::Unchanged, "calibration stub was not idempotent");
+    bytes = original;
+    Check(ApplyDisableCalibrationBegin(kDisableCalibrationBeginOffset,
+          std::span(bytes).first(8)) == Result::NoOverlap,
+          "partial calibration BeginPlay was modified");
+    bytes[3] = 0x29;
+    const auto bad = bytes;
+    Check(ApplyDisableCalibrationBegin(kDisableCalibrationBeginOffset, bytes) ==
+          Result::Mismatch, "calibration stub accepted wrong original");
+    Check(bytes == bad, "calibration stub modified a mismatched source");
+}
+void AutoWizardAfterComfort() {
+    std::array<uint8_t, 150> bytes {};
+    constexpr size_t at = 1;
+    bytes[at - 1] = 0x16;
+    bytes[at] = 0x4d;
+    bytes[at + 1] = 0x61;
+    bytes[at + 142] = 0x16;
+    bytes[at + 143] = 0x4d;
+    bytes[at + 144] = 0x06;
+    bytes[at + 145] = 0xba;
+    bytes[at + 146] = 0x0b;
+    const auto original = bytes;
+    const uint64_t block_offset = kAutoWizardStart - 1;
+    Check(ApplyAutoWizard(block_offset, std::span(bytes).first(149)) == Result::NoOverlap,
+          "partial wizard read was modified");
+    Check(bytes == original, "partial wizard read changed input");
+    bytes[at + 144] = 0;
+    Check(ApplyAutoWizard(block_offset, bytes) == Result::Mismatch,
+          "wizard accepted invalid jump opcode");
+    bytes[at + 144] = 0x06;
+    Check(ApplyAutoWizard(block_offset, bytes) == Result::Patched,
+          "wizard failed to patch all three bytecode sites");
+    Check(bytes[at] == 0x0b && bytes[at + 143] == 0x0b &&
+          bytes[at + 145] == 0xb7 && bytes[at + 146] == 0x4f,
+          "wizard bytecode patch contents are incorrect");
+    Check(ApplyAutoWizard(block_offset, bytes) == Result::Unchanged,
+          "wizard patch was not idempotent");
 }
 void MainMenuDefaultMap() {
     const auto n = kDefaultMapOriginal.size();
@@ -329,6 +474,54 @@ void MainMenuDefaultMap() {
                            std::span(bytes.data(), 5u)) == Result::NoOverlap,
           "map override accepted an incomplete APR chunk");
 }
+void RiverRideDefaultMap() {
+    std::array<uint8_t, 128> bytes {};
+    const auto original = kDefaultMapAndEditorOriginal;
+    const auto replacement = kDefaultMapRiverRide;
+    Check(original.size() == replacement.size(), "RiverRide map edit changes length");
+    Check(replacement.find("RiverRideV2_Persistent") != std::string_view::npos,
+          "RiverRide map path is missing");
+    std::ranges::copy(original, bytes.begin() + 8u);
+    const auto block_offset = kDefaultMapPakOffset - 8u;
+    Check(ApplyRiverRideMap(block_offset, std::span(bytes).first(40)) == Result::NoOverlap,
+          "partial RiverRide map block was patched");
+    Check(ApplyRiverRideMap(block_offset, bytes) == Result::Patched,
+          "RiverRide map was not patched");
+    const std::string_view actual(reinterpret_cast<const char*>(bytes.data() + 8),
+                                  replacement.size());
+    Check(actual == replacement, "RiverRide map edit contents differ");
+    Check(ApplyRiverRideMap(block_offset, bytes) == Result::Unchanged,
+          "RiverRide map edit is not idempotent");
+    std::ranges::copy(original, bytes.begin() + 8u);
+    bytes[8u] = 'X';
+    const auto invalid = bytes;
+    Check(ApplyRiverRideMap(block_offset, bytes) == Result::Mismatch,
+          "RiverRide map edit ignored invalid signature");
+    Check(bytes == invalid, "RiverRide map edit modified invalid bytes");
+}
+void HubDefaultMap() {
+    std::array<uint8_t, 128> bytes {};
+    const auto original = kDefaultMapAndEditorOriginal;
+    std::ranges::copy(original, bytes.begin() + 8u);
+    const uint64_t offset = kDefaultMapPakOffset - 8u;
+    Check(ApplyHubMap(offset, std::span(bytes).first(40)) == Result::NoOverlap,
+          "partial hub map read was changed");
+    Check(ApplyHubMap(offset, bytes) == Result::Patched,
+          "Hub map override was not applied");
+    const std::string_view result(reinterpret_cast<const char*>(bytes.data() + 8),
+                                   original.size());
+    Check(result.starts_with("GameDefaultMap=/Game/Maps/Hub/Hub_Persistent.Hub_Persistent"),
+          "Hub map path changed");
+    Check(result.size() == original.size() && result.ends_with("\r\n"),
+          "Hub map rewrite changed the INI boundaries");
+    Check(ApplyHubMap(offset, bytes) == Result::Unchanged,
+          "Hub map rewrite is not idempotent");
+    bytes[8] = 'X';
+    const auto invalid = bytes;
+    Check(ApplyHubMap(offset, bytes) == Result::Mismatch,
+          "Hub map accepted a corrupted signature");
+    Check(bytes == invalid, "Hub map mutated an invalid read");
+}
 void AutoSaveComfortWidget() {
     const auto& edit = kAutoSaveComfortEdit;
     Check(edit.file_offset == 75824259426ull, "comfort widget pak offset changed");
@@ -352,9 +545,19 @@ int main() {
 	ParseEveryExport();
 	AutoSaveComfortWidget();
 	MainMenuDefaultMap();
+	RiverRideDefaultMap();
+	HubDefaultMap();
 	AutoStartOnEndActivation();
-	AutoStandardAfterSetup();
+	StartupMainMenuRedirect();
+	AutoMovementStandard();
+	AutoMovementReady();
+	AutoAnalogueConfirm();
+		AutoStandardFromMode();
+		AutoStandardAfterSetup();
+		AutoNotifyAfterFade();
 	AutoMovementChain();
+	DisableCalibrationBegin();
+	AutoWizardAfterComfort();
 	std::puts("HorizonCalibrationPatchTests: passed");
 	return 0;
 }

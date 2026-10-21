@@ -198,6 +198,17 @@ static int32_t KYTY_SYSV_ABI Hmd2Open(int32_t user_id, int32_t type, int32_t ind
     return requested != nullptr && std::strcmp(requested, "1") == 0 ? 1 : 0;
 }
 
+static int32_t KYTY_SYSV_ABI Hmd2SetVibration(int32_t handle, int32_t strength) {
+    // On a desktop without PS VR2 hardware, acknowledge headset haptics.
+    // The guest emits these frequently even while navigating its menus.
+    if (!g_initialized.load(std::memory_order_acquire) || !Config::VrEnabled()) {
+        return ERROR_NOT_INITIALIZED;
+    }
+    if (handle < 0 || handle > 1 || strength < 0 || strength > 25) {
+        return VideoOut::VIDEO_OUT_ERROR_INVALID_VALUE;
+    }
+    return OK;
+}
 static int32_t KYTY_SYSV_ABI Hmd2GetFieldOfView(int32_t handle, SceHmd2FieldOfView* fov) {
     if (handle != 0) {
         LOGF("Hmd2: unexpected FOV handle=%d\n", handle);
@@ -753,6 +764,7 @@ LIB_DEFINE(InitHmd2_1) {
 	LIB_FUNC("Pb1d+j-bBSc", Hmd2::Hmd2BootQueryBufferA);
 	LIB_FUNC("wEO+gMHs9NU", Hmd2::Hmd2BootQueryBufferB);
     LIB_FUNC("4BlE4IPXP0Q", Hmd2::Hmd2GetDeviceInformationByHandle);
+    LIB_FUNC("Al4qjNREVQQ", Hmd2::Hmd2SetVibration);
     LIB_FUNC("Ocf081WpBpA", Hmd2::Hmd2ReprojectionBeginFrame);
     LIB_FUNC("SVEG+1D7qHA", Hmd2::Hmd2ReprojectionGetPredictedDisplayTime);
     LIB_FUNC("Qx7SkcgAzok", Hmd2::Hmd2ReprojectionEnableMirroring);

@@ -128,6 +128,33 @@ void HeldInputAndReset() {
     VERIFY(catch_up.next_step == 2 && catch_up.offset == script->steps[1].offset);
 }
 
+void ResetToLastAppliedStep() {
+    const auto script = ParseScript("100:0:0:-0.05:0.08:0;200:0.1:0.2:-0.1:0.16:0.02");
+    VERIFY(script && script->count == 2);
+    State state;
+    VERIFY(state.Move({0.2f, 0.0f, 0.0f}));
+    VERIFY(state.ResetToLastAppliedStep(*script) == nullptr);
+    VERIFY(state.offset == Offset {} && state.next_step == 0);
+
+    VERIFY(state.ApplyDue(*script, 100) == 1);
+    VERIFY(state.Move({0.3f, 0.0f, 0.0f}));
+    const Step* first = state.ResetToLastAppliedStep(*script);
+    VERIFY(first == &script->steps[0]);
+    VERIFY(state.offset == first->offset && state.next_step == 1);
+    Near(first->yaw, 0.08f);
+
+    VERIFY(state.ApplyDue(*script, 200) == 1);
+    VERIFY(state.Move({0.0f, 0.3f, 0.0f}));
+    const Step* second = state.ResetToLastAppliedStep(*script);
+    VERIFY(second == &script->steps[1]);
+    VERIFY(state.offset == second->offset && state.next_step == 2);
+    Near(second->pitch, 0.02f);
+
+    Script empty;
+    VERIFY(state.ResetToLastAppliedStep(empty) == nullptr);
+    VERIFY(state.offset == Offset {} && state.next_step == 2);
+}
+
 float ReadFloat(const std::array<std::uint8_t, Libs::Hmd2TrackerPose::kHeadsetResultBytes>& bytes,
                 std::size_t offset) {
     float value = 0.0f;
@@ -169,6 +196,7 @@ int main() {
     RejectMalformedInput();
     WorkspaceAndAtomicRejection();
     HeldInputAndReset();
+    ResetToLastAppliedStep();
     ScriptedPoseReachesSdkHeadAndEyes();
-    std::puts("VirtualHeadPositionTests: 5 cases passed");
+    std::puts("VirtualHeadPositionTests: 6 cases passed");
 }

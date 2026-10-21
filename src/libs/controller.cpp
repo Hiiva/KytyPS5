@@ -263,6 +263,49 @@ static void VirtualHandMovePositionLocked(int side, const float head_position[3]
             static_cast<double>(head_position[axis] + VIRTUAL_HAND_WORKSPACE)));
     }
 }
+static std::atomic<uint64_t> g_virtual_aim_grid_epoch_us {0};
+
+// Optional, finite desktop calibration diagnostic. It moves only the virtual
+// right Sense ray through a 9x7 angular grid; the real desktop pointer and
+// real controller input are never changed.
+static bool VirtualSenseAimGrid(uint32_t* step, uint32_t* phase_ms) {
+    const char* enabled = std::getenv("KYTY_VR_AIM_GRID");
+    const char* gaze = std::getenv("KYTY_VR_GAZE_GRID");
+    const bool aim_active = enabled != nullptr && enabled[0] == '1' && enabled[1] == '\0';
+    const bool gaze_active = gaze != nullptr && gaze[0] == '1' && gaze[1] == '\0';
+    if (!aim_active && !gaze_active) {
+        return false;
+    }
+    const uint64_t now = LibKernel::KernelGetProcessTime();
+    uint64_t first = 0;
+    if (g_virtual_aim_grid_epoch_us.compare_exchange_strong(
+            first, now, std::memory_order_relaxed)) {
+        first = now;
+    }
+    static const uint64_t start_ms = [] {
+        const char* value = std::getenv("KYTY_VR_AIM_GRID_START_MS");
+        if (value != nullptr && *value != '\0') {
+            char* end = nullptr;
+            const auto parsed = std::strtoull(value, &end, 10);
+            if (end != value && *end == '\0' && parsed <= 60000u) {
+                return parsed;
+            }
+        }
+        return 18000ull;
+    }();
+    constexpr uint64_t interval_ms = 1150u;
+    constexpr uint64_t steps = 9u * 7u;
+    if (now < first || (now - first) / 1000u < start_ms) {
+        return false;
+    }
+    const uint64_t active_ms = (now - first) / 1000u - start_ms;
+    if (active_ms >= interval_ms * steps) {
+        return false;
+    }
+    *step = static_cast<uint32_t>(active_ms / interval_ms);
+    *phase_ms = static_cast<uint32_t>(active_ms % interval_ms);
+    return true;
+}
 
 // Fixed initial ray directions are useful for headset-free wizard navigation.
 // Mouse aim still applies normally after this initial pose has been chosen.
@@ -377,17 +420,21 @@ void VirtualHandAdjustReach(int side, float wheel_steps) {
     LOGF("Virtual Sense %s reach=%.2f m\n",
          side == 0 ? "left" : "right", g_virtual_hand_reach[side]);
 }
+static const VirtualHeadPosition::Script& VirtualHeadPoseScript();
+
 void VirtualHeadResetPose() {
+    const auto& script = VirtualHeadPoseScript();
     Common::LockGuard lock(g_virtual_head_mutex);
-    g_virtual_head_yaw        = 0.0f;
-    g_virtual_head_pitch      = 0.0f;
+    const auto* baseline = g_virtual_head_position.ResetToLastAppliedStep(script);
+    g_virtual_head_yaw        = baseline != nullptr ? baseline->yaw : 0.0f;
+    g_virtual_head_pitch      = baseline != nullptr ? baseline->pitch : 0.0f;
     g_virtual_head_updated_us = 0u;
-    g_virtual_head_position.ResetPosition();
     g_virtual_hand_reach[0] = 0.45f;
     g_virtual_hand_reach[1] = 0.45f;
     g_virtual_hand_position = {};
     VirtualHandResetAimLocked();
-    LOGF("Virtual PS VR2: headset position/orientation and hands reset\n");
+    LOGF("Virtual PS VR2: headset and hands reset (%s pose)\n",
+         baseline != nullptr ? "last scripted" : "neutral");
 }
 
 static const VirtualHeadPosition::Script& VirtualHeadPoseScript() {
@@ -479,6 +526,21 @@ void VirtualHeadGetPose(float position[3], float orientation[4]) {
         yaw = g_virtual_head_yaw;
         pitch = g_virtual_head_pitch;
     }
+    if (const char* gaze = std::getenv("KYTY_VR_GAZE_GRID");
+        gaze != nullptr && gaze[0] == '1' && gaze[1] == '\0') {
+        uint32_t step = 0, phase = 0;
+        if (VirtualSenseAimGrid(&step, &phase)) {
+            const uint32_t row = step / 9u;
+            const uint32_t col = row % 2u ? 8u - step % 9u : step % 9u;
+            yaw = -0.70f + static_cast<float>(col) * 0.175f;
+            pitch = -0.45f + static_cast<float>(row) * 0.15f;
+            static std::atomic<uint32_t> last_step {UINT32_MAX};
+            if (last_step.exchange(step, std::memory_order_relaxed) != step) {
+                LOGF("Virtual gaze grid step=%u yaw=%.2f pitch=%.2f\n",
+                     step, yaw, pitch);
+            }
+        }
+    }
 
     const float cy = std::cos(yaw * 0.5f);
     const float sy = std::sin(yaw * 0.5f);
@@ -516,10 +578,40 @@ void VirtualHandGetPose(int side, float position[3], float orientation[4]) {
         aim_yaw = g_virtual_hand_aim_yaw[side];
         aim_pitch = g_virtual_hand_aim_pitch[side];
     }
+    uint32_t grid_step = 0;
+    uint32_t grid_phase = 0;
+    const char* hand_sweep = std::getenv("KYTY_VR_AIM_GRID");
+    if (side == 1 && hand_sweep != nullptr && hand_sweep[0] == '1' &&
+        hand_sweep[1] == '\0' && VirtualSenseAimGrid(&grid_step, &grid_phase)) {
+        const uint32_t row = grid_step / 9u;
+        const uint32_t raw_col = grid_step % 9u;
+        const uint32_t col = row % 2u != 0 ? 8u - raw_col : raw_col;
+        const char* wide = std::getenv("KYTY_VR_AIM_GRID_WIDE");
+        const bool wide_sweep = wide != nullptr && wide[0] == '1' && wide[1] == '\0';
+        // Some native Sense pointer consumers use the grip's +X axis rather
+        // than the OpenXR-style -Z axis. Include 90/180 degree orientations.
+        aim_yaw = wide_sweep ? -3.0f + 0.75f * static_cast<float>(col)
+                             : -1.2f + 0.30f * static_cast<float>(col);
+        aim_pitch = wide_sweep ? -1.5f + 0.5f * static_cast<float>(row)
+                               : -0.75f + 0.25f * static_cast<float>(row);
+        static std::atomic<uint32_t> last_step {UINT32_MAX};
+        if (last_step.exchange(grid_step, std::memory_order_relaxed) != grid_step) {
+            LOGF("Virtual Sense aim grid step=%u yaw=%.2f pitch=%.2f\n",
+                 grid_step, aim_yaw, aim_pitch);
+        }
+    }
     const float qx = orientation[0];
     const float qy = orientation[1];
     const float qz = orientation[2];
     const float qw = orientation[3];
+    // With an untracked HMD handle, Horizon initializes its camera at the
+    // tracker-local origin rather than the 1.6 m virtual standing height.
+    // Keep the default world-space pose unless this calibration experiment
+    // explicitly asks for local controller coordinates.
+    if (const char* local_origin = std::getenv("KYTY_VR_HAND_LOCAL_ORIGIN");
+        local_origin != nullptr && local_origin[0] == '1' && local_origin[1] == '\0') {
+        position[1] -= 1.6f;
+    }
     // Aim is relative to the captured wrist base for independently placed hands,
     // or to the current headset for untouched hands. Mouse aim keeps its bounds.
     const float cy = std::cos(aim_yaw * 0.5f);
@@ -1701,6 +1793,16 @@ int KYTY_SYSV_ABI PadVrControllerReadState(int handle, void* state_out) {
     }
     if (side == 1) {
         buttons = ApplyVirtualSenseScript(buttons);
+        uint32_t grid_step = 0;
+        uint32_t grid_phase = 0;
+        if (VirtualSenseAimGrid(&grid_step, &grid_phase) &&
+            grid_phase >= 600u && grid_phase < 940u) {
+            const char* gaze = std::getenv("KYTY_VR_GAZE_GRID");
+            const bool gaze_active = gaze != nullptr && gaze[0] == '1' && gaze[1] == '\0';
+            const char* click = std::getenv("KYTY_VR_AIM_GRID_BUTTON");
+            const bool cross = click != nullptr && std::strcmp(click, "X") == 0;
+            buttons |= gaze_active || cross ? PAD_BUTTON_CROSS : PAD_BUTTON_R2;
+        }
     }
     std::memcpy(bytes, &buttons, sizeof(buttons));
     // Horizon's native Sense reader consumes the left/right trigger axes at
