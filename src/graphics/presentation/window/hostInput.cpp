@@ -79,6 +79,7 @@ struct MouseJoystickState {
 	bool     enabled   = false;
 	bool     head_look = false;
 	int      hand_aim  = -1;
+	int      hand_position = -1;
 	bool     output    = false;
 	uint64_t next_poll = 0;
 };
@@ -378,7 +379,15 @@ int PollMouse(uint64_t now_ms) {
 	float delta_x = 0;
 	float delta_y = 0;
 	SDL_GetRelativeMouseState(&delta_x, &delta_y);
-	if (g_mouse.hand_aim >= 0) {
+	if (g_mouse.hand_position >= 0) {
+		if (delta_x != 0.0f || delta_y != 0.0f) {
+			// Initial desktop setting: two millimetres per physical mouse pixel.
+			constexpr float metres_per_pixel = 0.002f;
+			Controller::VirtualHandMovePosition(g_mouse.hand_position,
+			    delta_x * metres_per_pixel, -delta_y * metres_per_pixel, 0.0f);
+		}
+		CenterMouseStick();
+	} else if (g_mouse.hand_aim >= 0) {
 		if (delta_x != 0.0f || delta_y != 0.0f) {
 			Controller::VirtualHandMouseMotion(g_mouse.hand_aim, delta_x, delta_y);
 		}
@@ -439,8 +448,25 @@ void HostInputShutdown() {
 
 void HostInputKey(int key_code, bool down) {
 	const auto& map = GetInputMap();
+	const auto control = map.FindKey(key_code);
+	// Unmodified desktop hand controls avoid the legacy Shift/L3 chord. A
+	// custom binding for one of these keys remains authoritative.
+	if (Config::VrEnabled() && control == INVALID_CONTROL) {
+		switch (key_code) {
+			case SDLK_F2:
+				if (down) { HostInputToggleMouseToHandPosition(0); }
+				return;
+			case SDLK_F3:
+				if (down) { HostInputToggleMouseToHandPosition(1); }
+				return;
+			case SDLK_F5:
+				if (down) { HostInputToggleMouseToHand(0); }
+				return;
+			default: break;
+		}
+	}
 	if (map.Custom()) {
-		SetControl(map.FindKey(key_code), down);
+		SetControl(control, down);
 	} else {
 		DefaultKeyboardInput(key_code, down);
 	}
@@ -467,8 +493,22 @@ void HostInputMouseButton(uint8_t mouse_button, bool down) {
 	}
 }
 
+void HostInputMouseWheel(float wheel_steps, bool left_modifier) {
+	if (!Config::VrEnabled()) {
+		return;
+	}
+	const int selected = g_mouse.hand_position >= 0 ? g_mouse.hand_position : g_mouse.hand_aim;
+	const int side = left_modifier ? 0 : (selected >= 0 ? selected : 1);
+	if (g_mouse.hand_position == side) {
+		// F9 resets the pose while leaving the selected mouse mode active.
+		// Its next wheel input must resume position control, just like XY input.
+		Controller::VirtualHandBeginPositionControl(side);
+	}
+	Controller::VirtualHandAdjustReach(side, wheel_steps);
+}
+
 void HostInputToggleMouseToJoystick() {
-	if (g_mouse.enabled && !g_mouse.head_look && g_mouse.hand_aim < 0) {
+	if (g_mouse.enabled && !g_mouse.head_look && g_mouse.hand_aim < 0 && g_mouse.hand_position < 0) {
 		SetRelativeMouseMode(false);
 		CenterMouseStick();
 		g_mouse = {};
@@ -479,6 +519,7 @@ void HostInputToggleMouseToJoystick() {
 		CenterMouseStick();
 		g_mouse.head_look = false;
 		g_mouse.hand_aim = -1;
+		g_mouse.hand_position = -1;
 		g_mouse.next_poll = 0;
 		LOGF("Mouse to right stick: enabled (F7 to release)\n");
 		return;
@@ -489,6 +530,7 @@ void HostInputToggleMouseToJoystick() {
 	g_mouse.enabled = true;
 	g_mouse.head_look = false;
 	g_mouse.hand_aim = -1;
+	g_mouse.hand_position = -1;
 	g_mouse.next_poll = 0;
 	LOGF("Mouse to right stick: enabled (F7 to release)\n");
 }
@@ -507,6 +549,7 @@ void HostInputToggleMouseToHead() {
 		CenterMouseStick();
 		g_mouse.head_look = true;
 		g_mouse.hand_aim = -1;
+		g_mouse.hand_position = -1;
 		g_mouse.next_poll = 0;
 		LOGF("Virtual headset mouse look: enabled (F8 to release; F9 to recenter)\n");
 		return;
@@ -517,6 +560,7 @@ void HostInputToggleMouseToHead() {
 	g_mouse.enabled = true;
 	g_mouse.head_look = true;
 	g_mouse.hand_aim = -1;
+	g_mouse.hand_position = -1;
 	g_mouse.next_poll = 0;
 	LOGF("Virtual headset mouse look: enabled (F8 to release; F9 to recenter)\n");
 }
@@ -539,8 +583,34 @@ void HostInputToggleMouseToHand(int side) {
 	g_mouse.enabled = true;
 	g_mouse.head_look = false;
 	g_mouse.hand_aim = side;
+	g_mouse.hand_position = -1;
 	g_mouse.next_poll = 0;
-	LOGF("Virtual Sense mouse aim: %s hand (F10 toggles; Shift+F10 for left)\n",
+	LOGF("Virtual Sense mouse aim: %s hand (F5 left; F10 right; wheel changes reach)\n",
+		side == 0 ? "left" : "right");
+}
+
+void HostInputToggleMouseToHandPosition(int side) {
+	if (!Config::VrEnabled() || side < 0 || side > 1) {
+		return;
+	}
+	if (g_mouse.enabled && g_mouse.hand_position == side) {
+		SetRelativeMouseMode(false);
+		CenterMouseStick();
+		g_mouse = {};
+		LOGF("Virtual Sense mouse position: disabled (hand position retained)\n");
+		return;
+	}
+	if (!g_mouse.enabled && !SetRelativeMouseMode(true)) {
+		return;
+	}
+	CenterMouseStick();
+	Controller::VirtualHandBeginPositionControl(side);
+	g_mouse.enabled = true;
+	g_mouse.head_look = false;
+	g_mouse.hand_aim = -1;
+	g_mouse.hand_position = side;
+	g_mouse.next_poll = 0;
+	LOGF("Virtual Sense mouse position: %s hand (F2 left; F3 right; wheel moves depth; F9 resets)\n",
 		side == 0 ? "left" : "right");
 }
 

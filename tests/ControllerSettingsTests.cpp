@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <string>
 #include <vector>
 
 namespace {
@@ -25,6 +27,11 @@ std::vector<Rumble>                haptics;
 std::vector<std::array<Uint8, 32>> effects;
 bool                               haptics_handles_rumble = false;
 std::array<Uint8, 0x68>             vr_read_buffer {};
+bool                               relative_mouse_enabled = false;
+bool                               relative_mouse_allowed = true;
+bool                               window_has_focus = true;
+float                              mouse_dx = 0.0f, mouse_dy = 0.0f;
+SDL_Window* const                  test_window = reinterpret_cast<SDL_Window*>(uintptr_t {1});
 } // namespace
 
 namespace Fake {
@@ -60,6 +67,19 @@ bool SetGamepadSensorEnabled(SDL_Gamepad*, SDL_SensorType, bool) {
 }
 void CloseGamepad(SDL_Gamepad*) {}
 void Delay(Uint32) {}
+bool SetWindowRelativeMouseMode(SDL_Window*, bool enabled) {
+	if (!relative_mouse_allowed) { return false; }
+	relative_mouse_enabled = enabled;
+	return true;
+}
+SDL_MouseButtonFlags GetRelativeMouseState(float* x, float* y) {
+	if (x != nullptr) { *x = mouse_dx; }
+	if (y != nullptr) { *y = mouse_dy; }
+	mouse_dx = mouse_dy = 0.0f;
+	return 0;
+}
+SDL_Window* GetKeyboardFocus() { return window_has_focus ? test_window : nullptr; }
+bool WaitEventTimeout(SDL_Event*, Sint32) { return false; }
 } // namespace Fake
 
 #define SDL_GetTicks                Fake::GetTicks
@@ -83,6 +103,19 @@ void Delay(Uint32) {}
 #undef SDL_SetGamepadSensorEnabled
 #undef SDL_CloseGamepad
 #undef SDL_Delay
+
+// Exercise the real mouse modes/keymap routing without opening a host window.
+#define SDL_GetTicks                   Fake::GetTicks
+#define SDL_SetWindowRelativeMouseMode Fake::SetWindowRelativeMouseMode
+#define SDL_GetRelativeMouseState      Fake::GetRelativeMouseState
+#define SDL_GetKeyboardFocus           Fake::GetKeyboardFocus
+#define SDL_WaitEventTimeout           Fake::WaitEventTimeout
+#include "graphics/presentation/window/hostInput.cpp"
+#undef SDL_GetTicks
+#undef SDL_SetWindowRelativeMouseMode
+#undef SDL_GetRelativeMouseState
+#undef SDL_GetKeyboardFocus
+#undef SDL_WaitEventTimeout
 
 namespace Libs::Controller::DualSenseHaptics {
 bool SetVibration(int, uint8_t large_motor, uint8_t small_motor, uint32_t duration_ms) {
@@ -134,6 +167,296 @@ struct Controller {
 	}
 	~Controller() { Shutdown(); }
 };
+
+class ScopedEnvironment {
+public:
+	ScopedEnvironment(const char* name, const char* value): m_name(name) {
+		if (const char* previous = std::getenv(name)) {
+			m_present = true;
+			m_previous = previous;
+		}
+		Set(value);
+	}
+	~ScopedEnvironment() { Set(m_present ? m_previous.c_str() : nullptr); }
+private:
+	void Set(const char* value) {
+#ifdef _WIN32
+		Check(_putenv_s(m_name, value != nullptr ? value : "") == 0, "environment update failed");
+#else
+		Check((value != nullptr ? setenv(m_name, value, 1) : unsetenv(m_name)) == 0,
+		      "environment update failed");
+#endif
+	}
+	const char* m_name;
+	bool m_present = false;
+	std::string m_previous;
+};
+
+struct VirtualPose {
+	std::array<float, 3> position;
+	std::array<float, 4> orientation;
+};
+
+VirtualPose ReadHand(int side) {
+	VirtualPose pose;
+	VirtualHandGetPose(side, pose.position.data(), pose.orientation.data());
+	return pose;
+}
+
+template <size_t N>
+bool Near(const std::array<float, N>& a, const std::array<float, N>& b) {
+	for (size_t axis = 0; axis < N; ++axis) {
+		if (!std::isfinite(a[axis]) || std::abs(a[axis] - b[axis]) > 0.00001f) { return false; }
+	}
+	return true;
+}
+
+bool SamePose(const VirtualPose& a, const VirtualPose& b) {
+	return Near(a.position, b.position) && Near(a.orientation, b.orientation);
+}
+
+bool InHandWorkspace(const VirtualPose& pose) {
+	const float head[3] = {0.0f, 1.6f, 0.0f};
+	for (size_t axis = 0; axis < pose.position.size(); ++axis) {
+		if (!std::isfinite(pose.position[axis]) || std::abs(pose.position[axis] - head[axis]) > 2.00001f) {
+			return false;
+		}
+	}
+	float norm = 0.0f;
+	for (float component: pose.orientation) { norm += component * component; }
+	return std::isfinite(norm) && std::abs(norm - 1.0f) < 0.00001f;
+}
+
+void TestIndependentHandPositions() {
+	Config::ConfigOptions options;
+	options.vr_enabled = true;
+	Config::Load(options);
+	Controller controller;
+	ResetInputState();
+	VirtualHeadResetPose();
+	const auto neutral_left = ReadHand(0), neutral_right = ReadHand(1);
+	Check(Near(neutral_left.position, {-0.25f, 1.26f, -0.45f}) &&
+	          Near(neutral_right.position, {0.25f, 1.26f, -0.45f}), "neutral hand positions changed");
+
+	VirtualHeadMouseMotion(180.0f, -100.0f);
+	VirtualHandMouseMotion(0, 35.0f, -20.0f);
+	const auto before_left = ReadHand(0), before_right = ReadHand(1);
+	VirtualHandBeginPositionControl(0);
+	VirtualHandBeginPositionControl(1);
+	Check(SamePose(ReadHand(0), before_left) && SamePose(ReadHand(1), before_right),
+	      "entering position control changed the current position or wrist orientation");
+	VirtualHeadMouseMotion(-310.0f, 170.0f);
+	VirtualHandBeginPositionControl(0);
+	Check(SamePose(ReadHand(0), before_left) && SamePose(ReadHand(1), before_right),
+	      "head motion or re-entering position control dragged a detached hand");
+	VirtualHandMouseMotion(0, -45.0f, 30.0f);
+	Check(Near(ReadHand(0).position, before_left.position) &&
+	          !Near(ReadHand(0).orientation, before_left.orientation) &&
+	          SamePose(ReadHand(1), before_right), "left wrist aim moved a hand or changed the right wrist");
+	{
+		const ScopedEnvironment left_override("KYTY_VR_LEFT_AIM_YAW", "0.8");
+		const ScopedEnvironment right_override("KYTY_VR_RIGHT_AIM_PITCH", "-0.6");
+		VirtualHeadResetPose();
+		VirtualHeadMouseMotion(-170.0f, 90.0f);
+		const auto overridden_left = ReadHand(0), overridden_right = ReadHand(1);
+		VirtualHandBeginPositionControl(0);
+		VirtualHandBeginPositionControl(1);
+		VirtualHeadMouseMotion(210.0f, -130.0f);
+		Check(SamePose(ReadHand(0), overridden_left) && SamePose(ReadHand(1), overridden_right),
+		      "position control discarded a nondefault wrist aim override");
+	}
+
+	VirtualHeadResetPose();
+	VirtualHandBeginPositionControl(0);
+	VirtualHandBeginPositionControl(1);
+	constexpr float quarter_turn_pixels = -1.57079632679f / 0.0025f;
+	VirtualHeadMouseMotion(quarter_turn_pixels, 0.0f);
+	VirtualHandMovePosition(1, 0.1f, 0.2f, 0.3f);
+	Check(Near(ReadHand(1).position, {-0.05f, 1.46f, -0.55f}) &&
+	          SamePose(ReadHand(0), neutral_left),
+	      "position deltas did not use the current view's right/up/forward axes");
+	VirtualHandAdjustReach(1, 1.0f);
+	Check(Near(ReadHand(1).position, {-0.13f, 1.46f, -0.55f}),
+	      "independent reach did not move along the current view depth");
+	const auto stationary_right = ReadHand(1);
+	SetAxis(1, Axis::RightX, 255);
+	for (int frame = 0; frame < 10; ++frame) { now += 33; (void)ReadHand(1); }
+	ResetInputState();
+	Check(SamePose(ReadHand(1), stationary_right), "right-stick head turning dragged an independent hand");
+
+	VirtualHeadResetPose();
+	const float meeting_point[3] = {0.1f, 2.3f, 0.3f};
+	VirtualHandSetPosition(0, meeting_point);
+	VirtualHandSetPosition(1, meeting_point);
+	Check(Near(ReadHand(0).position, {0.1f, 2.3f, 0.3f}) &&
+	          Near(ReadHand(1).position, ReadHand(0).position),
+	      "hands could not meet above and behind the headset");
+	VirtualHandMovePosition(0, -0.4f, 0.0f, 0.0f);
+	Check(Near(ReadHand(0).position, {-0.3f, 2.3f, 0.3f}) &&
+	          Near(ReadHand(1).position, {0.1f, 2.3f, 0.3f}), "moving the left hand changed the right position");
+	const auto valid_left = ReadHand(0);
+	const float invalid_position[3] = {0.0f, std::numeric_limits<float>::quiet_NaN(), 0.0f};
+	VirtualHandSetPosition(0, invalid_position);
+	VirtualHandSetPosition(0, nullptr);
+	VirtualHandMovePosition(0, 0.0f, std::numeric_limits<float>::infinity(), 0.0f);
+	VirtualHandBeginPositionControl(-1);
+	VirtualHandMovePosition(2, 1.0f, 1.0f, 1.0f);
+	VirtualHandSetPosition(2, meeting_point);
+	Check(SamePose(ReadHand(0), valid_left), "invalid hand input corrupted a valid pose");
+	const float outside_workspace[3] = {-100.0f, 100.0f, 100.0f};
+	VirtualHandSetPosition(0, outside_workspace);
+	Check(Near(ReadHand(0).position, {-2.0f, 3.6f, 2.0f}), "absolute position escaped the desktop workspace");
+	VirtualHandMovePosition(0, 100.0f, -100.0f, 100.0f);
+	Check(Near(ReadHand(0).position, {2.0f, -0.4f, -2.0f}), "position motion escaped the desktop workspace");
+
+	VirtualHeadResetPose();
+	Check(SamePose(ReadHand(0), neutral_left) && SamePose(ReadHand(1), neutral_right),
+	      "desktop reset did not restore both neutral hands");
+	VirtualHandAdjustReach(1, 100.0f);
+	Check(Near(ReadHand(1).position, {0.25f, 1.26f, -1.2f}), "legacy maximum reach changed after reset");
+	VirtualHandAdjustReach(1, -100.0f);
+	Check(Near(ReadHand(1).position, {0.25f, 1.26f, -0.2f}), "legacy minimum reach changed after reset");
+	VirtualHeadMouseMotion(100.0f, 0.0f);
+	Check(!Near(ReadHand(0).position, neutral_left.position), "reset left an untouched hand detached");
+	VirtualHeadResetPose();
+}
+
+void PressHostKey(SDL_Keycode key) {
+	Libs::Graphics::HostInputKey(key, true);
+	Libs::Graphics::HostInputKey(key, false);
+}
+
+void PollHostMouse(float dx, float dy) {
+	SDL_Event event {};
+	// A newly selected mode first drains deltas from its predecessor.
+	(void)Libs::Graphics::HostInputWaitEvent(&event, 0);
+	now += 33;
+	mouse_dx = dx;
+	mouse_dy = dy;
+	(void)Libs::Graphics::HostInputWaitEvent(&event, 0);
+}
+
+void TestDesktopHandBindings(bool custom) {
+	Config::ConfigOptions options;
+	options.vr_enabled = true;
+	if (custom) { options.keymap = {"Square=F2", "Cross=F3", "Circle=F5"}; }
+	Config::Load(options);
+	Controller controller;
+	ResetInputState();
+	VirtualHeadResetPose();
+	using namespace Libs::Graphics;
+	HostInputInit(test_window);
+	if (custom) {
+		const std::pair<SDL_Keycode, uint32_t> keys[] = {
+		    {SDLK_F2, PAD_BUTTON_SQUARE}, {SDLK_F3, PAD_BUTTON_CROSS}, {SDLK_F5, PAD_BUTTON_CIRCLE}};
+		for (const auto [key, button]: keys) {
+			HostInputKey(key, true);
+			PadData data {};
+			Check(PadReadState(1, &data) == OK && data.buttons == button && !relative_mouse_enabled,
+			      "a desktop hand hotkey overrode its custom binding");
+			HostInputKey(key, false);
+			Check(PadReadState(1, &data) == OK && data.buttons == 0, "custom hotkey release was lost");
+		}
+		HostInputShutdown();
+		return;
+	}
+
+	const auto left = ReadHand(0), right = ReadHand(1);
+	relative_mouse_allowed = false;
+	PressHostKey(SDLK_F2);
+	Check(!relative_mouse_enabled, "failed relative-mouse capture enabled position control");
+	VirtualHeadMouseMotion(30.0f, 0.0f);
+	Check(!SamePose(ReadHand(0), left), "failed mouse capture detached the hand");
+	VirtualHeadResetPose();
+	relative_mouse_allowed = true;
+	PressHostKey(SDLK_F2);
+	Check(relative_mouse_enabled, "F2 did not capture left-hand position input");
+	HostInputMouseButton(SDL_BUTTON_MIDDLE, true);
+	PollHostMouse(100.0f, -50.0f);
+	Check(Near(ReadHand(0).position, {-0.05f, 1.36f, -0.45f}) && SamePose(ReadHand(1), right),
+	      "F2 mouse motion did not move only the left hand at two millimetres per pixel");
+	HostInputMouseWheel(1.0f, false);
+	Check(Near(ReadHand(0).position, {-0.05f, 1.36f, -0.53f}) && SamePose(ReadHand(1), right),
+	      "unmodified wheel did not select the left position-control hand");
+	const auto placed_left = ReadHand(0);
+	PressHostKey(SDLK_F3);
+	HostInputMouseButton(SDL_BUTTON_LEFT, true);
+	PollHostMouse(-50.0f, 25.0f);
+	Check(Near(ReadHand(1).position, {0.15f, 1.21f, -0.45f}) && SamePose(ReadHand(0), placed_left),
+	      "F3 failed to preserve the left hand while positioning the right");
+	PadData data {};
+	Check(PadReadState(1, &data) == OK && data.analog_buttons_l2 == 255 &&
+	          data.analog_buttons_r2 == 255 && (data.buttons & PAD_BUTTON_L3) == 0,
+	      "hand placement lost held grips or emitted a Shift/L3 press");
+	HostInputMouseButton(SDL_BUTTON_MIDDLE, false);
+	Check(PadReadState(1, &data) == OK && data.analog_buttons_l2 == 0 && data.analog_buttons_r2 == 255,
+	      "releasing the left grip also released the right");
+	HostInputMouseButton(SDL_BUTTON_LEFT, false);
+	HostInputMouseWheel(1.0f, false);
+	Check(Near(ReadHand(1).position, {0.15f, 1.21f, -0.53f}), "right-hand wheel routing was lost");
+	HostInputMouseWheel(1.0f, true);
+	Check(Near(ReadHand(0).position, {-0.05f, 1.36f, -0.61f}), "legacy Shift/wheel left selection changed");
+	const auto before_aim = ReadHand(0), parked_right = ReadHand(1);
+	PressHostKey(SDLK_F5);
+	PollHostMouse(50.0f, -25.0f);
+	Check(Near(ReadHand(0).position, before_aim.position) &&
+	          !Near(ReadHand(0).orientation, before_aim.orientation) && SamePose(ReadHand(1), parked_right),
+	      "F5 did not switch from right position to independent left wrist aim");
+	const auto parked_left = ReadHand(0);
+	HostInputToggleMouseToHead();
+	PollHostMouse(120.0f, -60.0f);
+	Check(SamePose(ReadHand(0), parked_left) && SamePose(ReadHand(1), parked_right),
+	      "mouse head-look dragged placed hands");
+	HostInputToggleMouseToHand(1);
+	PollHostMouse(-40.0f, 30.0f);
+	Check(Near(ReadHand(1).position, parked_right.position) &&
+	          !Near(ReadHand(1).orientation, parked_right.orientation) && SamePose(ReadHand(0), parked_left),
+	      "legacy right wrist aim retained another mouse mode");
+	PressHostKey(SDLK_F3);
+	const auto before_focus_loss = ReadHand(1);
+	window_has_focus = false;
+	PollHostMouse(200.0f, 100.0f);
+	window_has_focus = true;
+	PollHostMouse(0.0f, 0.0f);
+	Check(SamePose(ReadHand(1), before_focus_loss), "focus loss/re-entry applied stale hand motion");
+	HostInputToggleMouseToJoystick();
+	PollHostMouse(20.0f, 0.0f);
+	Check(PadReadState(1, &data) == OK && data.right_stick_x > 128,
+	      "F7 mode retained hand positioning instead of emitting stick input");
+	PressHostKey(SDLK_F2);
+	Check(PadReadState(1, &data) == OK && data.right_stick_x == 128 && data.right_stick_y == 128,
+	      "entering hand positioning retained mouse-generated stick deflection");
+	VirtualHeadResetPose();
+	Check(SamePose(ReadHand(0), left) && SamePose(ReadHand(1), right), "F9 in position mode did not recenter");
+	HostInputMouseWheel(1.0f, false);
+	const auto after_reset_wheel = ReadHand(0);
+	Check(Near(after_reset_wheel.position, {-0.25f, 1.26f, -0.53f}),
+	      "wheel after F9 did not resume the selected hand's depth control");
+	VirtualHeadMouseMotion(-80.0f, -20.0f);
+	Check(SamePose(ReadHand(0), after_reset_wheel), "wheel after F9 left the hand following head turns");
+	VirtualHeadResetPose();
+	PollHostMouse(50.0f, -25.0f);
+	Check(Near(ReadHand(0).position, {-0.15f, 1.31f, -0.45f}) && SamePose(ReadHand(1), right),
+	      "XY motion after F9 did not resume the selected hand from neutral");
+	VirtualHeadMouseMotion(190.0f, -110.0f);
+	const float extreme = std::numeric_limits<float>::max();
+	PollHostMouse(extreme, -extreme);
+	HostInputMouseWheel(extreme, false);
+	Check(InHandWorkspace(ReadHand(0)), "finite extreme mouse/wheel input produced an invalid pose");
+	VirtualHandMouseMotion(0, extreme, -extreme);
+	VirtualHandMovePosition(0, extreme, -extreme, extreme);
+	Check(InHandWorkspace(ReadHand(0)), "finite extreme wrist/direct motion produced an invalid pose");
+	const auto retained = ReadHand(0);
+	PressHostKey(SDLK_F2);
+	Check(!relative_mouse_enabled && SamePose(ReadHand(0), retained), "leaving position mode reset the hand");
+	VirtualHeadResetPose();
+	Check(SamePose(ReadHand(0), left) && SamePose(ReadHand(1), right), "reset after mouse control lost neutral pose");
+	HostInputShutdown();
+	options.vr_enabled = false;
+	Config::Load(options);
+	PressHostKey(SDLK_F2);
+	Check(!relative_mouse_enabled, "hand positioning captured the mouse outside VR mode");
+}
 
 DualSenseEffects LastEffect() {
 	Check(!effects.empty(), "missing trigger output");
@@ -647,10 +970,26 @@ void TestTriggerEffectState() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+	const ScopedEnvironment no_hand_grid("KYTY_VR_AIM_GRID", nullptr);
+	const ScopedEnvironment no_gaze_grid("KYTY_VR_GAZE_GRID", nullptr);
+	const ScopedEnvironment world_hands("KYTY_VR_HAND_LOCAL_ORIGIN", nullptr);
+	const ScopedEnvironment left_yaw("KYTY_VR_LEFT_AIM_YAW", nullptr);
+	const ScopedEnvironment right_yaw("KYTY_VR_RIGHT_AIM_YAW", nullptr);
+	const ScopedEnvironment left_pitch("KYTY_VR_LEFT_AIM_PITCH", nullptr);
+	const ScopedEnvironment right_pitch("KYTY_VR_RIGHT_AIM_PITCH", nullptr);
 	Config::Initialize();
+	// InputMap is intentionally immutable for the process. Run the custom-map
+	// variant in a fresh process, without changing production keymap lifetime.
+	if (argc == 2 && std::strcmp(argv[1], "--custom-vr-hand-bindings") == 0) {
+		TestDesktopHandBindings(true);
+		Config::Shutdown();
+		return 0;
+	}
 	TestPadPortOwnership();
 	TestVirtualSenseInput();
+	TestIndependentHandPositions();
+	TestDesktopHandBindings(false);
 	TestSettingCycles();
 	TestGlobalControllerLevels();
 	// Each following test initializes another controller and requires strong defaults.

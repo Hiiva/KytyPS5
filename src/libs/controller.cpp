@@ -200,6 +200,65 @@ static uint64_t g_virtual_head_updated_us = 0u;
 static float g_virtual_hand_reach[2] = {0.45f, 0.45f};
 static float g_virtual_hand_aim_yaw[2] = {-0.15f, 0.15f};
 static float g_virtual_hand_aim_pitch[2] = {0.14f, 0.14f};
+static bool g_virtual_hand_aim_initialized = false;
+
+struct VirtualHandPositionState {
+    bool independent = false;
+    std::array<float, 3> position {};
+    std::array<float, 4> base_orientation {0.0f, 0.0f, 0.0f, 1.0f};
+};
+static std::array<VirtualHandPositionState, 2> g_virtual_hand_position;
+static constexpr float VIRTUAL_HEAD_HEIGHT = 1.6f;
+// Initial desktop workspace setting, not a native tracker or game reach limit.
+static constexpr float VIRTUAL_HAND_WORKSPACE = 2.0f;
+
+static std::array<float, 3> RotateVirtualVector(const float q[4],
+                                              const std::array<float, 3>& v) {
+    const float tx = 2.0f * (q[1] * v[2] - q[2] * v[1]);
+    const float ty = 2.0f * (q[2] * v[0] - q[0] * v[2]);
+    const float tz = 2.0f * (q[0] * v[1] - q[1] * v[0]);
+    return {v[0] + q[3] * tx + q[1] * tz - q[2] * ty,
+            v[1] + q[3] * ty + q[2] * tx - q[0] * tz,
+            v[2] + q[3] * tz + q[0] * ty - q[1] * tx};
+}
+
+// All Locked helpers require g_virtual_head_mutex. Get the current head pose
+// before acquiring it: VirtualHeadGetPose also takes this mutex.
+static void VirtualHandFollowPositionLocked(int side, const float head_position[3],
+                                           const float head_orientation[4], float position[3]) {
+    const auto offset = RotateVirtualVector(head_orientation,
+        {side == 0 ? -0.25f : 0.25f, -0.34f, -g_virtual_hand_reach[side]});
+    for (size_t axis = 0; axis < offset.size(); ++axis) {
+        position[axis] = head_position[axis] + offset[axis];
+    }
+}
+
+static void VirtualHandBeginPositionLocked(int side, const float head_position[3],
+                                          const float head_orientation[4]) {
+    auto& hand = g_virtual_hand_position[side];
+    if (!hand.independent) {
+        VirtualHandFollowPositionLocked(side, head_position, head_orientation, hand.position.data());
+        std::copy_n(head_orientation, hand.base_orientation.size(), hand.base_orientation.begin());
+        hand.independent = true;
+    }
+}
+
+static void VirtualHandMovePositionLocked(int side, const float head_position[3],
+                                         const float head_orientation[4],
+                                         float right_m, float up_m, float forward_m) {
+    const auto delta = RotateVirtualVector(head_orientation, {right_m, up_m, -forward_m});
+    if (!std::all_of(delta.begin(), delta.end(), [](float value) { return std::isfinite(value); })) {
+        return;
+    }
+    VirtualHandBeginPositionLocked(side, head_position, head_orientation);
+    auto& position = g_virtual_hand_position[side].position;
+    for (size_t axis = 0; axis < position.size(); ++axis) {
+        position[axis] = static_cast<float>(std::clamp(
+            static_cast<double>(position[axis]) + delta[axis],
+            static_cast<double>(head_position[axis] - VIRTUAL_HAND_WORKSPACE),
+            static_cast<double>(head_position[axis] + VIRTUAL_HAND_WORKSPACE)));
+    }
+}
 
 // Fixed initial ray directions are useful for headset-free wizard navigation.
 // Mouse aim still applies normally after this initial pose has been chosen.
@@ -215,6 +274,18 @@ static float VirtualHandAimOverride(const char* name, float fallback, float mini
         return fallback;
     }
     return parsed;
+}
+
+static void VirtualHandResetAimLocked() {
+    g_virtual_hand_aim_yaw[0] = VirtualHandAimOverride(
+        "KYTY_VR_LEFT_AIM_YAW", -0.15f, -1.25f, 1.25f);
+    g_virtual_hand_aim_yaw[1] = VirtualHandAimOverride(
+        "KYTY_VR_RIGHT_AIM_YAW", 0.15f, -1.25f, 1.25f);
+    g_virtual_hand_aim_pitch[0] = VirtualHandAimOverride(
+        "KYTY_VR_LEFT_AIM_PITCH", 0.14f, -1.0f, 1.0f);
+    g_virtual_hand_aim_pitch[1] = VirtualHandAimOverride(
+        "KYTY_VR_RIGHT_AIM_PITCH", 0.14f, -1.0f, 1.0f);
+    g_virtual_hand_aim_initialized = true;
 }
 
 void VirtualHeadMouseMotion(float dx, float dy) {
@@ -234,6 +305,9 @@ void VirtualHandMouseMotion(int side, float dx, float dy) {
     }
     constexpr float sensitivity = 0.0025f;
     Common::LockGuard lock(g_virtual_head_mutex);
+    if (!g_virtual_hand_aim_initialized) {
+        VirtualHandResetAimLocked();
+    }
     g_virtual_hand_aim_yaw[side] = std::clamp(
         g_virtual_hand_aim_yaw[side] - dx * sensitivity, -1.25f, 1.25f);
     g_virtual_hand_aim_pitch[side] = std::clamp(
@@ -245,11 +319,55 @@ void VirtualHandMouseMotion(int side, float dx, float dy) {
              g_virtual_hand_aim_pitch[side], dx, dy);
     }
 }
+void VirtualHandBeginPositionControl(int side) {
+    if (!Config::VrEnabled() || side < 0 || side > 1) {
+        return;
+    }
+    float head_position[3], head_orientation[4];
+    VirtualHeadGetPose(head_position, head_orientation);
+    Common::LockGuard lock(g_virtual_head_mutex);
+    VirtualHandBeginPositionLocked(side, head_position, head_orientation);
+}
+
+void VirtualHandMovePosition(int side, float right_m, float up_m, float forward_m) {
+    if (!Config::VrEnabled() || side < 0 || side > 1 || !std::isfinite(right_m) ||
+        !std::isfinite(up_m) || !std::isfinite(forward_m)) {
+        return;
+    }
+    float head_position[3], head_orientation[4];
+    VirtualHeadGetPose(head_position, head_orientation);
+    Common::LockGuard lock(g_virtual_head_mutex);
+    VirtualHandMovePositionLocked(side, head_position, head_orientation, right_m, up_m, forward_m);
+}
+
+void VirtualHandSetPosition(int side, const float position[3]) {
+    if (!Config::VrEnabled() || side < 0 || side > 1 || position == nullptr ||
+        !std::isfinite(position[0]) || !std::isfinite(position[1]) || !std::isfinite(position[2])) {
+        return;
+    }
+    float head_position[3], head_orientation[4];
+    VirtualHeadGetPose(head_position, head_orientation);
+    Common::LockGuard lock(g_virtual_head_mutex);
+    VirtualHandBeginPositionLocked(side, head_position, head_orientation);
+    auto& target = g_virtual_hand_position[side].position;
+    for (size_t axis = 0; axis < target.size(); ++axis) {
+        target[axis] = std::clamp(position[axis], head_position[axis] - VIRTUAL_HAND_WORKSPACE,
+                                head_position[axis] + VIRTUAL_HAND_WORKSPACE);
+    }
+}
+
 void VirtualHandAdjustReach(int side, float wheel_steps) {
     if (!Config::VrEnabled() || side < 0 || side > 1 || !std::isfinite(wheel_steps)) {
         return;
     }
+    float head_position[3], head_orientation[4];
+    VirtualHeadGetPose(head_position, head_orientation);
     Common::LockGuard lock(g_virtual_head_mutex);
+    if (g_virtual_hand_position[side].independent) {
+        VirtualHandMovePositionLocked(side, head_position, head_orientation, 0.0f, 0.0f,
+                                      wheel_steps * 0.08f);
+        return;
+    }
     g_virtual_hand_reach[side] = std::clamp(
         g_virtual_hand_reach[side] + wheel_steps * 0.08f, 0.2f, 1.2f);
     LOGF("Virtual Sense %s reach=%.2f m\n",
@@ -262,14 +380,8 @@ void VirtualHeadResetPose() {
     g_virtual_head_updated_us = 0u;
     g_virtual_hand_reach[0] = 0.45f;
     g_virtual_hand_reach[1] = 0.45f;
-    g_virtual_hand_aim_yaw[0] = VirtualHandAimOverride(
-        "KYTY_VR_LEFT_AIM_YAW", -0.15f, -1.25f, 1.25f);
-    g_virtual_hand_aim_yaw[1] = VirtualHandAimOverride(
-        "KYTY_VR_RIGHT_AIM_YAW", 0.15f, -1.25f, 1.25f);
-    g_virtual_hand_aim_pitch[0] = VirtualHandAimOverride(
-        "KYTY_VR_LEFT_AIM_PITCH", 0.14f, -1.0f, 1.0f);
-    g_virtual_hand_aim_pitch[1] = VirtualHandAimOverride(
-        "KYTY_VR_RIGHT_AIM_PITCH", 0.14f, -1.0f, 1.0f);
+    g_virtual_hand_position = {};
+    VirtualHandResetAimLocked();
     LOGF("Virtual PS VR2: headset orientation recentered\n");
 }
 
@@ -320,7 +432,7 @@ void VirtualHeadGetPose(float position[3], float orientation[4]) {
     const float sp = std::sin(pitch * 0.5f);
 
     position[0] = 0.0f;
-    position[1] = 1.6f;
+    position[1] = VIRTUAL_HEAD_HEIGHT;
     position[2] = 0.0f;
     orientation[0] = cy * sp;
     orientation[1] = sy * cp;
@@ -332,45 +444,30 @@ void VirtualHandGetPose(int side, float position[3], float orientation[4]) {
     if (side < 0 || side > 1 || position == nullptr || orientation == nullptr) {
         return;
     }
-    static const bool initial_aim = [] {
-        Common::LockGuard lock(g_virtual_head_mutex);
-        g_virtual_hand_aim_yaw[0] = VirtualHandAimOverride(
-            "KYTY_VR_LEFT_AIM_YAW", -0.15f, -1.25f, 1.25f);
-        g_virtual_hand_aim_yaw[1] = VirtualHandAimOverride(
-            "KYTY_VR_RIGHT_AIM_YAW", 0.15f, -1.25f, 1.25f);
-        g_virtual_hand_aim_pitch[0] = VirtualHandAimOverride(
-            "KYTY_VR_LEFT_AIM_PITCH", 0.14f, -1.0f, 1.0f);
-        g_virtual_hand_aim_pitch[1] = VirtualHandAimOverride(
-            "KYTY_VR_RIGHT_AIM_PITCH", 0.14f, -1.0f, 1.0f);
-        return true;
-    }();
-    (void)initial_aim;
     VirtualHeadGetPose(position, orientation);
-    float reach = 0.45f;
     float aim_yaw = 0.0f;
     float aim_pitch = 0.0f;
     {
         Common::LockGuard lock(g_virtual_head_mutex);
-        reach = g_virtual_hand_reach[side];
+        if (!g_virtual_hand_aim_initialized) {
+            VirtualHandResetAimLocked();
+        }
+        const auto& hand = g_virtual_hand_position[side];
+        if (hand.independent) {
+            std::copy(hand.position.begin(), hand.position.end(), position);
+            std::copy(hand.base_orientation.begin(), hand.base_orientation.end(), orientation);
+        } else {
+            VirtualHandFollowPositionLocked(side, position, orientation, position);
+        }
         aim_yaw = g_virtual_hand_aim_yaw[side];
         aim_pitch = g_virtual_hand_aim_pitch[side];
     }
-    // Neutral Sense pose: shoulder-width hands below and ahead of the face.
-    // Rotate local offsets by the virtual headset orientation so mouse look
-    // keeps both hands in front of the user, without external tracking.
-    const float local[3] = {side == 0 ? -0.25f : 0.25f, -0.34f, -reach};
     const float qx = orientation[0];
     const float qy = orientation[1];
     const float qz = orientation[2];
     const float qw = orientation[3];
-    const float tx = 2.0f * (qy * local[2] - qz * local[1]);
-    const float ty = 2.0f * (qz * local[0] - qx * local[2]);
-    const float tz = 2.0f * (qx * local[1] - qy * local[0]);
-    position[0] += local[0] + qw * tx + qy * tz - qz * ty;
-    position[1] += local[1] + qw * ty + qz * tx - qx * tz;
-    position[2] += local[2] + qw * tz + qx * ty - qy * tx;
-    // The Sense ray orientation is independent of headset gaze. Its local
-    // yaw/pitch can be driven by desktop mouse movements in F10 mode.
+    // Aim is relative to the captured wrist base for independently placed hands,
+    // or to the current headset for untouched hands. Mouse aim keeps its bounds.
     const float cy = std::cos(aim_yaw * 0.5f);
     const float sy = std::sin(aim_yaw * 0.5f);
     const float cp = std::cos(aim_pitch * 0.5f);

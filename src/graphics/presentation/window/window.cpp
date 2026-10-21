@@ -235,8 +235,7 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 
 static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
 	if (Config::VrEnabled() && mb.wheel && mb.y != 0) {
-		const int side = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0 ? 0 : 1;
-		Controller::VirtualHandAdjustReach(side, static_cast<float>(mb.y));
+		HostInputMouseWheel(static_cast<float>(mb.y), (SDL_GetModState() & SDL_KMOD_SHIFT) != 0);
 	}
 #ifdef KYTY_DBG_INPUT
 	if (mb.wheel) {

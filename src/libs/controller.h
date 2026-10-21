@@ -83,6 +83,13 @@ void VirtualHeadGetPose(float position[3], float orientation[4]);
 void VirtualHandGetPose(int side, float position[3], float orientation[4]);
 void VirtualHandAdjustReach(int side, float wheel_steps);
 void VirtualHandMouseMotion(int side, float dx, float dy);
+// Position control detaches one hand from head turns until VirtualHeadResetPose.
+// Stored coordinates are tracker metres (+X right, +Y up, -Z forward), before
+// any optional local-origin output adjustment. Motion is relative to the view
+// at the instant of input; SetPosition accepts absolute tracker coordinates.
+void VirtualHandBeginPositionControl(int side);
+void VirtualHandMovePosition(int side, float right_m, float up_m, float forward_m);
+void VirtualHandSetPosition(int side, const float position[3]);
 
 enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };
 
