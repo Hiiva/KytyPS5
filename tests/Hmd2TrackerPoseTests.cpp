@@ -46,6 +46,8 @@ void HeadsetPose() {
 	VERIFY(ReadU32(bytes, 0x04) == 1u);
 	VERIFY(ReadU32(bytes, 0x0c) == 2u);
 	VERIFY(ReadU32(bytes, 0x18) == 1u);
+	VERIFY(ReadU32(bytes, 0x1c) == 9u);
+	VERIFY(ReadU32(bytes, 0x20) == 9u);
 	uint64_t decoded_time = 0;
 	std::memcpy(&decoded_time, bytes.data() + 0x10, sizeof(decoded_time));
 	VERIFY(decoded_time == time);
@@ -62,7 +64,7 @@ void HeadsetPose() {
 		Near(ReadFloat(bytes, pose + 0x1c), 1.0f);
 	}
 	// Unknown native fields and result padding must remain untouched.
-	VERIFY(bytes[0x00] == 0xcc && bytes[0x1c] == 0xcc);
+	VERIFY(bytes[0x00] == 0xcc && bytes[0x24] == 0xcc);
 	VERIFY(bytes[0x150] == 0xcc);
 }
 
@@ -81,8 +83,14 @@ void RotatedEyes() {
 
 void ControllerPose() {
 	std::array<uint8_t, 0x160> bytes {};
+	bytes.fill(0xcc);
 	VERIFY(Write(bytes, {0.2f, 1.1f, -0.4f}, {0.0f, 0.0f, 0.0f, 5.0f},
 	             123u, false));
+	// Horizon gates translation on +0x1c and orientation on +0x18; neither
+	// may depend on the stack bytes left behind by an earlier native call.
+	VERIFY(ReadU32(bytes, 0x18) == 1u);
+	Near(static_cast<int32_t>(ReadU32(bytes, 0x1c)) / 9.0f, 1.0f);
+	Near(static_cast<int32_t>(ReadU32(bytes, 0x20)) / 9.0f, 1.0f);
 	for (size_t pose : {size_t {0x60}, size_t {0xa0}, size_t {0xe0}, size_t {0x120}}) {
 		Near(ReadFloat(bytes, pose), 0.2f);
 		Near(ReadFloat(bytes, pose + 4), 1.1f);

@@ -67,10 +67,15 @@ struct Pose {
 	const uint32_t valid = 1u;
 	const uint32_t mode  = 2u; // 6DoF (both translation and orientation)
 	const uint32_t pose_state = 1u;
+	// The guest normalizes both quality fields by 9 and discards controller
+	// translation when position confidence is zero, even with a valid pose.
+	const uint32_t confidence = 9u;
 	std::memcpy(out.data() + 0x04u, &valid, sizeof(valid));
 	std::memcpy(out.data() + 0x0cu, &mode, sizeof(mode));
 	std::memcpy(out.data() + 0x10u, &predicted_time, sizeof(predicted_time));
 	std::memcpy(out.data() + 0x18u, &pose_state, sizeof(pose_state));
+	std::memcpy(out.data() + 0x1cu, &confidence, sizeof(confidence));
+	std::memcpy(out.data() + 0x20u, &confidence, sizeof(confidence));
 
 	const auto write_pose = [&](size_t offset, const std::array<float, 3>& p) {
 		std::memcpy(out.data() + offset, p.data(), 3u * sizeof(float));

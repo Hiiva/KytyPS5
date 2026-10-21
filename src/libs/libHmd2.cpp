@@ -531,11 +531,12 @@ static int32_t KYTY_SYSV_ABI VrTracker2GetResult(const void* param, void* result
              handle, head_pos[0], head_pos[1], head_pos[2],
              quat[0], quat[1], quat[2], quat[3]);
     }
-    // Optional fuller 6DoF result derived from the four pose blocks the
-    // Horizon caller reads at +0x60, +0xa0, +0xe0 and +0x120. In the default
-    // path, preserve the previously verified calibration behavior.
+    // Horizon rejects controller poses with missing state or confidence.
+    // Initialize their complete result by default, leaving headset tracking
+    // opt-in. An explicit 0 retains partial results for diagnostics.
     if (const char* full = std::getenv("KYTY_VR_FULL_TRACKING_RESULT");
-        full != nullptr && full[0] == '1' && full[1] == '\0') {
+        (full != nullptr && std::strcmp(full, "1") == 0) ||
+        ((handle == 2 || handle == 3) && (full == nullptr || full[0] == '\0'))) {
         if (!Graphics::HostMemoryRangeIsReadable(
                 reinterpret_cast<uint64_t>(param), 0x20u) ||
             !Graphics::HostMemoryRangeIsReadable(
@@ -559,7 +560,8 @@ static int32_t KYTY_SYSV_ABI VrTracker2GetResult(const void* param, void* result
                  Hmd2TrackerPose::kInterpupillaryDistance);
         }
         return OK;
-    }    std::memcpy(out + 0x60, head_pos, sizeof(head_pos));
+    }
+    std::memcpy(out + 0x60, head_pos, sizeof(head_pos));
     std::memcpy(out + 0x70, quat, sizeof(quat));
     std::memcpy(out + 0xb0, quat, sizeof(quat));
     std::memcpy(out + 0xf0, quat, sizeof(quat));
