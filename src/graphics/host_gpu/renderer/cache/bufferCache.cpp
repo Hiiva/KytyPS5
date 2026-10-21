@@ -294,6 +294,15 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	});
 }
 
+const Buffer* BufferCache::FindRegisteredBuffer(uint64_t vaddr, uint64_t size) const {
+	if (vaddr == 0 || size == 0 || !GuestRange {vaddr, size}.Valid()) return nullptr;
+	const auto upper = m_buffers.upper_bound(vaddr);
+	if (upper == m_buffers.begin()) return nullptr;
+	const auto* owner = m_slot_buffers.try_get(std::prev(upper)->second);
+	return owner != nullptr && !owner->is_deleted && owner->IsInBounds(vaddr, size)
+	           ? owner : nullptr;
+}
+
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;

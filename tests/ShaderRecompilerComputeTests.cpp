@@ -191,6 +191,10 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  static void RetireBuffer(BufferCache &cache, BufferId id) {
+    cache.DeleteBuffer(id);
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -392,6 +396,42 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  using PanelGpuScalarPlan = RenderExecutor::PanelGpuScalarPlan;
+
+  static const char *PlanPanelGpuScalarCapture(const RenderExecutor &executor,
+      const CommandBuffer &command, std::span<const RenderColorInfo> colors,
+      ImageId depth, const RenderState &rendering,
+      std::span<PreparedBindings *const> stages, PanelGpuScalarPlan &plan) {
+    return executor.PlanPanelGpuScalarCapture(command, colors, depth, rendering,
+                                               stages, plan);
+  }
+
+  static bool QueuePanelGpuScalarReadback(RenderExecutor &executor,
+      CommandBuffer &command, const PanelGpuScalarPlan &plan,
+      Common::UniqueFunction<void, bool, uint32_t> completion) {
+    return executor.QueuePanelGpuScalarReadback(command, plan, std::move(completion));
+  }
+
+  static const char *PlanPanelGpuHdrUvCapture(const RenderExecutor &executor,
+      const CommandBuffer &command, std::span<const RenderColorInfo> colors,
+      ImageId depth, const RenderState &rendering,
+      std::span<PreparedBindings *const> stages, PanelGpuScalarPlan &plan) {
+    return executor.PlanPanelGpuHdrUvCapture(command, colors, depth, rendering, stages, plan);
+  }
+
+  static bool QueuePanelGpuHdrUvReadback(RenderExecutor &executor,
+      CommandBuffer &command, const PanelGpuScalarPlan &plan,
+      Common::UniqueFunction<void, bool, std::array<uint32_t, 12>> completion) {
+    return executor.QueuePanelGpuHdrUvReadback(command, plan, std::move(completion));
+  }
+
+  static std::array<uint64_t, 5> PanelGpuScalarCaptureState(
+      const RenderExecutor &executor) {
+    return {executor.m_gpu_scalar_capture.index, executor.m_gpu_scalar_capture.misses,
+            executor.m_gpu_scalar_capture.bytes, executor.m_gpu_scalar_decisions,
+            executor.m_gpu_scalar_last_frame};
+  }
+
   static void DrawIndex(RenderExecutor &executor, CommandBuffer &command,
                         const DrawIndexArgs &args) {
     executor.DrawIndex(0, command, args);
@@ -16215,6 +16255,492 @@ public:
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
     m_device.destroyShaderModule(module, nullptr);
+  }
+
+  void CheckPanelGpuScalarCapture() {
+    constexpr const char *name = "PanelGpuScalarCapture";
+    constexpr uintptr_t base = 0x000000020a800000ull;
+    constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t guest = base + 0x2800;
+    constexpr uint64_t declared_bytes = 4384;
+    constexpr uint64_t scalar_offset = 2168;
+    constexpr uint64_t uv_guest = guest + 0x200, uv_declared_bytes = 128;
+    constexpr std::array<uint32_t, 12> uv_a{
+        0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u,
+        0x80000000u, 0x7fc01234u, 0x3e800000u, 0x3f000000u,
+        0x40a00000u, 0x40c00000u, 0x40e00000u, 0x41000000u};
+    constexpr uint32_t gpu_a = 0x3e800000u, gpu_b = 0x3f600000u;
+    constexpr uint32_t guest_c = 0x3f200000u;
+    constexpr uint32_t left_guard = 0x12345678u, right_guard = 0x89abcdefu;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    auto &textures = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    registers.SetRenderTargetMask(0xf);
+    registers.SetShaderMask(0xf);
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &command = scheduler.Current();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+        allocation_size, 0, &physical) == 0, "scalar fixture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, allocation_size, 0x3, 0x10, physical, allocation_size) == 0 &&
+        mapped == reinterpret_cast<void *>(base), "scalar fixture mapping failed");
+    std::fill_n(static_cast<uint32_t *>(mapped), allocation_size / 4, guest_c);
+    context.MapMemory(base, allocation_size);
+
+    ShaderBufferResource descriptor{{static_cast<uint32_t>(guest),
+        static_cast<uint32_t>(guest >> 32u) | 0x00100000u, 0x112u, 0x0004dfacu}};
+    ShaderBufferResource uv_descriptor{{static_cast<uint32_t>(uv_guest),
+        static_cast<uint32_t>(uv_guest >> 32u) | 0x00100000u, 8u, 0x0004dfacu}};
+    GraphicsCase fragment_case;
+    std::optional<CompiledShader> compiled_fragment;
+    if (RasterizationSupported()) {
+      // Resource discovery may inspect guest memory. Complete it while backing C
+      // is clean, before any diagnostic copy or GPU write is recorded.
+      fragment_case.name = name;
+      fragment_case.has_user_data = true;
+      std::copy_n(descriptor.fields, 4, fragment_case.user_data.begin());
+      fragment_case.fragment_code = {
+          EncodeSmem0(0x08, 16), EncodeSmem1(scalar_offset, 125),
+          EncodeVop1(0x01, 0, 16), EncodeExp0(0, 0xf), EncodeExp1(0, 0, 0, 0)};
+      AppendEnd(&fragment_case.fragment_code);
+      compiled_fragment.emplace(CompileFragmentCase(fragment_case));
+    }
+
+    // The guest backing deliberately differs from every GPU-written value.
+    // Mark the resource GPU-owned so ordinary descriptor preparation must retain it.
+    auto [owner, native_offset] = cache.ObtainBuffer(guest, declared_bytes, true);
+    const auto owner_id = BufferCacheTestAccess::PageOwner(cache, guest);
+    Require(name, "cached native owner", owner_id && owner->Usage() == MemoryUsage::DeviceLocal &&
+        native_offset >= 4 && native_offset + declared_bytes + 4 <= owner->Size(),
+        "fixture did not obtain the intended cached allocation");
+    owner->Fill(native_offset - 4, declared_bytes + 8, 0x5a5a5a5au);
+    owner->Fill(native_offset + scalar_offset - 4, 4, left_guard);
+    owner->Fill(native_offset + scalar_offset, 4, gpu_a);
+    owner->Fill(native_offset + scalar_offset + 4, 4, right_guard);
+    const auto uv_native_offset = native_offset + (uv_guest - guest);
+    owner->Fill(uv_native_offset - 4, 4, left_guard);
+    for (uint32_t i = 0; i < uv_a.size(); ++i) {
+      owner->Fill(uv_native_offset + i * 4u, 4, uv_a[i]);
+    }
+    owner->Fill(uv_native_offset + sizeof(uv_a), 4, right_guard);
+    const auto unrelated_id = cache.FindBuffer(base + 0x8000, 16);
+
+    using Plan = RenderExecutorTestAccess::PanelGpuScalarPlan;
+    struct Fixture {
+      ShaderRecompiler::IR::CompiledShaderInfo program;
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      PreparedBindings prepared;
+      RenderState rendering{};
+      std::vector<RenderColorInfo> colors;
+    } fixture;
+    fixture.program.stage = ShaderType::Pixel;
+    fixture.program.shader_hash = 0x83b1c2d863c50cf3ull;
+    fixture.program.info.buffers.resize(2);
+    auto &resource = fixture.program.info.buffers[1];
+    resource.descriptor_index = 1;
+    resource.first_use_pc = 0x40;
+    resource.read = resource.scalar = true;
+    auto &uv_resource = fixture.program.info.buffers[0];
+    uv_resource.descriptor_index = 0;
+    uv_resource.first_use_pc = 0x10;
+    uv_resource.read = uv_resource.scalar = true;
+    fixture.snapshot.buffers.resize(2);
+    fixture.snapshot.buffers[1].dword_count = 4;
+    std::copy_n(descriptor.fields, 4, fixture.snapshot.buffers[1].dwords.begin());
+    fixture.snapshot.buffers[0].dword_count = 4;
+    std::copy_n(uv_descriptor.fields, 4, fixture.snapshot.buffers[0].dwords.begin());
+    fixture.prepared.buffer_sources.resize(2);
+    // A stale but allocated ID must not override the actual native descriptor.
+    fixture.prepared.buffer_sources[1] = {guest, declared_bytes, unrelated_id};
+    fixture.prepared.buffer_sources[0] = {uv_guest, uv_declared_bytes, unrelated_id};
+    fixture.prepared.buffers.resize(2);
+    fixture.prepared.buffers[1] = {owner->Handle(), native_offset, declared_bytes};
+    fixture.prepared.buffers[0] = {owner->Handle(), uv_native_offset, uv_declared_bytes};
+    fixture.prepared.shader_data.resize(1);
+    ShaderStageRuntime runtime{&fixture.program, &fixture.snapshot};
+    fixture.prepared.runtime = &runtime;
+    std::array<PreparedBindings *, 1> stages{&fixture.prepared};
+    Plan plan;
+    Require(name, "exact recipe plan", RenderExecutorTestAccess::PlanPanelGpuScalarCapture(
+        executor, command, {}, {}, {}, stages, plan) == nullptr &&
+        plan.native.buffer == owner->Handle() && plan.native.offset == native_offset &&
+        plan.selected_offset == native_offset + scalar_offset && !plan.stream &&
+        plan.guest_address == guest && plan.guest_size == declared_bytes,
+        "planner lost the final descriptor, selected offset, or current owner");
+    Plan uv_plan;
+    Require(name, "exact HDR UV plan", RenderExecutorTestAccess::PlanPanelGpuHdrUvCapture(
+        executor, command, {}, {}, {}, stages, uv_plan) == nullptr &&
+        uv_plan.native.buffer == owner->Handle() && uv_plan.native.offset == uv_native_offset &&
+        uv_plan.selected_offset == uv_native_offset && !uv_plan.stream &&
+        uv_plan.guest_address == uv_guest && uv_plan.guest_size == uv_declared_bytes,
+        "HDR UV planner lost the exact 128-byte descriptor or first 48-byte selection");
+
+    RenderColorInfo color{};
+    color.desc.type = BindingType::RenderTarget;
+    color.desc.info.data = {base + 0x10000, 4 * 4 * 16};
+    color.desc.info.extent = {4, 4, 1};
+    color.desc.info.pitch = 4;
+    color.desc.info.bytes_per_block = 16;
+    color.desc.info.pixel_format = vk::Format::eR32G32B32A32Sfloat;
+    color.desc.info.guest_format = Prospero::BufferFormat::k32_32_32_32Float;
+    color.desc.info.mip_layout[0] = {0, 256, 4, 4, 0, 256, 4};
+    color.desc.info.tiling.block.bytes_per_element = 16;
+    color.desc.info.linear_slice_stride = 256;
+    color.desc.view_info.format = color.desc.info.pixel_format;
+    color.desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+    color.image_id = textures.FindImage(color.desc);
+
+    const auto capture_state = RenderExecutorTestAccess::PanelGpuScalarCaptureState(executor);
+    const auto tick = scheduler.CurrentTick();
+    const auto native_command = command.Handle();
+    uint32_t unexpected_callbacks = 0;
+    const auto Reject = [&](const char *label, const char *expected, auto mutate, bool hdr_uv = false) {
+      auto bad = fixture;
+      ShaderStageRuntime bad_runtime{&bad.program, &bad.snapshot};
+      bad.prepared.runtime = &bad_runtime;
+      mutate(bad);
+      std::array<PreparedBindings *, 1> bad_stages{&bad.prepared};
+      Plan rejected = hdr_uv ? uv_plan : plan;
+      const auto *reason = hdr_uv
+          ? RenderExecutorTestAccess::PlanPanelGpuHdrUvCapture(
+                executor, command, bad.colors, {}, bad.rendering, bad_stages, rejected)
+          : RenderExecutorTestAccess::PlanPanelGpuScalarCapture(
+                executor, command, bad.colors, {}, bad.rendering, bad_stages, rejected);
+      Require(name, label, reason != nullptr && std::strcmp(reason, expected) == 0 &&
+          rejected.native.buffer == nullptr && rejected.guest_size == 0 &&
+          rejected.selected_offset == 0, "rejected request retained a usable capture plan");
+      const bool queued = hdr_uv
+          ? RenderExecutorTestAccess::QueuePanelGpuHdrUvReadback(executor, command, rejected,
+                [&](bool, std::array<uint32_t, 12>) { ++unexpected_callbacks; })
+          : RenderExecutorTestAccess::QueuePanelGpuScalarReadback(executor, command, rejected,
+                [&](bool, uint32_t) { ++unexpected_callbacks; });
+      Require(name, "rejected plan cannot queue", !queued, "a failed plan queued a GPU readback");
+      Require(name, "rejection preserves recording and budgets",
+          scheduler.CurrentTick() == tick && command.Handle() == native_command &&
+          capture_state == RenderExecutorTestAccess::PanelGpuScalarCaptureState(executor) &&
+          cache.FindRegisteredBuffer(guest, declared_bytes) == owner &&
+          cache.HasGpuDirtyBytes(guest, declared_bytes),
+          "rejection submitted work, consumed a slot, or refreshed the source");
+    };
+    Reject("shader identity", "missing-exact-pixel-recipe",
+           [](auto &f) { f.program.shader_hash ^= 1; });
+    Reject("resource mapping", "recipe-mapping-or-access",
+           [](auto &f) { f.program.info.buffers[1].descriptor_index = 0; });
+    Reject("first-use instruction", "recipe-mapping-or-access",
+           [](auto &f) { f.program.info.buffers[1].first_use_pc += 4; });
+    Reject("read-only scalar access", "recipe-mapping-or-access",
+           [](auto &f) { f.program.info.buffers[1].scalar = false; });
+    Reject("formatted resource", "recipe-mapping-or-access",
+           [](auto &f) { f.program.info.buffers[1].formatted = true; });
+    Reject("image alias", "recipe-mapping-or-access",
+           [](auto &f) { f.program.info.buffers[1].image_alias = 0; });
+    Reject("other bound buffer write", "bound-buffer-or-address-write",
+           [](auto &f) { f.program.info.buffers[0].written = true; });
+    Reject("address write", "bound-buffer-or-address-write",
+           [](auto &f) { f.program.has_address_writes = true; });
+    Reject("unknown image binding", "bound-storage-image-or-unknown-write",
+           [](auto &f) { f.program.info.images.resize(1); });
+    Reject("descriptor word count", "descriptor-word-count",
+           [](auto &f) { f.snapshot.buffers[1].dword_count = 3; });
+    Reject("descriptor declared range", "descriptor-or-resolved-range",
+           [](auto &f) { --f.snapshot.buffers[1].dwords[2]; });
+    Reject("resolved guest range", "descriptor-or-resolved-range",
+           [](auto &f) { ++f.prepared.buffer_sources[1].address; });
+    Reject("packed buffer adjustment", "nonzero-packed-offset",
+           [](auto &f) { f.prepared.shader_data[0] = 0x00000100u; });
+    Reject("missing packed adjustment", "missing-packed-offset",
+           [](auto &f) { f.prepared.shader_data.clear(); });
+    Reject("native descriptor range", "native-range",
+           [](auto &f) { --f.prepared.buffers[1].range; });
+    Reject("native descriptor alignment", "native-range",
+           [](auto &f) { ++f.prepared.buffers[1].offset; });
+    Reject("native descriptor offset", "unproved-native-owner",
+           [](auto &f) { f.prepared.buffers[1].offset += 4; });
+    Reject("overflowed native extent", "unproved-native-owner",
+           [](auto &f) { f.prepared.buffers[1].offset = UINT64_MAX - 15; });
+    Reject("HDR UV resource mapping", "recipe-mapping-or-access",
+           [](auto &f) { f.program.info.buffers[0].descriptor_index = 1; }, true);
+    Reject("HDR UV first-use instruction", "recipe-mapping-or-access",
+           [](auto &f) { f.program.info.buffers[0].first_use_pc = 0x40; }, true);
+    Reject("HDR UV declared range", "descriptor-or-resolved-range",
+           [](auto &f) { f.snapshot.buffers[0].dwords[2] = 3; }, true);
+    Reject("HDR UV packed adjustment", "nonzero-packed-offset",
+           [](auto &f) { f.prepared.shader_data[0] = 1; }, true);
+    Reject("HDR UV native range", "native-range",
+           [](auto &f) { f.prepared.buffers[0].range = 47; }, true);
+    Reject("HDR UV native owner", "unproved-native-owner",
+           [](auto &f) { f.prepared.buffers[0].offset += 4; }, true);
+    Libs::Graphics::Buffer unregistered(m_runtime_context, scheduler,
+        MemoryUsage::DeviceLocal, owner->CpuAddress(), AllFlags, owner->Size());
+    Reject("unregistered native handle", "unproved-native-owner",
+           [&](auto &f) { f.prepared.buffers[1].buffer = unregistered.Handle(); });
+    for (const auto part : {0u, 1u, 2u}) {
+      Reject("attachment data/stencil/metadata overlap", "attachment-overlap",
+          [&](auto &f) {
+            f.colors = {color};
+            auto &info = f.colors[0].desc.info;
+            const GuestRange overlap{guest + scalar_offset, 4};
+            if (part == 0) info.data = overlap;
+            if (part == 1) info.stencil = overlap;
+            if (part == 2) info.metadata.range = overlap;
+          });
+    }
+    Reject("invalid attachment extent", "invalid-attachment-range",
+        [&](auto &f) {
+          f.colors = {color};
+          f.colors[0].desc.info.metadata.range = {UINT64_MAX - 1, 4};
+        });
+    Reject("unresolved attachment", "unresolved-attachment",
+        [&](auto &f) { f.colors = {color}; f.colors[0].image_id = {}; });
+    for (const auto clear : {0u, 1u, 2u}) {
+      Reject("color/depth/stencil load clear", "rendering-load-clear",
+          [&](auto &f) {
+            if (clear == 0) f.rendering.color_attachments[0].is_clear = true;
+            if (clear == 1) f.rendering.depth_stencil_attachment.depth_clear = true;
+            if (clear == 2) f.rendering.depth_stencil_attachment.stencil_clear = true;
+          });
+    }
+    auto &cached_color = textures.GetImage(color.image_id);
+    const auto saved_metadata = cached_color.info.metadata.range;
+    cached_color.info.metadata.range = {guest, 4};
+    Reject("cached attachment overlap", "attachment-overlap",
+           [&](auto &f) { f.colors = {color}; });
+    cached_color.info.metadata.range = saved_metadata;
+    for (const auto change : {0u, 1u, 2u}) {
+      auto invalid = plan;
+      if (change == 0) invalid.selected_offset += 4;
+      if (change == 1) invalid.owner_size += 4;
+      if (change == 2) invalid.packed_offset_word = 0x100;
+      Require(name, "queue revalidates plan",
+          !RenderExecutorTestAccess::QueuePanelGpuScalarReadback(executor, command, invalid,
+              [&](bool, uint32_t) { ++unexpected_callbacks; }),
+          "queue accepted a changed native range or owner");
+    }
+    Require(name, "queue requires completion",
+        !RenderExecutorTestAccess::QueuePanelGpuScalarReadback(executor, command, plan, {}),
+        "queue accepted an empty completion");
+    Require(name, "common queue rejects HDR UV plan",
+        !RenderExecutorTestAccess::QueuePanelGpuScalarReadback(executor, command, uv_plan,
+            [&](bool, uint32_t) { ++unexpected_callbacks; }),
+        "four-byte wrapper accepted a 48-byte recipe");
+    Require(name, "HDR UV queue rejects common plan",
+        !RenderExecutorTestAccess::QueuePanelGpuHdrUvReadback(executor, command, plan,
+            [&](bool, std::array<uint32_t, 12>) { ++unexpected_callbacks; }),
+        "48-byte wrapper accepted the four-byte recipe");
+    for (const auto change : {0u, 1u, 2u, 3u}) {
+      auto invalid = uv_plan;
+      if (change == 0) invalid.selected_offset += 4;
+      if (change == 1) invalid.native.range = sizeof(uv_a) - 4;
+      if (change == 2) invalid.owner_size -= 4;
+      if (change == 3) invalid.packed_offset_word = 1;
+      Require(name, "HDR UV queue revalidates extent",
+          !RenderExecutorTestAccess::QueuePanelGpuHdrUvReadback(executor, command, invalid,
+              [&](bool, std::array<uint32_t, 12>) { ++unexpected_callbacks; }),
+          "HDR UV queue accepted a changed range, owner, or packed adjustment");
+    }
+
+    uint32_t completed = 0, captured_bits = 0;
+    uint32_t uv_completed = 0;
+    std::array<uint32_t, 12> captured_uv{};
+    bool captured_ok = false;
+    bool uv_captured_ok = false;
+    Require(name, "production capture queue",
+        RenderExecutorTestAccess::QueuePanelGpuScalarReadback(executor, command, plan,
+            [&](bool success, uint32_t bits) {
+              captured_ok = success;
+              captured_bits = bits;
+              ++completed;
+            }), "production scalar readback was not queued");
+    Require(name, "production HDR UV capture queue",
+        RenderExecutorTestAccess::QueuePanelGpuHdrUvReadback(executor, command, uv_plan,
+            [&](bool success, std::array<uint32_t, 12> bits) {
+              uv_captured_ok = success;
+              captured_uv = bits;
+              ++uv_completed;
+            }), "production HDR UV readback was not queued after the common scalar");
+    scheduler.PopPendingOperations();
+    Require(name, "deferred capture", completed == 0 && uv_completed == 0 && unexpected_callbacks == 0 &&
+        scheduler.CurrentTick() == tick, "capture completed or submitted before its GPU tick");
+
+    ShaderProgram vertex_shader{}, pixel_shader{};
+    Buffer vertex_buffer{};
+    if (RasterizationSupported()) {
+      // A real recompiled SMEM fragment consumes the same native range after the
+      // diagnostic copy. No fixture-side CPU read supplies its expected value.
+      auto &fragment = *compiled_fragment;
+      vertex_shader = {1, CreateShaderModule(name, TestSpv::MakePassthroughVertexSpirv(false))};
+      pixel_shader = {2, CreateShaderModule(name, fragment.spirv)};
+      ShaderRecompiler::IR::CompiledShaderInfo vertex_program{};
+      vertex_program.stage = ShaderType::Vertex;
+      vertex_program.info.vertex_fetch_components[0] = 2;
+      vertex_program.info.vertex_fetch_components[1] = 4;
+      ShaderRecompiler::IR::CompiledShaderInfo pixel_program{};
+      pixel_program.stage = ShaderType::Pixel;
+      pixel_program.info = fragment.program.info;
+      pixel_program.bindings = fragment.program.bindings;
+      ShaderRecompiler::IR::ResourceSnapshot vertex_snapshot;
+      ShaderVertexInputInfo vertex{};
+      vertex.stage = {&vertex_program, &vertex_snapshot};
+      vertex.resources_num = 2;
+      vertex.buffers_num = 1;
+      vertex.buffers[0].stride = 6 * sizeof(float);
+      vertex.resources[1].UpdateAddress48(2 * sizeof(float));
+      for (uint32_t i = 0; i < 2; ++i) {
+        const auto format = i == 0 ? Prospero::BufferFormat::k32_32Float
+                                  : Prospero::BufferFormat::k32_32_32_32Float;
+        vertex.resources[i].fields[3] = DstSel(4, 5, 6, 7) |
+            (static_cast<uint32_t>(format) << 12u);
+        vertex.resources_dst[i].registers_num = i == 0 ? 2 : 4;
+      }
+      ShaderPixelInputInfo pixel{};
+      pixel.stage = {&pixel_program, &fragment.resources};
+      RenderDepthInfo depth{};
+      auto &pipeline = context.GetPipelineCache().GetGraphicsPipeline(
+          std::span{&color, 1u}, depth, std::span{&vertex, 1u}, command, &pixel,
+          vk::PrimitiveTopology::eTriangleList, false,
+          PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
+      const std::array<float, 18> vertices{
+          -1, -1, 0, 0, 0, 1, 3, -1, 0, 0, 0, 1, -1, 3, 0, 0, 0, 1};
+      std::vector<uint32_t> words(vertices.size());
+      std::memcpy(words.data(), vertices.data(), sizeof(vertices));
+      vertex_buffer = CreateHostBuffer(name, sizeof(vertices),
+          vk::BufferUsageFlagBits::eVertexBuffer, words);
+      RenderExecutorTestAccess::BindRenderTarget(executor, color.image_id);
+      auto bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
+          executor, vertex.stage, pixel.stage, true);
+      Require(name, "fragment final native descriptor", bindings.pixel &&
+          bindings.pixel->buffers.size() == 1 &&
+          bindings.pixel->buffers[0].buffer == plan.native.buffer &&
+          bindings.pixel->buffers[0].offset == plan.native.offset &&
+          bindings.pixel->buffers[0].range == plan.native.range,
+          "fragment preparation refreshed guest C or rebound a different native range");
+      std::array<PreparedBindings *, 2> draw_stages{&bindings.vertex[0], &*bindings.pixel};
+      auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, command, &color, 1, depth, draw_stages);
+      RenderExecutorTestAccess::CommitBindings(
+          executor, command, pipeline, bindings.vertex[0], *bindings.pixel);
+      rendering.color_attachments[0].is_clear = true;
+      rendering.color_attachments[0].clear_value = {};
+      command.BeginRendering(rendering);
+      const auto cmd = command.Handle();
+      cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+      const vk::Viewport viewport{0, 0, 4, 4, 0, 1};
+      const vk::Rect2D scissor{{0, 0}, {4, 4}};
+      cmd.setViewportWithCount(1, &viewport);
+      cmd.setScissorWithCount(1, &scissor);
+      cmd.setLineWidth(1);
+      cmd.setDepthTestEnable(false);
+      cmd.setDepthWriteEnable(false);
+      cmd.setDepthCompareOp(vk::CompareOp::eAlways);
+#if !defined(__APPLE__)
+      cmd.setDepthBoundsTestEnable(false);
+#endif
+      cmd.setDepthBiasEnable(false);
+      cmd.setStencilTestEnable(false);
+      const vk::Bool32 write = true;
+      cmd.setColorWriteEnableEXT(1, &write);
+      cmd.setAttachmentFeedbackLoopEnableEXT({});
+      const vk::DeviceSize offset = 0;
+      cmd.bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
+      cmd.draw(3, 1, 0, 0);
+      command.EndRendering();
+      RenderExecutorTestAccess::ResetBindings(executor);
+    } else {
+      SkipRasterizationCases(1);
+      std::printf("[skip]    PanelGpuScalarCapture fragment rasterization unsupported\n");
+    }
+
+    Require(name, "draw preserves deferred tick", completed == 0 && uv_completed == 0 &&
+        scheduler.CurrentTick() == tick,
+        "fragment preparation or draw forced completion before the later GPU overwrite");
+    owner->Fill(plan.selected_offset, 4, gpu_b);
+    owner->Fill(uv_plan.selected_offset, sizeof(uv_a), gpu_b);
+    Libs::Graphics::Buffer guards(m_runtime_context, scheduler,
+        MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, 12);
+    guards.CopyFrom(command, *owner, plan.selected_offset - 4, 0, 12,
+        vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite, {},
+        vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+        vk::AccessFlagBits::eHostRead);
+    Libs::Graphics::Buffer uv_guards(m_runtime_context, scheduler,
+        MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(uv_a) + 8);
+    uv_guards.CopyFrom(command, *owner, uv_plan.selected_offset - 4, 0, sizeof(uv_a) + 8,
+        vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite, {},
+        vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+        vk::AccessFlagBits::eHostRead);
+    uint32_t current_guest = 0;
+    Require(name, "divergent guest backing", LibKernel::Memory::TryReadBacking(
+        guest + scalar_offset, &current_guest, sizeof(current_guest)) && current_guest == guest_c,
+        "diagnostic or descriptor preparation published GPU bytes into guest backing");
+    std::array<uint32_t, 12> current_uv_guest{};
+    Require(name, "divergent HDR UV guest backing", LibKernel::Memory::TryReadBacking(
+        uv_guest, current_uv_guest.data(), sizeof(current_uv_guest)) &&
+        std::ranges::all_of(current_uv_guest, [](uint32_t value) { return value == guest_c; }),
+        "HDR UV diagnostic changed the guest backing");
+    BufferCacheTestAccess::RetireBuffer(cache, owner_id);
+    Require(name, "retirement waits for GPU", !cache.FindRegisteredBuffer(guest, declared_bytes) &&
+        BufferCacheTestAccess::IsBufferAllocated(cache, owner_id) && completed == 0 && uv_completed == 0,
+        "native source was destroyed before queued GPU commands completed");
+    Require(name, "retired plan cannot queue",
+        !RenderExecutorTestAccess::QueuePanelGpuScalarReadback(executor, command, plan,
+            [&](bool, uint32_t) { ++unexpected_callbacks; }),
+        "retired native owner remained eligible for a new capture");
+    Require(name, "retired HDR UV plan cannot queue",
+        !RenderExecutorTestAccess::QueuePanelGpuHdrUvReadback(executor, command, uv_plan,
+            [&](bool, std::array<uint32_t, 12>) { ++unexpected_callbacks; }),
+        "retired HDR UV owner remained eligible for a new capture");
+    scheduler.Finish();
+    scheduler.PopPendingOperations();
+    guards.Invalidate(0, 12);
+    std::array<uint32_t, 3> actual_guards{};
+    std::memcpy(actual_guards.data(), guards.Mapped().data(), sizeof(actual_guards));
+    Require(name, "exact GPU capture ordering", completed == 1 && captured_ok &&
+        captured_bits == gpu_a && captured_bits != guest_c && captured_bits != gpu_b &&
+        unexpected_callbacks == 0, "capture saw guest bytes, a later overwrite, or invalid completion");
+    Require(name, "source overwrite and adjacent sentinels",
+        actual_guards == std::array<uint32_t, 3>{left_guard, gpu_b, right_guard},
+        "diagnostic changed source bytes or the selected copy extent");
+    Require(name, "exact HDR UV capture ordering", uv_completed == 1 && uv_captured_ok &&
+        captured_uv == uv_a, "HDR UV capture lost payload bits or observed the later overwrite");
+    uv_guards.Invalidate(0, sizeof(uv_a) + 8);
+    std::array<uint32_t, 14> actual_uv_guards{};
+    std::memcpy(actual_uv_guards.data(), uv_guards.Mapped().data(), sizeof(actual_uv_guards));
+    Require(name, "HDR UV overwrite and adjacent sentinels",
+        actual_uv_guards.front() == left_guard && actual_uv_guards.back() == right_guard &&
+        std::all_of(actual_uv_guards.begin() + 1, actual_uv_guards.end() - 1,
+                    [](uint32_t value) { return value == gpu_b; }),
+        "HDR UV diagnostic changed adjacent source bytes or its exact 48-byte extent");
+    Require(name, "retired source reclamation",
+        !BufferCacheTestAccess::IsBufferAllocated(cache, owner_id),
+        "retired source was retained after the completed tick");
+    Require(name, "diagnostic slot isolation",
+        capture_state == RenderExecutorTestAccess::PanelGpuScalarCaptureState(executor),
+        "pure planning or readback seams changed live milestone bookkeeping");
+    if (RasterizationSupported()) {
+      const auto pixels = ReadCachedTexel(name, context, color.image_id, {}, {4, 4, 1});
+      Require(name, "fragment consumes captured GPU value", pixels.size() == 64 &&
+          std::ranges::all_of(pixels, [](uint32_t value) { return value == gpu_a; }),
+          "fragment did not consume the same GPU scalar between capture and overwrite");
+      DestroyBuffer(&vertex_buffer);
+      m_device.destroyShaderModule(pixel_shader.module);
+      m_device.destroyShaderModule(vertex_shader.module);
+    }
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+        LibKernel::Memory::KernelReleaseDirectMemory(physical, allocation_size) == 0,
+        "scalar fixture mapping or allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckRasterization(
@@ -44371,6 +44897,11 @@ int main(int argc, char **argv) {
     CheckImageTransitionState(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--panel-gpu-scalar-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPanelGpuScalarCapture();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--depth-stencil-color-copy-only") == 0) {
     VulkanHarness vulkan;
     CheckDepthStencilColorCopy(vulkan.RuntimeRenderer());
@@ -44535,6 +45066,7 @@ int main(int argc, char **argv) {
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
+  vulkan.CheckPanelGpuScalarCapture();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);

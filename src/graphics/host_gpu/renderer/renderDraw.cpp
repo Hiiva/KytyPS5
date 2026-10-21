@@ -1205,6 +1205,74 @@ bool PanelImagesOverlap(const Image& a, const Image& b) {
 	return false;
 }
 
+struct PanelGpuScalarCaptureOptions {
+	bool enabled = false;
+	bool hdr_uv = false;
+	std::string prefix;
+	std::array<uint32_t, 2> milestones {2048u, 3072u};
+};
+
+const PanelGpuScalarCaptureOptions& GetPanelGpuScalarCaptureOptions() {
+	static const PanelGpuScalarCaptureOptions options = [] {
+		PanelGpuScalarCaptureOptions result;
+		const char* value = std::getenv("KYTY_VR_PANEL_GPU_SCALAR_CAPTURE");
+		if (value == nullptr || std::strcmp(value, "1") != 0) return result;
+		const auto disabled = [&](const char* reason) {
+			LOGF("PanelProducer GPU scalar capture disabled: reason=%s existing-diagnostics-unchanged\n", reason);
+			return result;
+		};
+		const char* producer = std::getenv("KYTY_VR_PANEL_PRODUCER_TRACE");
+		if (producer == nullptr || std::strcmp(producer, "1") != 0)
+			return disabled("requires-producer-trace");
+		const auto& upstream = GetPanelUpstreamOptions();
+		if (!upstream.enabled) return disabled("requires-valid-upstream-trace");
+		const char* prefix = std::getenv("KYTY_VR_PANEL_GPU_SCALAR_CAPTURE_PREFIX");
+		if (prefix == nullptr || *prefix == '\0' || std::strlen(prefix) > 2048u)
+			return disabled("requires-nonempty-prefix-at-most-2048-bytes");
+		result.prefix = prefix;
+		result.milestones = upstream.capture_frames;
+		const char* hdr_uv = std::getenv("KYTY_VR_PANEL_GPU_SCALAR_CAPTURE_HDR_UV");
+		result.hdr_uv = hdr_uv != nullptr && std::strcmp(hdr_uv, "1") == 0;
+		result.enabled = true;
+		LOGF("PanelProducer GPU scalar capture enabled: ps=83b1c2d863c50cf3 resource=1 binding=1 "
+		     "byte_offset=2168 bytes=4 timing=before-draw capture_frames=%u,%u max_captures=2 "
+		     "max_raw_bytes=%u max_decisions=64 cutoff_frame=4096 guest_reads=0 image-budget-unchanged=1 "
+		     "hdr_uv_companion=%d companion_recipe=83b1c2d863c50cf3:0:0:48 primary-first=1\n",
+		     result.milestones[0], result.milestones[1], result.hdr_uv ? 104u : 8u, result.hdr_uv);
+		return result;
+	}();
+	return options;
+}
+
+bool PanelScalarRangeFits(uint64_t offset, uint64_t size, uint64_t capacity) {
+	return offset <= capacity && size <= capacity - offset;
+}
+
+const Buffer* ResolvePanelScalarNativeOwner(BufferCache& cache,
+	                                        const vk::DescriptorBufferInfo& native,
+	                                        uint64_t address, uint64_t size, bool& stream) {
+	stream = false;
+	if (address == 0 || size == 0 || !GuestRange {address, size}.Valid() ||
+	    native.buffer == nullptr || native.range != size || native.range == VK_WHOLE_SIZE)
+		return nullptr;
+	const auto& upload = cache.GetUtilityBuffer(MemoryUsage::Stream);
+	const Buffer* owner = nullptr;
+	if (native.buffer == upload.Handle()) {
+		if (upload.Usage() != MemoryUsage::Stream) return nullptr;
+		owner = &upload;
+		stream = true;
+	} else {
+		owner = cache.FindRegisteredBuffer(address, size);
+		if (owner == nullptr || owner->Usage() != MemoryUsage::DeviceLocal ||
+		    owner->Handle() != native.buffer || owner->Offset(address) != native.offset)
+			return nullptr;
+	}
+	// Both accepted allocation routes use AllFlags, including TransferSrc. Do not
+	// infer transfer usage or ownership for an arbitrary native descriptor handle.
+	return !owner->is_deleted && PanelScalarRangeFits(native.offset, native.range, owner->Size())
+	           ? owner : nullptr;
+}
+
 bool PanelNativeScalarTraceEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_VR_PANEL_NATIVE_SCALAR_TRACE");
@@ -1457,6 +1525,424 @@ bool QueuePanelInputCapture(CommandBuffer& command, Image& image, uint32_t bytes
 }
 
 } // namespace
+
+const RenderExecutor::PanelGpuScalarRecipe* RenderExecutor::GetPanelGpuScalarRecipe(PanelGpuScalarKind kind) {
+	static constexpr PanelGpuScalarRecipe common_rgb {1u, 0x40u, 4384u, 2168u, 4u};
+	static constexpr PanelGpuScalarRecipe hdr_uv {0u, 0x10u, 128u, 0u, 48u};
+	switch (kind) {
+	case PanelGpuScalarKind::CommonRgb: return &common_rgb;
+	case PanelGpuScalarKind::HdrUv: return &hdr_uv;
+	default: return nullptr;
+	}
+}
+
+const char* RenderExecutor::PlanPanelGpuScalarCapture(
+	const CommandBuffer& buffer, std::span<const RenderColorInfo> colors, ImageId depth,
+	const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	PanelGpuScalarPlan& plan) const {
+	return PlanPanelGpuCapture(PanelGpuScalarKind::CommonRgb, buffer, colors, depth, rendering, stages, plan);
+}
+
+const char* RenderExecutor::PlanPanelGpuHdrUvCapture(
+	const CommandBuffer& buffer, std::span<const RenderColorInfo> colors, ImageId depth,
+	const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	PanelGpuScalarPlan& plan) const {
+	return PlanPanelGpuCapture(PanelGpuScalarKind::HdrUv, buffer, colors, depth, rendering, stages, plan);
+}
+
+const char* RenderExecutor::PlanPanelGpuCapture(
+	PanelGpuScalarKind kind, const CommandBuffer& buffer, std::span<const RenderColorInfo> colors,
+	ImageId depth, const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	PanelGpuScalarPlan& plan) const {
+	plan = {};
+	const auto* recipe = GetPanelGpuScalarRecipe(kind);
+	if (recipe == nullptr) return "unsupported-recipe-kind";
+	if (buffer.IsInvalid() || &buffer.GetContext() != &m_context) return "invalid-command-context";
+	if (stages.empty() || stages.size() > 4u || colors.size() > RENDER_COLOR_ATTACHMENTS_MAX ||
+	    rendering.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX)
+		return "stage-or-attachment-count";
+	if (rendering.depth_stencil_attachment.depth_clear || rendering.depth_stencil_attachment.stencil_clear ||
+	    std::any_of(rendering.color_attachments.begin(), rendering.color_attachments.end(),
+	                [](const auto& attachment) { return attachment.is_clear; }))
+		return "rendering-load-clear";
+	const PreparedBindings* pixel = nullptr;
+	uint32_t pixel_index = 0;
+	for (uint32_t i = 0; i < stages.size(); ++i) {
+		const auto* prepared = stages[i];
+		if (prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime)
+			return "invalid-bound-stage";
+		const auto& program = *prepared->runtime->program;
+		if (program.stage == ShaderType::Pixel) {
+			if (pixel != nullptr) return "multiple-pixel-stages";
+			pixel = prepared;
+			pixel_index = i;
+		}
+		if (program.has_address_writes ||
+		    std::any_of(program.info.buffers.begin(), program.info.buffers.end(),
+		                [](const auto& resource) { return resource.written || resource.atomic; }))
+			return "bound-buffer-or-address-write";
+		if (prepared->images.size() != program.info.images.size() ||
+		    std::any_of(program.info.images.begin(), program.info.images.end(),
+		                [](const auto& resource) { return resource.written || resource.atomic || resource.atomic64; }) ||
+		    std::any_of(prepared->images.begin(), prepared->images.end(),
+		                [](const auto& binding) { return binding.desc.type == TextureCache::BindingType::Storage; }))
+			return "bound-storage-image-or-unknown-write";
+	}
+	if (pixel == nullptr || pixel->runtime->program->shader_hash != 0x83b1c2d863c50cf3ull)
+		return "missing-exact-pixel-recipe";
+	const auto& program = *pixel->runtime->program;
+	const auto& snapshot = *pixel->runtime->resources;
+	if (program.info.buffers.size() <= recipe->resource || snapshot.buffers.size() <= recipe->resource)
+		return "missing-recipe-resource";
+	const auto& resource = program.info.buffers[recipe->resource];
+	if (resource.descriptor_index != recipe->resource || resource.first_use_pc != recipe->first_pc || !resource.read ||
+	    !resource.scalar || resource.written || resource.atomic || resource.formatted ||
+	    resource.image_alias != ShaderRecompiler::IR::BufferResource::NoImageAlias ||
+	    resource.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer ||
+	    !resource.indirect_resources.empty() || !program.info.user_data_registers.empty())
+		return "recipe-mapping-or-access";
+	if (pixel->buffer_sources.size() <= recipe->resource || pixel->buffers.size() <= recipe->resource)
+		return "missing-native-binding";
+	const auto& words = snapshot.buffers[recipe->resource];
+	if (words.dword_count != 4u) return "descriptor-word-count";
+	ShaderBufferResource descriptor {};
+	std::memcpy(descriptor.fields, words.dwords.data(), sizeof(descriptor.fields));
+	const auto& source = pixel->buffer_sources[recipe->resource];
+	const auto& native = pixel->buffers[recipe->resource];
+	const auto offset_word = uint64_t {program.bindings.memory_offset_dword};
+	if (offset_word >= pixel->shader_data.size()) return "missing-packed-offset";
+	const uint32_t packed = pixel->shader_data[static_cast<size_t>(offset_word)];
+	if (((packed >> (8u * recipe->resource)) & 255u) != 0u) return "nonzero-packed-offset";
+	if ((descriptor.fields[1] & 0xffff0000u) != 0x00100000u || descriptor.fields[3] != 0x0004dfacu ||
+	    descriptor.GetSize() != recipe->declared_size || source.address != descriptor.Base48() ||
+	    source.size != recipe->declared_size ||
+	    source.address == 0 || !GuestRange {source.address, source.size}.Valid())
+		return "descriptor-or-resolved-range";
+	if (native.buffer == nullptr || native.range != recipe->declared_size || (native.offset & 3u) != 0u)
+		return "native-range";
+	bool stream = false;
+	const auto* owner = ResolvePanelScalarNativeOwner(m_context.GetBufferCache(), native,
+	                                                 source.address, source.size, stream);
+	if (owner == nullptr) return "unproved-native-owner";
+	if (!PanelScalarRangeFits(recipe->selected_offset, recipe->selected_size, native.range))
+		return "selected-native-extent";
+	const uint64_t selected = native.offset + recipe->selected_offset;
+	if (!PanelScalarRangeFits(selected, recipe->selected_size, owner->Size())) return "selected-owner-extent";
+	const auto check_info = [&](const ImageInfo& info) -> const char* {
+		for (const auto range: {info.data, info.stencil, info.metadata.range}) {
+			if (range.Empty()) continue;
+			if (!range.Valid()) return "invalid-attachment-range";
+			if (ImageRangeOverlaps(source.address, source.size, range.address, range.size))
+				return "attachment-overlap";
+		}
+		return nullptr;
+	};
+	const auto check_attachment = [&](ImageId id) -> const char* {
+		const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
+		if (!id || image == nullptr || !image->registered) return "unresolved-attachment";
+		return check_info(image->info);
+	};
+	for (uint32_t slot = 0; slot < rendering.color_attachments.size(); ++slot) {
+		const auto view = rendering.color_attachments[slot].image_view;
+		if (view == nullptr) continue;
+		if (slot >= rendering.num_color_attachments) return "unresolved-attachment";
+		const auto color = std::find_if(colors.begin(), colors.end(),
+		    [slot](const auto& target) { return target.target_slot == slot; });
+		if (color == colors.end()) return "unresolved-attachment";
+		const auto* image = m_context.GetTextureCache().m_slot_images.try_get(color->image_id);
+		if (image == nullptr || std::none_of(image->views.begin(), image->views.end(),
+		    [view](const auto& candidate) { return candidate.view == view; })) return "unresolved-attachment";
+	}
+	for (const auto& color: colors) {
+		if (const auto* reason = check_attachment(color.image_id)) return reason;
+		if (const auto* reason = check_info(color.desc.info)) return reason;
+	}
+	if (depth) {
+		if (const auto* reason = check_attachment(depth)) return reason;
+	} else if (rendering.depth_stencil_attachment.image_view != nullptr) {
+		return "unresolved-attachment";
+	}
+	PanelGpuScalarPlan result;
+	result.kind = kind;
+	result.native = native;
+	result.guest_address = source.address;
+	result.guest_size = source.size;
+	result.selected_offset = selected;
+	result.owner_size = owner->Size();
+	std::copy(std::begin(descriptor.fields), std::end(descriptor.fields), result.sharp.begin());
+	result.stage_index = pixel_index;
+	result.packed_offset_word = packed;
+	result.stream = stream;
+	plan = result;
+	return nullptr;
+}
+
+bool RenderExecutor::QueuePanelGpuScalarReadback(
+	CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
+	Common::UniqueFunction<void, bool, uint32_t>&& completion) {
+	if (!completion || plan.kind != PanelGpuScalarKind::CommonRgb) return false;
+	return QueuePanelGpuReadback(PanelGpuScalarKind::CommonRgb, buffer, plan,
+	    [completion = std::move(completion)](bool success, PanelGpuScalarWords words) mutable {
+		    completion(success, words[0]);
+	    });
+}
+
+bool RenderExecutor::QueuePanelGpuHdrUvReadback(
+	CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
+	Common::UniqueFunction<void, bool, PanelGpuScalarWords>&& completion) {
+	return QueuePanelGpuReadback(PanelGpuScalarKind::HdrUv, buffer, plan, std::move(completion));
+}
+
+bool RenderExecutor::QueuePanelGpuReadback(
+	PanelGpuScalarKind kind, CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
+	Common::UniqueFunction<void, bool, PanelGpuScalarWords>&& completion) {
+	const auto* recipe = GetPanelGpuScalarRecipe(kind);
+	if (recipe == nullptr || plan.kind != kind) return false;
+	if (buffer.IsInvalid() || &buffer.GetContext() != &m_context || !completion ||
+	    plan.guest_size != recipe->declared_size || plan.native.range != recipe->declared_size ||
+	    (plan.native.offset & 3u) != 0u ||
+	    ((plan.packed_offset_word >> (8u * recipe->resource)) & 255u) != 0u)
+		return false;
+	ShaderBufferResource descriptor {};
+	std::copy(plan.sharp.begin(), plan.sharp.end(), std::begin(descriptor.fields));
+	if (descriptor.Base48() != plan.guest_address || descriptor.GetSize() != recipe->declared_size ||
+	    (descriptor.fields[1] & 0xffff0000u) != 0x00100000u || descriptor.fields[3] != 0x0004dfacu)
+		return false;
+	bool stream = false;
+	const auto* owner = ResolvePanelScalarNativeOwner(m_context.GetBufferCache(), plan.native,
+	                                                 plan.guest_address, plan.guest_size, stream);
+	if (owner == nullptr || owner->Size() != plan.owner_size || stream != plan.stream ||
+	    !PanelScalarRangeFits(recipe->selected_offset, recipe->selected_size, plan.native.range) ||
+	    plan.selected_offset != plan.native.offset + recipe->selected_offset ||
+	    !PanelScalarRangeFits(plan.selected_offset, recipe->selected_size, owner->Size()))
+		return false;
+	// Validate everything before allocation or commands. A failed diagnostic allocation
+	// must not terminate the emulator or consume a capture slot.
+	auto readback = std::make_unique<PanelInputReadback>();
+	readback->allocator = buffer.GetGraphics().allocator;
+	VkBufferCreateInfo buffer_info {};
+	buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	buffer_info.size = recipe->selected_size;
+	buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VmaAllocationCreateInfo allocation_info {};
+	allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+	allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+	allocation_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+	if (vmaCreateBuffer(readback->allocator, &buffer_info, &allocation_info,
+	                    &readback->buffer, &readback->allocation, nullptr) != VK_SUCCESS)
+		return false;
+	buffer.EndRendering();
+	const auto command = buffer.Handle();
+	vk::BufferMemoryBarrier2 before {};
+	before.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost;
+	before.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eHostWrite;
+	before.dstStageMask = vk::PipelineStageFlagBits2::eCopy | vk::PipelineStageFlagBits2::eFragmentShader;
+	before.dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eShaderStorageRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer = plan.native.buffer;
+	before.offset = plan.selected_offset;
+	before.size = recipe->selected_size;
+	vk::DependencyInfo dependency {};
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers = &before;
+	command.pipelineBarrier2(dependency);
+	const vk::BufferCopy copy {plan.selected_offset, 0, recipe->selected_size};
+	command.copyBuffer(plan.native.buffer, readback->buffer, 1, &copy);
+	std::array<vk::BufferMemoryBarrier2, 2> after {};
+	after[0] = before;
+	after[0].srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+	after[0].srcAccessMask = vk::AccessFlagBits2::eTransferRead;
+	after[0].dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	after[0].dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	after[1].srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+	after[1].srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	after[1].dstStageMask = vk::PipelineStageFlagBits2::eHost;
+	after[1].dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	after[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after[1].buffer = readback->buffer;
+	after[1].offset = 0;
+	after[1].size = recipe->selected_size;
+	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(after.size());
+	dependency.pBufferMemoryBarriers = after.data();
+	command.pipelineBarrier2(dependency);
+	// Source allocations already live through this tick: registered owners retire
+	// through DeferOperation, and stream Commit guards reservation reuse. Retain only
+	// the dedicated destination and callback; never retain a cache or mapped pointer.
+	m_context.GetCommandScheduler().DeferOperation(
+	    [readback = std::move(readback), completion = std::move(completion), bytes = recipe->selected_size]() mutable {
+		    PanelGpuScalarWords words {};
+		    const bool success = vmaMapMemory(readback->allocator, readback->allocation,
+		                                     &readback->mapped) == VK_SUCCESS &&
+		        readback->mapped != nullptr &&
+		        vmaInvalidateAllocation(readback->allocator, readback->allocation, 0, bytes) == VK_SUCCESS;
+		    if (success) std::memcpy(words.data(), readback->mapped, bytes);
+		    completion(success, words);
+	    });
+	return true;
+}
+
+uint32_t RenderExecutor::CapturePanelGpuScalarBeforeDraw(
+	uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
+	const DrawEmitInfo& emit, const DrawRenderState& state, const RenderState& rendering,
+	std::span<PreparedBindings* const> stages) {
+	const auto& options = GetPanelGpuScalarCaptureOptions();
+	const uint64_t max_raw_bytes = options.hdr_uv ? 104u : 8u;
+	if (!options.enabled || m_gpu_scalar_capture.index >= options.milestones.size() ||
+	    !PanelScalarRangeFits(m_gpu_scalar_capture.bytes, 4u, max_raw_bytes) || m_gpu_scalar_decisions >= 64u ||
+	    !GuestGpu::IsGpuThread() || m_upstream_source_count == 0)
+		return 0;
+	const auto frame = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+	const auto milestone = options.milestones[m_gpu_scalar_capture.index];
+	if (frame > 4096u || frame < milestone || frame == m_gpu_scalar_last_frame) return 0;
+	const bool exact_pixel = std::any_of(stages.begin(), stages.end(), [](const auto* prepared) {
+		return prepared != nullptr && prepared->runtime != nullptr && *prepared->runtime &&
+		       prepared->runtime->program->stage == ShaderType::Pixel &&
+		       prepared->runtime->program->shader_hash == 0x83b1c2d863c50cf3ull;
+	});
+	if (!exact_pixel) return 0;
+	const auto colors = std::span {state.color_info, state.color_count};
+	const auto match = MatchPanelProducerWrites(colors, stages);
+	if ((match.images & PanelUpstreamWatchMask) == 0) return 0;
+	++m_gpu_scalar_decisions;
+	PanelGpuScalarPlan plan;
+	const auto* reason = PlanPanelGpuScalarCapture(buffer, colors, state.depth_info.image_id,
+	                                              rendering, stages, plan);
+	if (reason != nullptr) {
+		LOGF("PanelProducer GPU scalar decision: frame=%u submit=%" PRIu64
+		     " milestone=%u decision=%u state=skipped reason=%s hdr_uv_state=not-attempted\n",
+		     frame, submit_id, milestone, m_gpu_scalar_decisions, reason);
+		return 0;
+	}
+	const uint32_t sequence = m_gpu_scalar_capture.index + 1u;
+	const auto tick = m_context.GetCommandScheduler().CurrentTick();
+	const auto path = fmt::format("{}-scalar{}-frame{}-submit{}-tick{}.bin",
+	                             options.prefix, sequence, frame, submit_id, tick);
+	std::string metadata = fmt::format(
+	    "PanelGpuScalar sequence={} milestone={} frame={} submit={} tick={} timing=before-draw "
+	    "origin=gpu-buffer-copy kind=common-rgb role=pre-LUT-common-RGB-multiplier bytes=4 "
+	    "stage={} ps=83b1c2d863c50cf3 resource=1 binding=1 first_pc=40 source_images={:x}\n"
+	    "draw={} count={} instances={} vertex_offset={} first_vertex={} first_instance={}\n"
+	    "sharp={:08x},{:08x},{:08x},{:08x} packed_offset_word={:08x} "
+	    "guest={:016x} resolved_bytes={} native={:016x} offset={} range={} selected_byte_offset=2168 "
+	    "selected_native_offset={} owner_size={} owner={}\n",
+	    sequence, milestone, frame, submit_id, tick, plan.stage_index, match.images,
+	    draw.Name(), draw.index_count, draw.instance_count, emit.vertex_offset, emit.first_vertex, emit.first_instance,
+	    plan.sharp[0], plan.sharp[1], plan.sharp[2], plan.sharp[3], plan.packed_offset_word,
+	    plan.guest_address, plan.guest_size, PanelNativeHandle(plan.native.buffer), plan.native.offset, plan.native.range,
+	    plan.selected_offset, plan.owner_size, plan.stream ? "stream" : "registered-cache");
+	const bool queued = QueuePanelGpuScalarReadback(buffer, plan,
+	    [path, metadata = std::move(metadata), sequence, frame, tick](bool readback_ok, uint32_t bits) {
+		    uint32_t written = 0;
+		    bool saved = false;
+		    if (readback_ok) {
+			    Common::File raw;
+			    if (raw.Create(path)) {
+				    raw.Write(&bits, sizeof(bits), &written);
+				    saved = written == sizeof(bits) && raw.Flush();
+			    }
+		    }
+		    auto text = metadata + fmt::format("gpu_completed=1 readback_ok={} saved={} written={}",
+		                                       readback_ok, saved, written);
+		    if (readback_ok) text += fmt::format(" dword={:08x} float={}", bits, std::bit_cast<float>(bits));
+		    text += "\n";
+		    Common::File info;
+		    bool metadata_saved = false;
+		    if (info.Create(path + ".txt")) {
+			    uint32_t count = 0;
+			    info.Write(text.data(), static_cast<uint32_t>(text.size()), &count);
+			    metadata_saved = count == text.size() && info.Flush();
+		    }
+		    LOGF("PanelProducer GPU scalar complete: sequence=%u frame=%u tick=%" PRIu64
+		         " file=%s gpu_completed=1 readback_ok=%d saved=%d metadata=%d bytes=%u\n",
+		         sequence, frame, tick, path.c_str(), readback_ok, saved, metadata_saved, written);
+	    });
+	// The common scalar owns the set. The companion can only be queued after the
+	// primary copy succeeded, and shares its frame, tick, sequence and decision row.
+	bool hdr_uv_queued = false;
+	const char* hdr_uv_reason = options.hdr_uv ? "primary-not-queued" : "disabled";
+	PanelGpuScalarPlan hdr_uv_plan;
+	if (queued && options.hdr_uv) {
+		hdr_uv_reason = PanelScalarRangeFits(m_gpu_scalar_capture.bytes + 4u, 48u, max_raw_bytes)
+		                    ? PlanPanelGpuHdrUvCapture(buffer, colors, state.depth_info.image_id,
+		                                              rendering, stages, hdr_uv_plan)
+		                    : "raw-byte-budget";
+		if (hdr_uv_reason == nullptr) {
+			const auto hdr_uv_path = fmt::format("{}-scalar{}-hdr-uv-frame{}-submit{}-tick{}.bin",
+			                                     options.prefix, sequence, frame, submit_id, tick);
+			std::string hdr_uv_metadata = fmt::format(
+			    "PanelGpuScalar sequence={} milestone={} frame={} submit={} tick={} timing=before-draw "
+			    "origin=gpu-buffer-copy kind=hdr-uv role=HDR-input1-UV-transform bytes=48 primary_queued=1 "
+			    "stage={} ps=83b1c2d863c50cf3 resource=0 binding=0 first_pc=10 source_images={:x}\n"
+			    "draw={} count={} instances={} vertex_offset={} first_vertex={} first_instance={}\n"
+			    "sharp={:08x},{:08x},{:08x},{:08x} packed_offset_word={:08x} "
+			    "guest={:016x} resolved_bytes={} native={:016x} offset={} range={} selected_byte_offset=0 "
+			    "selected_native_offset={} owner_size={} owner={}\n"
+			    "interpretation=raw-dwords-authoritative float_words=0,1,2,3,10,11 uint_words=8,9 "
+			    "remaining_words=uninterpreted\n",
+			    sequence, milestone, frame, submit_id, tick, hdr_uv_plan.stage_index, match.images,
+			    draw.Name(), draw.index_count, draw.instance_count, emit.vertex_offset, emit.first_vertex, emit.first_instance,
+			    hdr_uv_plan.sharp[0], hdr_uv_plan.sharp[1], hdr_uv_plan.sharp[2], hdr_uv_plan.sharp[3],
+			    hdr_uv_plan.packed_offset_word, hdr_uv_plan.guest_address, hdr_uv_plan.guest_size,
+			    PanelNativeHandle(hdr_uv_plan.native.buffer), hdr_uv_plan.native.offset, hdr_uv_plan.native.range,
+			    hdr_uv_plan.selected_offset, hdr_uv_plan.owner_size, hdr_uv_plan.stream ? "stream" : "registered-cache");
+			hdr_uv_queued = QueuePanelGpuHdrUvReadback(buffer, hdr_uv_plan,
+			    [hdr_uv_path, metadata = std::move(hdr_uv_metadata), sequence, frame, tick]
+			    (bool readback_ok, PanelGpuScalarWords words) {
+				    uint32_t written = 0;
+				    bool saved = false;
+				    if (readback_ok) {
+					    Common::File raw;
+					    if (raw.Create(hdr_uv_path)) {
+						    raw.Write(words.data(), 48u, &written);
+						    saved = written == 48u && raw.Flush();
+					    }
+				    }
+				    auto text = metadata + fmt::format("gpu_completed=1 readback_ok={} saved={} written={}",
+				                                       readback_ok, saved, written);
+				    if (readback_ok) {
+					    text += " dwords=";
+					    for (uint32_t i = 0; i < words.size(); ++i)
+						    text += fmt::format("{}{:08x}", i == 0 ? "" : ",", words[i]);
+					    text += fmt::format(" float_words_0_1_2_3={},{},{},{} uint_words_8_9={},{} "
+					                        "float_words_10_11={},{}",
+					                        std::bit_cast<float>(words[0]), std::bit_cast<float>(words[1]),
+					                        std::bit_cast<float>(words[2]), std::bit_cast<float>(words[3]),
+					                        words[8], words[9], std::bit_cast<float>(words[10]),
+					                        std::bit_cast<float>(words[11]));
+				    }
+				    text += "\n";
+				    Common::File info;
+				    bool metadata_saved = false;
+				    if (info.Create(hdr_uv_path + ".txt")) {
+					    uint32_t count = 0;
+					    info.Write(text.data(), static_cast<uint32_t>(text.size()), &count);
+					    metadata_saved = count == text.size() && info.Flush();
+				    }
+				    LOGF("PanelProducer GPU scalar complete: sequence=%u kind=hdr-uv frame=%u tick=%" PRIu64
+				         " file=%s gpu_completed=1 readback_ok=%d saved=%d metadata=%d bytes=%u\n",
+				         sequence, frame, tick, hdr_uv_path.c_str(), readback_ok, saved, metadata_saved, written);
+			    });
+			hdr_uv_reason = hdr_uv_queued ? "ok" : "owner-changed-or-allocation-failed";
+		}
+	}
+	LOGF("PanelProducer GPU scalar decision: frame=%u submit=%" PRIu64
+	     " milestone=%u decision=%u sequence=%u state=%s reason=%s native=%016" PRIx64
+	     " selected_offset=%" PRIu64 " bytes=4 tick=%" PRIu64
+	     " hdr_uv_state=%s hdr_uv_reason=%s hdr_uv_native=%016" PRIx64
+	     " hdr_uv_selected_offset=%" PRIu64 " hdr_uv_bytes=%u\n",
+	     frame, submit_id, milestone, m_gpu_scalar_decisions, sequence, queued ? "queued" : "skipped",
+	     queued ? "ok" : "owner-changed-or-allocation-failed", PanelNativeHandle(plan.native.buffer),
+	     plan.selected_offset, tick, hdr_uv_queued ? "queued" : "skipped", hdr_uv_reason,
+	     PanelNativeHandle(hdr_uv_plan.native.buffer), hdr_uv_plan.selected_offset, hdr_uv_queued ? 48u : 0u);
+	if (!queued) return 0;
+	++m_gpu_scalar_capture.index;
+	m_gpu_scalar_capture.bytes += 4u + (hdr_uv_queued ? 48u : 0u);
+	m_gpu_scalar_last_frame = frame;
+	return sequence;
+}
 
 bool RenderExecutor::PanelProducerTraceEnabled() {
 	static const bool enabled = [] {
@@ -1788,7 +2274,7 @@ bool RenderExecutor::TracePanelProducerWindow(const CommandBuffer& buffer, uint3
 
 void RenderExecutor::TracePanelProducerDraw(uint64_t submit_id, CommandBuffer& buffer,
 	    const DrawCallInfo& draw, const DrawEmitInfo& emit, const DrawRenderState& state,
-	    const RenderState& rendering, std::span<PreparedBindings* const> stages) {
+	    const RenderState& rendering, std::span<PreparedBindings* const> stages, uint32_t scalar_capture) {
 	if (!PanelProducerTraceEnabled() || m_panel_source_count == 0) return;
 	const auto frame = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
 	if (frame > 4096u) return;
@@ -1802,7 +2288,12 @@ void RenderExecutor::TracePanelProducerDraw(uint64_t submit_id, CommandBuffer& b
 		// Replacing a child slot must not leave this record with its previous occupant's mask.
 		match = MatchPanelProducerWrites(colors, stages);
 	}
-	const bool trace_due = TracePanelProducerWindow(buffer, frame, match);
+	const bool trace_due = TracePanelProducerWindow(buffer, frame, match) || scalar_capture != 0u;
+	if (scalar_capture != 0u) {
+		LOGF("PanelProducer GPU scalar link: call=%u sequence=%u frame=%u submit=%" PRIu64
+		     " source_images=%x timing=before-this-draw\n",
+		     match.Any() ? m_producer_order : 0u, scalar_capture, frame, submit_id, match.images);
+	}
 	static const std::string prefix = [] {
 		const char* value = std::getenv("KYTY_VR_PANEL_PRODUCER_CAPTURE_PREFIX");
 		return value != nullptr && std::strlen(value) <= 2048 ? std::string(value) : std::string {};
@@ -2390,6 +2881,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	const auto scalar_capture = CapturePanelGpuScalarBeforeDraw(
+	    submit_id, buffer, draw, emit, state, rendering, stages);
 	if (mesh_active) {
 		const uint32_t draw_data[] {
 		    draw.index_count,
@@ -2444,7 +2937,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
 	TracePanelDraw(submit_id, buffer, draw, emit, state, rendering, stages);
-	TracePanelProducerDraw(submit_id, buffer, draw, emit, state, rendering, stages);
+	TracePanelProducerDraw(submit_id, buffer, draw, emit, state, rendering, stages, scalar_capture);
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);

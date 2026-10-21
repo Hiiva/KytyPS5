@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -215,6 +216,56 @@ private:
 		uint32_t misses = 0;
 		uint64_t bytes = 0;
 	};
+	enum class PanelGpuScalarKind { CommonRgb, HdrUv };
+	using PanelGpuScalarWords = std::array<uint32_t, 12>;
+	struct PanelGpuScalarRecipe {
+		uint32_t resource;
+		uint32_t first_pc;
+		uint32_t declared_size;
+		uint32_t selected_offset;
+		uint32_t selected_size;
+	};
+	[[nodiscard]] static const PanelGpuScalarRecipe* GetPanelGpuScalarRecipe(PanelGpuScalarKind kind);
+	struct PanelGpuScalarPlan {
+		PanelGpuScalarKind kind = PanelGpuScalarKind::CommonRgb;
+		vk::DescriptorBufferInfo native {};
+		uint64_t guest_address = 0;
+		uint64_t guest_size = 0;
+		uint64_t selected_offset = 0;
+		uint64_t owner_size = 0;
+		std::array<uint32_t, 4> sharp {};
+		uint32_t stage_index = 0;
+		uint32_t packed_offset_word = 0;
+		bool stream = false;
+	};
+	// Pure descriptor/owner validation. Caller retains GPU-thread serialization.
+	[[nodiscard]] const char* PlanPanelGpuScalarCapture(
+	    const CommandBuffer& buffer, std::span<const RenderColorInfo> colors, ImageId depth,
+	    const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	    PanelGpuScalarPlan& plan) const;
+	[[nodiscard]] const char* PlanPanelGpuHdrUvCapture(
+	    const CommandBuffer& buffer, std::span<const RenderColorInfo> colors, ImageId depth,
+	    const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	    PanelGpuScalarPlan& plan) const;
+	[[nodiscard]] const char* PlanPanelGpuCapture(
+	    PanelGpuScalarKind kind, const CommandBuffer& buffer, std::span<const RenderColorInfo> colors,
+	    ImageId depth, const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	    PanelGpuScalarPlan& plan) const;
+	// Records a four-byte copy; completion runs only after the normal scheduler tick.
+	[[nodiscard]] bool QueuePanelGpuScalarReadback(
+	    CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
+	    Common::UniqueFunction<void, bool, uint32_t>&& completion);
+	// The only companion recipe copies exactly twelve words from the same pixel stage.
+	[[nodiscard]] bool QueuePanelGpuHdrUvReadback(
+	    CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
+	    Common::UniqueFunction<void, bool, PanelGpuScalarWords>&& completion);
+	[[nodiscard]] bool QueuePanelGpuReadback(
+	    PanelGpuScalarKind kind, CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
+	    Common::UniqueFunction<void, bool, PanelGpuScalarWords>&& completion);
+	[[nodiscard]] uint32_t CapturePanelGpuScalarBeforeDraw(
+	    uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
+	    const DrawEmitInfo& emit, const DrawRenderState& state, const RenderState& rendering,
+	    std::span<PreparedBindings* const> stages);
 	struct PanelSourceWatch {
 		ImageId image_id;
 		vk::Image native = nullptr;
@@ -256,7 +307,8 @@ private:
 	[[nodiscard]] bool TracePanelProducerWindow(const CommandBuffer& buffer, uint32_t frame, const PanelProducerMatch& match);
 	void TracePanelProducerDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                            const DrawEmitInfo& emit, const DrawRenderState& state,
-	                            const RenderState& rendering, std::span<PreparedBindings* const> stages);
+	                            const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	                            uint32_t scalar_capture = 0);
 	void TracePanelProducerDispatch(uint64_t submit_id, CommandBuffer& buffer, PreparedBindings& bindings,
 	                                std::array<uint32_t, 3> groups, uint32_t mode, bool async_compute,
 	                                vk::Buffer indirect_buffer = nullptr, uint64_t indirect_offset = 0);
@@ -287,6 +339,9 @@ private:
 	uint32_t                             m_panel_trace_draws = 0;
 	PanelCaptureState                    m_panel_capture;
 	PanelCaptureState                    m_producer_capture;
+	PanelCaptureState                    m_gpu_scalar_capture;
+	uint32_t                             m_gpu_scalar_decisions = 0;
+	uint32_t                             m_gpu_scalar_last_frame = UINT32_MAX;
 	std::array<PanelSourceWatch, PanelPrimaryWatchCapacity + PanelUpstreamWatchCapacity> m_panel_sources {};
 	uint32_t                             m_panel_source_count = 0;
 	uint32_t                             m_panel_source_logs = 0;

@@ -54,6 +54,9 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// Read-only full containment lookup; never creates, refreshes or touches an owner.
+	// The caller must retain GPU-thread serialization while using the returned pointer.
+	[[nodiscard]] const Buffer* FindRegisteredBuffer(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
