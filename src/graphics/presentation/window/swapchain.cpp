@@ -974,12 +974,11 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		if (Config::VrEnabled() && g_vr_eye_crop.load(std::memory_order_relaxed) &&
 		    source->image.extent.width == Hmd2::PANEL_WIDTH &&
 		    source->image.extent.height == Hmd2::PANEL_HEIGHT) {
-			// A virtual-headset frame contains the stereo panel; center the
-			// left eye in the desktop window rather than scaling both eyes.
+			// A virtual-headset frame contains side-by-side eye panels.
+			// Keep the desktop crop within the complete left-eye panel.
 			const int eye_width = static_cast<int>(source->image.extent.width / 2u);
-			const int offset = static_cast<int>(source->image.extent.width / 16u);
-			region.srcOffsets[0].x = offset;
-			region.srcOffsets[1].x = offset + eye_width;
+			region.srcOffsets[0].x = 0;
+			region.srcOffsets[1].x = eye_width;
 		}
 		region.srcOffsets[1].y               = static_cast<int>(source->image.extent.height);
 		region.srcOffsets[1].z               = 1;
