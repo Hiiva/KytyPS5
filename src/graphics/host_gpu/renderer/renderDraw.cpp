@@ -1095,6 +1095,9 @@ struct PanelUpstreamCaptureFilter {
 	uint32_t image_index = 0;
 };
 
+constexpr uint64_t PanelMultiplierPrimaryPs = 0x83b1c2d863c50cf3ull;
+constexpr uint64_t PanelMultiplierVertexShader = 0x492fcfff7e74a877ull;
+
 const PanelUpstreamCaptureFilter& GetPanelUpstreamCaptureFilter() {
 	static const PanelUpstreamCaptureFilter options = [] {
 		PanelUpstreamCaptureFilter result;
@@ -1132,6 +1135,25 @@ const PanelUpstreamCaptureFilter& GetPanelUpstreamCaptureFilter() {
 		return result;
 	}();
 	return options;
+}
+
+bool PanelVertexMultiplierCaptureEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VR_PANEL_CAPTURE_VERTEX_MULTIPLIER");
+		if (value == nullptr || std::strcmp(value, "1") != 0) return false;
+		const auto& filter = GetPanelUpstreamCaptureFilter();
+		if (!filter.enabled || !filter.exact || filter.ps_hash != PanelMultiplierPrimaryPs ||
+		    filter.image_index != 3u) {
+			LOGF("PanelProducer vertex multiplier capture disabled: reason=requires-exact-83b1c2d863c50cf3-input3-filter\n");
+			return false;
+		}
+		LOGF("PanelProducer vertex multiplier capture enabled: primary_ps=%016" PRIx64
+		     " primary_image=3 vertex_shader=%016" PRIx64
+		     " vertex_image=0 primary-must-queue-first=1 shared-input-cap=2\n",
+		     PanelMultiplierPrimaryPs, PanelMultiplierVertexShader);
+		return true;
+	}();
+	return enabled;
 }
 
 template <typename Handle>
@@ -1183,6 +1205,158 @@ bool PanelImagesOverlap(const Image& a, const Image& b) {
 	return false;
 }
 
+bool PanelNativeScalarTraceEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VR_PANEL_NATIVE_SCALAR_TRACE");
+		const bool result = value != nullptr && std::strcmp(value, "1") == 0;
+		if (result) LOGF("PanelProducer native scalar trace: mapped-stream-only recipe_fields=ps:resource:byte_offset:bytes "
+		                 "recipes=7b2dcbdf832f0791:0:0:32,8f4f493f4d30416d:3:0:4,83b1c2d863c50cf3:1:2168:4 "
+		                 "window=existing-graphics-native-image-writes "
+		                 "gpu_completed=0 guest_reads=0\n");
+		return result;
+	}();
+	return enabled;
+}
+
+void AppendPanelNativeScalars(std::string& record, uint32_t call, const CommandBuffer& buffer,
+                              std::span<const RenderColorInfo> colors,
+                              std::span<const ImageInfo* const> attachment_infos, bool invalid_attachment,
+                              std::span<PreparedBindings* const> stages) {
+	// Called only after the actual draw, in an existing selected producer window. The
+	// source is the final native descriptor, never its historical guest backing address.
+	if (!GuestGpu::IsGpuThread()) {
+		record += fmt::format("PanelProducer native-scalar call={} state=skipped reason=not-gpu-thread\n", call);
+		return;
+	}
+	auto& context = buffer.GetContext();
+	const auto& stream = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	const std::span<const uint8_t> mapped = stream.Mapped();
+	for (uint32_t stage_index = 0; stage_index < stages.size(); ++stage_index) {
+		const auto* prepared = stages[stage_index];
+		if (prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime) {
+			record += fmt::format("PanelProducer native-scalar call={} stage={} state=skipped reason=invalid-stage\n",
+			                      call, stage_index);
+			continue;
+		}
+		const auto& program = *prepared->runtime->program;
+		if (program.stage != ShaderType::Pixel) continue;
+		const bool uv = program.shader_hash == 0x7b2dcbdf832f0791ull;
+		const bool pre_lut = program.shader_hash == 0x83b1c2d863c50cf3ull;
+		if (!uv && !pre_lut && program.shader_hash != 0x8f4f493f4d30416dull) continue;
+		const uint32_t resource_index = uv ? 0u : pre_lut ? 1u : 3u;
+		const uint32_t expected_pc = uv ? 0x8u : pre_lut ? 0x40u : 0x1d0u;
+		const uint32_t declared_bytes = uv ? 32u : pre_lut ? 4384u : 48u;
+		const uint32_t selected_offset = pre_lut ? 2168u : 0u;
+		const uint32_t selected_bytes = uv ? 32u : 4u;
+		const char* role = uv ? "uv-transform-and-bounds" : pre_lut ? "pre-LUT-common-RGB-multiplier" : "scene-background-mix";
+		const auto& snapshot = *prepared->runtime->resources;
+		ShaderBufferResource descriptor {};
+		const PreparedBindings::BufferSource* source = nullptr;
+		const vk::DescriptorBufferInfo* native = nullptr;
+		uint32_t binding_index = UINT32_MAX;
+		uint32_t adjustment = UINT32_MAX;
+		uint64_t selected_native_offset = 0;
+		bool selected_range_valid = false;
+		std::array<uint32_t, 8> values {};
+		const char* reason = [&]() -> const char* {
+			if (resource_index >= program.info.buffers.size() || resource_index >= snapshot.buffers.size())
+				return "missing-recipe-resource";
+			const auto& resource = program.info.buffers[resource_index];
+			binding_index = resource.descriptor_index;
+			if (binding_index < prepared->buffer_sources.size()) source = &prepared->buffer_sources[binding_index];
+			if (binding_index < prepared->buffers.size()) native = &prepared->buffers[binding_index];
+			const auto& words = snapshot.buffers[resource_index];
+			if (words.dword_count != 4u) return "descriptor-word-count";
+			std::memcpy(descriptor.fields, words.dwords.data(), sizeof(descriptor.fields));
+			if (binding_index != resource_index || resource.first_use_pc != expected_pc ||
+			    !resource.read || !resource.scalar || resource.written || resource.atomic || resource.formatted ||
+			    resource.image_alias != ShaderRecompiler::IR::BufferResource::NoImageAlias ||
+			    resource.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer ||
+			    !resource.indirect_resources.empty() || !program.info.user_data_registers.empty())
+				return "recipe-mapping-or-access";
+			if (source == nullptr || native == nullptr) return "missing-native-binding";
+			const uint64_t offset_word = uint64_t {program.bindings.memory_offset_dword} + binding_index / 4u;
+			if (offset_word >= prepared->shader_data.size()) return "missing-packed-offset";
+			adjustment = (prepared->shader_data[static_cast<size_t>(offset_word)] >> ((binding_index % 4u) * 8u)) & 255u;
+			if (adjustment != 0u) return "nonzero-packed-offset";
+			// These emitted recipes were proved with stride16, 2/3/0x112 records and
+			// this exact non-address descriptor encoding. Reject changed variants.
+			if ((descriptor.fields[1] & 0xffff0000u) != 0x00100000u || descriptor.fields[3] != 0x0004dfacu ||
+			    descriptor.GetSize() != declared_bytes || source->address != descriptor.Base48() ||
+			    source->size != declared_bytes || !GuestRange {source->address, source->size}.Valid())
+				return "descriptor-or-resolved-range";
+			if (native->buffer == nullptr || native->range == VK_WHOLE_SIZE || native->range != declared_bytes)
+				return "native-range";
+			if (native->buffer != stream.Handle()) return "not-mapped-stream";
+			if (stream.Usage() != MemoryUsage::Stream || mapped.empty()) return "stream-not-mapped";
+			const auto fits = [](uint64_t offset, uint64_t size, uint64_t capacity) {
+				return offset <= capacity && size <= capacity - offset;
+			};
+			if (!fits(native->offset, native->range, stream.Size()) ||
+			    !fits(native->offset, native->range, mapped.size()))
+				return "mapped-extent";
+			// Validate by subtraction before adding the proved logical byte offset.
+			if (!fits(selected_offset, selected_bytes, native->range)) return "selected-native-extent";
+			selected_native_offset = native->offset + selected_offset;
+			if (!fits(selected_native_offset, selected_bytes, mapped.size())) return "selected-mapped-extent";
+			selected_range_valid = true;
+			for (const auto* other: stages) {
+				if (other == nullptr || other->runtime == nullptr || !*other->runtime) return "invalid-bound-stage";
+				const auto& other_program = *other->runtime->program;
+				if (other_program.has_address_writes ||
+				    std::any_of(other_program.info.buffers.begin(), other_program.info.buffers.end(),
+				                [](const auto& r) { return r.written || r.atomic; })) return "bound-buffer-or-address-write";
+				if (other->images.size() != other_program.info.images.size() ||
+				    std::any_of(other_program.info.images.begin(), other_program.info.images.end(),
+				                [](const auto& r) { return r.written || r.atomic || r.atomic64; }) ||
+				    std::any_of(other->images.begin(), other->images.end(),
+				                [](const auto& b) { return b.desc.type == TextureCache::BindingType::Storage; }))
+					return "bound-storage-image-or-unknown-write";
+			}
+			const auto check_info = [&](const ImageInfo& info) -> const char* {
+				for (const auto range: {info.data, info.stencil, info.metadata.range}) {
+					if (range.Empty()) continue;
+					if (!range.Valid()) return "invalid-attachment-range";
+					if (ImageRangeOverlaps(source->address, source->size, range.address, range.size))
+						return "attachment-overlap";
+				}
+				return nullptr;
+			};
+			if (invalid_attachment) return "unresolved-attachment";
+			for (const auto* info: attachment_infos) {
+				if (info == nullptr) return "unresolved-attachment";
+				if (const auto* why = check_info(*info)) return why;
+			}
+			for (const auto& color: colors)
+				if (const auto* why = check_info(color.desc.info)) return why;
+			// The production Commit already flushed this host-written reservation and
+			// protected its lifetime. Copy now; never keep a mapped pointer for later.
+			std::memcpy(values.data(), mapped.data() + static_cast<size_t>(selected_native_offset), selected_bytes);
+			return nullptr;
+		}();
+		record += fmt::format("PanelProducer native-scalar call={} stage={} hash={:016x} resource={} binding={} "
+		    "state={} reason={} origin={} gpu_completed=0 sharp={:08x},{:08x},{:08x},{:08x} "
+		    "guest={:016x} declared={} resolved={:016x}:{} native={:016x} offset={} range={} "
+		    "stream={:016x} stream_size={} mapped_size={} coherent={} adjustment={} selected_offset={} selected_bytes={} "
+		    "selected_native_offset={} selected_range_valid={} role={}",
+		    call, stage_index, program.shader_hash, resource_index, binding_index,
+		    reason == nullptr ? "captured" : "skipped", reason == nullptr ? "ok" : reason,
+		    reason == nullptr ? "mapped-stream-upload" : "none", descriptor.fields[0], descriptor.fields[1],
+		    descriptor.fields[2], descriptor.fields[3], descriptor.Base48(), descriptor.GetSize(),
+		    source != nullptr ? source->address : 0, source != nullptr ? source->size : 0,
+		    native != nullptr ? PanelNativeHandle(native->buffer) : 0, native != nullptr ? native->offset : 0,
+		    native != nullptr ? native->range : 0, PanelNativeHandle(stream.Handle()), stream.Size(), mapped.size(),
+		    stream.IsCoherent(), adjustment, selected_offset, selected_bytes, selected_native_offset, selected_range_valid, role);
+		if (reason == nullptr) {
+			record += " dwords=";
+			for (uint32_t i = 0; i < selected_bytes / sizeof(uint32_t); ++i) record += fmt::format("{:08x},", values[i]);
+			record += " floats=";
+			for (uint32_t i = 0; i < selected_bytes / sizeof(uint32_t); ++i) record += fmt::format("{},", std::bit_cast<float>(values[i]));
+		}
+		record += "\n";
+	}
+}
+
 struct PanelInputReadback {
 	VmaAllocator allocator = nullptr;
 	VkBuffer buffer = VK_NULL_HANDLE;
@@ -1213,7 +1387,7 @@ bool QueuePanelInputCapture(CommandBuffer& command, Image& image, uint32_t bytes
 		LOGF("%s capture allocation failed: result=%d bytes=%u\n", label, static_cast<int>(result), bytes);
 		return false;
 	}
-	// Eligibility requires one native mip/layer and no split state. Restore the exact
+	// Eligibility requires one native mip/array layer and no split state. Restore the exact
 	// stage/access/layout with GetBarriers, since Transit derives a broader stage mask.
 	const auto previous = image.backing.state;
 	const vk::BufferImageCopy copy {0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
@@ -1239,14 +1413,19 @@ bool QueuePanelInputCapture(CommandBuffer& command, Image& image, uint32_t bytes
 	command.Handle().pipelineBarrier2(dependency);
 	auto& scheduler = command.GetContext().GetCommandScheduler();
 	const auto tick = scheduler.CurrentTick();
+	const uint64_t row_bytes = static_cast<uint64_t>(image.backing.extent.width) *
+	                           PanelCaptureTexelBytes(image.backing.format);
+	const uint64_t slice_bytes = row_bytes * image.backing.extent.height;
 	metadata += fmt::format("capture file={} bytes={} row_bytes={} native_format={} ({}) "
-	                        "extent={}x{} tick={} layout={} access={:x} stage={:x}\n",
-	                        path, bytes, bytes / image.backing.extent.height,
+	                        "extent={}x{} tick={} layout={} access={:x} stage={:x} "
+	                        "depth={} slice_bytes={} order=z-y-x native_type={}\n",
+	                        path, bytes, row_bytes,
 	                        static_cast<uint32_t>(image.backing.format), vk::to_string(image.backing.format),
 	                        image.backing.extent.width, image.backing.extent.height, tick,
 	                        static_cast<uint32_t>(previous.layout),
 	                        static_cast<uint64_t>(previous.access_mask),
-	                        static_cast<uint64_t>(previous.pl_stage));
+	                        static_cast<uint64_t>(previous.pl_stage), image.backing.extent.depth,
+	                        slice_bytes, static_cast<uint32_t>(image.backing.image_type));
 	// The normal deferred queue retains the dedicated allocation until this tick is
 	// complete. Shutdown submits and drains that queue before the allocator is destroyed.
 	scheduler.DeferOperation([readback = std::move(readback), path, metadata = std::move(metadata), bytes,
@@ -1684,6 +1863,26 @@ void RenderExecutor::TracePanelProducerDraw(uint64_t submit_id, CommandBuffer& b
 		    blend.alpha_srcblend, blend.alpha_comb_fcn, blend.alpha_destblend, blend.separate_alpha_blend,
 		    static_cast<uint32_t>(metadata.kind), metadata.range.address, metadata.range.size, metadata.clear_word);
 	}
+	if (trace_due && match.images != 0 && PanelNativeScalarTraceEnabled()) {
+		// Resolve through RenderExecutor's existing read-only cache access. The free
+		// helper receives stable const metadata only; GetImage would touch the cache.
+		std::array<const ImageInfo*, 9> attachment_infos {};
+		size_t attachment_count = 0;
+		bool invalid_attachment = false;
+		const auto append_attachment = [&](ImageId id) {
+			if (attachment_count == attachment_infos.size()) {
+				invalid_attachment = true;
+				return;
+			}
+			const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
+			invalid_attachment |= image == nullptr;
+			attachment_infos[attachment_count++] = image != nullptr ? &image->info : nullptr;
+		};
+		for (const auto& color: colors) append_attachment(color.image_id);
+		if (depth.image_id) append_attachment(depth.image_id);
+		AppendPanelNativeScalars(record, m_producer_order, buffer, colors,
+		                        std::span {attachment_infos.data(), attachment_count}, invalid_attachment, stages);
+	}
 	TracePanelBindings("PanelProducer", m_producer_order, buffer, std::move(record), colors, depth.image_id, stages,
 	                   clear, trace_due, capture_due ? &prefix : nullptr,
 	                   capture_due ? milestones[m_producer_capture.index] : 0u, m_producer_capture);
@@ -1802,6 +2001,8 @@ void RenderExecutor::TracePanelBindings(const char* label, uint32_t call, Comman
 	const auto* capture_filter = std::strcmp(label, "PanelProducer") == 0 ? &GetPanelUpstreamCaptureFilter() : nullptr;
 	const bool exact_capture = capture_filter != nullptr && capture_filter->exact;
 	const bool capture_due = capture_prefix != nullptr && (capture_filter == nullptr || capture_filter->enabled);
+	const bool vertex_multiplier_capture = capture_due && capture_filter != nullptr &&
+	                                       PanelVertexMultiplierCaptureEnabled();
 	// video_out marks the exact cache image selected by the presenter. Explicit preview
 	// paths can mark other images too; addresses/IDs correlate with the surface trace.
 	for (uint32_t i = 0; i < colors.size(); ++i) {
@@ -1828,6 +2029,7 @@ void RenderExecutor::TracePanelBindings(const char* label, uint32_t call, Comman
 		uint32_t stage;
 		uint32_t index;
 		uint64_t shader_hash;
+		bool vertex_multiplier;
 	};
 	std::array<Candidate, 16> candidates {};
 	uint32_t candidate_count = 0;
@@ -1929,9 +2131,12 @@ void RenderExecutor::TracePanelBindings(const char* label, uint32_t call, Comman
 			    image->IsCpuDirty(), image->IsBufferModified(), image->IsGpuModified(), binding.mip_views.size());
 			// Trace every binding as before; selection uses this actual program and its
 			// logical image index, never a descriptor-kind bank slot.
+			const bool multiplier_input = vertex_multiplier_capture && program.stage == ShaderType::Vertex &&
+			                              program.shader_hash == PanelMultiplierVertexShader && i == 0u;
 			if (!exact_capture || (program.stage == ShaderType::Pixel && program.shader_hash == capture_filter->ps_hash &&
-			                       i == capture_filter->image_index)) {
-				candidates[candidate_count++] = {image, &binding, actual_view, &resource, stage_index, i, program.shader_hash};
+			                       i == capture_filter->image_index) || multiplier_input) {
+				candidates[candidate_count++] = {image, &binding, actual_view, &resource, stage_index, i,
+				                                 program.shader_hash, multiplier_input};
 			}
 		}
 		if (shown != prepared.images.size()) {
@@ -1957,41 +2162,73 @@ void RenderExecutor::TracePanelBindings(const char* label, uint32_t call, Comman
 	}
 	if (trace_due) LOGF("%s", record.c_str());
 	if (!capture_due) return;
+	if (vertex_multiplier_capture) {
+		// Vertex bindings are traced first, but the companion must never consume a set
+		// unless the selected pixel input has already queued successfully.
+		std::stable_partition(candidates.begin(), candidates.begin() + candidate_count,
+		    [](const Candidate& candidate) { return !candidate.vertex_multiplier; });
+	}
 	constexpr uint64_t set_limit = 64u * 1024u * 1024u;
 	constexpr uint64_t total_limit = 2u * set_limit;
 	uint64_t set_bytes = 0;
 	std::array<vk::Image, 2> captured {};
 	uint32_t captured_count = 0;
+	bool primary_queued = false;
+	bool multiplier_queued = false;
+	const char* multiplier_reason = "no-resolved-exact-vertex-input";
 	const char* reason = rendering_clear ? "rendering-clear-would-be-replayed"
 	                   : uncertain_writes ? "shader-buffer-or-address-writes"
 	                   : exact_capture ? "capture-filter-no-resolved-pixel-input" : "no-sampled-input";
 	for (uint32_t i = 0; !rendering_clear && !uncertain_writes && i < candidate_count &&
 	                       captured_count < captured.size(); ++i) {
 		const auto& candidate = candidates[i];
+		if (candidate.vertex_multiplier && !primary_queued) {
+			multiplier_reason = "primary-lut-not-queued";
+			continue;
+		}
+		const char*& candidate_reason = candidate.vertex_multiplier ? multiplier_reason : reason;
 		const auto& resource = *candidate.resource;
 		auto& image = *candidate.image;
 		const auto& backing = image.backing;
 		const auto* view = candidate.view;
+		const bool plain_2d = view != nullptr && view->type == vk::ImageViewType::e2D &&
+		                      backing.image_type == vk::ImageType::e2D && backing.extent.depth == 1;
+		// Whole-volume readback is available only for an explicitly selected producer
+		// input. A 3D image has one Vulkan array layer; Z slices belong to its extent.
+		const bool exact_volume = exact_capture && view != nullptr && view->type == vk::ImageViewType::e3D &&
+		                          backing.image_type == vk::ImageType::e3D && image.info.IsVolume() &&
+		                          image.info.extent == backing.extent && backing.extent.depth != 0 &&
+		                          backing.extent.depth <= 256;
 		if (resource.resource_class != ShaderRecompiler::IR::ImageResourceClass::Sampled ||
 		    !resource.read || resource.written || candidate.binding->desc.type != TextureCache::BindingType::Texture) {
-			if (exact_capture) reason = "selected-input-is-not-read-only-sampled-texture";
+			if (exact_capture) candidate_reason = "selected-input-is-not-read-only-sampled-texture";
 			continue;
 		}
 		if (view == nullptr || view->aspect != vk::ImageAspectFlagBits::eColor ||
-		    view->type != vk::ImageViewType::e2D || view->base_level != 0 || view->level_count != 1 ||
+		    (!plain_2d && !exact_volume) || view->base_level != 0 || view->level_count != 1 ||
 		    view->base_layer != 0 || view->layer_count != 1 || candidate.binding->mip_views.size() > 1 ||
 		    backing.image == nullptr || !image.registered || image.depth_id || image.info.IsDepth() ||
-		    backing.image_type != vk::ImageType::e2D || backing.samples != 1 || backing.mip_levels != 1 ||
+		    backing.samples != 1 || backing.mip_levels != 1 ||
 		    backing.layers != 1 || image.info.resources.levels != 1 || image.info.resources.layers != 1 ||
 		    !backing.subresource_states.empty() || backing.state.layout == vk::ImageLayout::eUndefined ||
 		    backing.state.layout == vk::ImageLayout::ePreinitialized ||
-		    !(backing.usage & vk::ImageUsageFlagBits::eTransferSrc) || backing.extent.depth != 1 ||
+		    !(backing.usage & vk::ImageUsageFlagBits::eTransferSrc) ||
 		    backing.extent.width == 0 || backing.extent.height == 0 ||
 		    backing.extent.width > 8192 || backing.extent.height > 8192) {
-			reason = "unsupported-native-image-or-view";
+			candidate_reason = "unsupported-native-image-or-view";
 			continue;
 		}
-		if (std::find(captured.begin(), captured.end(), backing.image) != captured.end()) continue;
+		if (candidate.vertex_multiplier &&
+		    (!plain_2d || backing.format != vk::Format::eR32G32B32A32Sfloat ||
+		     view->format != vk::Format::eR32G32B32A32Sfloat ||
+		     backing.extent.width != 1 || backing.extent.height != 1 || backing.extent.depth != 1)) {
+			candidate_reason = "vertex-multiplier-requires-1x1-rgba32f-2d-view";
+			continue;
+		}
+		if (std::find(captured.begin(), captured.end(), backing.image) != captured.end()) {
+			if (candidate.vertex_multiplier) multiplier_reason = "input-already-captured";
+			continue;
+		}
 		bool overlaps = false;
 		for (uint32_t target = 0; target < colors.size(); ++target) {
 			const auto* other = cache.m_slot_images.try_get(colors[target].image_id);
@@ -2008,33 +2245,46 @@ void RenderExecutor::TracePanelBindings(const char* label, uint32_t call, Comman
 			}
 		}
 		if (overlaps) {
-			reason = "input-overlaps-render-or-storage-write";
+			candidate_reason = "input-overlaps-render-or-storage-write";
 			continue;
 		}
 		const auto texel_bytes = PanelCaptureTexelBytes(backing.format);
-		const uint64_t bytes = static_cast<uint64_t>(backing.extent.width) * backing.extent.height * texel_bytes;
+		const uint64_t bytes = static_cast<uint64_t>(backing.extent.width) * backing.extent.height *
+		                       backing.extent.depth * texel_bytes;
 		if (bytes == 0 || bytes > set_limit || bytes > set_limit - set_bytes ||
 		    bytes > total_limit - capture.bytes) {
-			reason = "unsupported-native-format-or-byte-cap";
+			candidate_reason = "unsupported-native-format-or-byte-cap";
 			continue;
 		}
 		const auto path = fmt::format("{}-draw{}-stage{}-image{}-{:016x}.bin", *capture_prefix,
 		                              call, candidate.stage, candidate.index, PanelNativeHandle(backing.image));
 		auto metadata = record + fmt::format("selected stage={} image={} milestone={}\n",
 		    candidate.stage, candidate.index, milestone);
-		if (exact_capture) {
+		if (candidate.vertex_multiplier) {
+			metadata += fmt::format("selected_filter mode=exact-vertex-multiplier primary_ps={:016x} "
+			    "primary_logical_image=3 requested_vs={:016x} requested_logical_image=0 actual_vs={:016x} "
+			    "actual_logical_image={} descriptor_binding={} primary_queued=1 index_scope=program.info.images\n",
+			    PanelMultiplierPrimaryPs, PanelMultiplierVertexShader, candidate.shader_hash,
+			    candidate.index, resource.descriptor_index);
+		} else if (exact_capture) {
 			metadata += fmt::format("selected_filter mode=exact-pixel-input requested_ps={:016x} "
 			    "requested_logical_image={} actual_ps={:016x} actual_logical_image={} descriptor_binding={} "
 			    "index_scope=program.info.images\n", capture_filter->ps_hash, capture_filter->image_index,
 			    candidate.shader_hash, candidate.index, resource.descriptor_index);
 		}
 		if (!QueuePanelInputCapture(buffer, image, static_cast<uint32_t>(bytes), path, metadata, label)) {
-			reason = "staging-allocation-failed";
+			candidate_reason = "staging-allocation-failed";
 			continue;
 		}
+		if (candidate.vertex_multiplier) multiplier_queued = true;
+		else if (vertex_multiplier_capture) primary_queued = true;
 		captured[captured_count++] = backing.image;
 		set_bytes += bytes;
 		capture.bytes += bytes;
+	}
+	if (vertex_multiplier_capture && primary_queued && !multiplier_queued) {
+		LOGF("%s capture companion skipped: call=%u milestone=%u mode=exact-vertex-multiplier "
+		     "reason=%s primary_queued=1\n", label, call, milestone, multiplier_reason);
 	}
 	if (captured_count != 0) {
 		if (!trace_due) LOGF("%s", record.c_str());
