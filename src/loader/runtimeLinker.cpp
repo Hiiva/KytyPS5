@@ -1677,7 +1677,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #else
 	const bool protect_memory_faults = false;
 #endif
-	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+	const bool trace_horizon_kismet = HorizonKismetTraceEnabled() &&
+	    Common::EqualNoCase(program->file_name.filename().string(), "eboot.bin");
+	const bool patch_guest_instructions = protect_memory_faults || emulate_amd || trace_horizon_kismet;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -1844,6 +1846,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		}
 	}
 
+	if (trace_horizon_kismet) {
+		InstallHorizonKismetTrace(program->base_vaddr, program->base_size_aligned);
+	}
 	if (!is_shared) {
 		SetupTlsHandler(program);
 	}

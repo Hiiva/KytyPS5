@@ -10,8 +10,11 @@
 #include <Zydis/Zydis.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <climits>
+#include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -101,6 +104,122 @@ namespace {
 constexpr size_t GuestRedZoneSize = 128;
 constexpr size_t ShortJumpSize    = 2;
 using RedZoneMask                 = std::bitset<GuestRedZoneSize>;
+
+constexpr u64 HorizonComputedJumpRva = 0x2701d6a;
+constexpr u32 HorizonTraceCapacity   = 2048;
+constexpr std::array<u8, 18> HorizonComputedJumpSignature {
+    0x49, 0x8b, 0x44, 0x24, 0x10, // mov rax,[r12+0x10]
+    0x48, 0x63, 0x4d, 0x94,       // movsxd rcx,dword [rbp-0x6c]
+    0x48, 0x03, 0x48, 0x60,       // add rcx,[rax+0x60]
+    0x49, 0x89, 0x4c, 0x24, 0x20, // mov [r12+0x20],rcx
+};
+constexpr std::array<u8, 17> HorizonComputedJumpPrologue {
+    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+    0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x48,
+};
+
+// Stable readback layout: committed@0, entry@4, script_num@8, reserved@12,
+// object@16, node@24, frame@32, script@40, code@48, native_frame@56.
+// Each slot is written once. Its aligned committed store publishes the payload
+// with x86 release ordering; the host drains with an acquire load.
+struct alignas(8) HorizonKismetTraceRecord {
+	std::atomic<u32> committed {0};
+	u32              entry        = 0;
+	u32              script_num   = 0;
+	u32              reserved     = 0;
+	u64              object       = 0;
+	u64              node         = 0;
+	u64              frame        = 0;
+	u64              script       = 0;
+	u64              code         = 0;
+	u64              native_frame = 0;
+};
+static_assert(std::atomic<u32>::is_always_lock_free && sizeof(std::atomic<u32>) == 4);
+static_assert(sizeof(HorizonKismetTraceRecord) == 64);
+static_assert(offsetof(HorizonKismetTraceRecord, committed) == 0);
+static_assert(offsetof(HorizonKismetTraceRecord, native_frame) == 56);
+
+struct HorizonKismetTraceBuffer {
+	std::atomic<u32>                                      reserved {0};
+	std::array<HorizonKismetTraceRecord, HorizonTraceCapacity> records {};
+};
+
+static std::unique_ptr<HorizonKismetTraceBuffer> g_horizon_trace_buffer;
+static std::atomic_bool                          g_horizon_trace_active {false};
+static std::mutex                               g_horizon_trace_drain_mutex;
+static u64                                      g_horizon_trace_module = 0;
+static u32                                      g_horizon_trace_drained = 0;
+
+void GenerateHorizonKismetTrace(Xbyak::CodeGenerator& generator,
+                               HorizonKismetTraceBuffer* buffer, const void* continuation) {
+	Xbyak::Label done, script_size_matched, reserve;
+	// No SIMD, floating-point, TLS, calls, or guest red-zone writes. Save every
+	// GPR except rsp, which is restored exactly by the paired stack operations.
+	generator.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+	generator.pushfq();
+	const std::array<Xbyak::Reg64, 15> saved {
+	    rax, rcx, rdx, rbx, rbp, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15};
+	for (const auto& reg: saved) generator.push(reg);
+
+	generator.mov(r10, reinterpret_cast<u64>(&buffer->reserved));
+	generator.cmp(dword[r10], HorizonTraceCapacity);
+	generator.jae(done, Xbyak::CodeGenerator::T_NEAR);
+	generator.mov(r8, ptr[r12 + 0x10]); // FFrame::Node, used by the stolen instruction.
+	generator.test(r8, r8);
+	generator.jz(done, Xbyak::CodeGenerator::T_NEAR);
+	generator.mov(edx, dword[r8 + 0x68]); // UStruct::Script.Num.
+	generator.cmp(edx, 14119);
+	generator.je(script_size_matched, Xbyak::CodeGenerator::T_NEAR);
+	generator.cmp(edx, 24737);
+	generator.jne(done, Xbyak::CodeGenerator::T_NEAR);
+	generator.L(script_size_matched);
+	generator.mov(r9, ptr[r8 + 0x60]); // UStruct::Script.Data.
+	generator.test(r9, r9);
+	generator.jz(done, Xbyak::CodeGenerator::T_NEAR);
+	// Both verified graphs start PushExecutionFlow(Num-3), ComputedJump:
+	// movement 4c 24 37 00 00 4e; calibration 4c 9e 60 00 00 4e.
+	generator.cmp(byte[r9], 0x4c);
+	generator.jne(done, Xbyak::CodeGenerator::T_NEAR);
+	generator.lea(ecx, ptr[rdx - 3]);
+	generator.cmp(dword[r9 + 1], ecx);
+	generator.jne(done, Xbyak::CodeGenerator::T_NEAR);
+	generator.cmp(byte[r9 + 5], 0x4e);
+	generator.jne(done, Xbyak::CodeGenerator::T_NEAR);
+	generator.mov(esi, dword[rbp - 0x6c]);
+	generator.cmp(esi, edx); // Unsigned comparison also rejects negative entries.
+	generator.jae(done, Xbyak::CodeGenerator::T_NEAR);
+
+	// Saturating reservation: no overwrite or counter wrap after the fixed limit.
+	generator.mov(eax, dword[r10]);
+	generator.L(reserve);
+	generator.cmp(eax, HorizonTraceCapacity);
+	generator.jae(done, Xbyak::CodeGenerator::T_NEAR);
+	generator.lea(ecx, ptr[rax + 1]);
+	generator.lock();
+	generator.cmpxchg(dword[r10], ecx);
+	generator.jne(reserve, Xbyak::CodeGenerator::T_NEAR);
+	generator.shl(rax, 6);
+	generator.mov(r11, reinterpret_cast<u64>(buffer->records.data()));
+	generator.add(r11, rax);
+	generator.mov(dword[r11 + offsetof(HorizonKismetTraceRecord, entry)], esi);
+	generator.mov(dword[r11 + offsetof(HorizonKismetTraceRecord, script_num)], edx);
+	generator.mov(rax, ptr[r12 + 0x18]);
+	generator.mov(ptr[r11 + offsetof(HorizonKismetTraceRecord, object)], rax);
+	generator.mov(ptr[r11 + offsetof(HorizonKismetTraceRecord, node)], r8);
+	generator.mov(ptr[r11 + offsetof(HorizonKismetTraceRecord, frame)], r12);
+	generator.mov(ptr[r11 + offsetof(HorizonKismetTraceRecord, script)], r9);
+	generator.mov(rax, ptr[r12 + 0x20]);
+	generator.mov(ptr[r11 + offsetof(HorizonKismetTraceRecord, code)], rax);
+	generator.mov(ptr[r11 + offsetof(HorizonKismetTraceRecord, native_frame)], rbp);
+	generator.mov(dword[r11 + offsetof(HorizonKismetTraceRecord, committed)], ecx);
+
+	generator.L(done);
+	for (auto it = saved.rbegin(); it != saved.rend(); ++it) generator.pop(*it);
+	generator.popfq();
+	generator.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+	generator.mov(rax, ptr[r12 + 0x10]); // Replay the exact stolen instruction.
+	generator.jmp(continuation);
+}
 
 struct DecodedCodeInstruction {
 	uintptr_t                                                address {};
@@ -1740,6 +1859,110 @@ bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_fram
 		function_starts->push_back(function_start);
 	}
 	return true;
+}
+
+bool HorizonKismetTraceEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_HORIZON_KISMET_TRACE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+bool InstallHorizonKismetTrace(uint64_t module_addr, uint64_t module_size) {
+	if (!HorizonKismetTraceEnabled()) return false;
+	if (g_horizon_trace_active.load(std::memory_order_acquire)) {
+		return g_horizon_trace_module == module_addr;
+	}
+	const auto reject = [](const char* reason) {
+		Log::WriteToConsoleAndLog(fmt::format("Horizon Kismet trace not installed: {}\n", reason));
+		return false;
+	};
+	if (module_addr == 0 || module_size > UINT64_MAX - module_addr ||
+	    HorizonComputedJumpRva > module_size ||
+	    HorizonComputedJumpSignature.size() > module_size - HorizonComputedJumpRva) {
+		return reject("module range does not contain the verified hook");
+	}
+	auto* module = GetContainingModule(reinterpret_cast<const void*>(module_addr));
+	if (module == nullptr || reinterpret_cast<u64>(module->start) != module_addr ||
+	    static_cast<u64>(module->end - module->start) < module_size) {
+		return reject("registered instruction trampoline area unavailable");
+	}
+	std::unique_lock lock {module->mutex};
+	auto* hook = reinterpret_cast<u8*>(module_addr + HorizonComputedJumpRva);
+	if (std::memcmp(hook, HorizonComputedJumpSignature.data(), HorizonComputedJumpSignature.size()) != 0 ||
+	    std::memcmp(reinterpret_cast<const void*>(module_addr + 0x2701ce0),
+	                HorizonComputedJumpPrologue.data(), HorizonComputedJumpPrologue.size()) != 0 ||
+	    std::memcmp(reinterpret_cast<const void*>(module_addr + 0x2701cff), "\x49\x89\xf4", 3) != 0) {
+		return reject("eboot computed-jump signature mismatch");
+	}
+
+	auto buffer = std::make_unique<HorizonKismetTraceBuffer>();
+	auto& generator = module->trampoline_gen;
+	const size_t begin = generator.getSize();
+	const auto trampoline = reinterpret_cast<u64>(generator.getCode()) + begin;
+	const u64 continuation = reinterpret_cast<u64>(hook) + NearJumpSize;
+	const s64 displacement = static_cast<s64>(trampoline) - static_cast<s64>(continuation);
+	if (displacement < INT32_MIN || displacement > INT32_MAX) {
+		return reject("instruction trampoline is outside rel32 range");
+	}
+	Xbyak::ClearError();
+	GenerateHorizonKismetTrace(generator, buffer.get(), reinterpret_cast<const void*>(continuation));
+	const auto rollback = [&] {
+		generator.reset();
+		generator.setSize(begin);
+		Xbyak::ClearError();
+	};
+	if (const int error = Xbyak::GetError(); error != 0) {
+		rollback();
+		return reject(Xbyak::ConvertErrorToString(error));
+	}
+	const size_t trampoline_size = generator.getSize() - begin;
+	if (!Common::VirtualMemory::FlushInstructionCache(trampoline, trampoline_size)) {
+		rollback();
+		return reject("could not finalize the instruction trampoline");
+	}
+	std::array<u8, NearJumpSize> jump {0xe9};
+	const auto relative = static_cast<s32>(displacement);
+	std::memcpy(jump.data() + 1, &relative, sizeof(relative));
+	std::memcpy(hook, jump.data(), jump.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<u64>(hook), jump.size())) {
+		std::memcpy(hook, HorizonComputedJumpSignature.data(), jump.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<u64>(hook), jump.size());
+		rollback();
+		return reject("could not finalize the hook; original bytes restored");
+	}
+	g_horizon_trace_buffer = std::move(buffer);
+	g_horizon_trace_module = module_addr;
+	g_horizon_trace_active.store(true, std::memory_order_release);
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Horizon Kismet trace installed: hook=0x{:016x} trampoline=0x{:016x} bytes={} "
+	    "counter=0x{:016x} records=0x{:016x} capacity={} record_size=64 layout=1 "
+	    "script_nums=14119,24737\n",
+	    reinterpret_cast<u64>(hook), trampoline, trampoline_size,
+	    reinterpret_cast<u64>(&g_horizon_trace_buffer->reserved),
+	    reinterpret_cast<u64>(g_horizon_trace_buffer->records.data()), HorizonTraceCapacity));
+	return true;
+}
+
+void DrainHorizonKismetTrace() {
+	if (!g_horizon_trace_active.load(std::memory_order_acquire)) return;
+	std::unique_lock lock {g_horizon_trace_drain_mutex, std::try_to_lock};
+	if (!lock.owns_lock()) return;
+	for (u32 count = 0; count < 64 && g_horizon_trace_drained < HorizonTraceCapacity; ++count) {
+		const auto& record = g_horizon_trace_buffer->records[g_horizon_trace_drained];
+		if (record.committed.load(std::memory_order_acquire) != g_horizon_trace_drained + 1) break;
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Horizon Kismet event: seq={} graph={} entry=0x{:04x} object=0x{:016x} "
+		    "node=0x{:016x} frame=0x{:016x} script=0x{:016x} code=0x{:016x} rbp=0x{:016x}\n",
+		    g_horizon_trace_drained + 1, record.script_num == 14119 ? "movement" : "calibration",
+		    record.entry, record.object, record.node, record.frame, record.script, record.code,
+		    record.native_frame));
+		++g_horizon_trace_drained;
+		if (g_horizon_trace_drained == HorizonTraceCapacity) {
+			Log::WriteToConsoleAndLog("Horizon Kismet trace capacity reached: 2048 events; recording stopped\n");
+		}
+	}
 }
 
 void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,

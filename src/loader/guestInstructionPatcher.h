@@ -56,6 +56,13 @@ void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
                                          void* trampoline_area_ptr, uint64_t trampoline_area_size);
 void UnregisterGuestInstructionPatchModule(void* module_ptr);
 
+// Opt-in diagnostic for the verified PPSA05666 eboot only. The loader installs
+// before guest execution; the guest hook records without calling host code.
+bool HorizonKismetTraceEnabled();
+bool InstallHorizonKismetTrace(uint64_t module_addr, uint64_t module_size);
+// Call from a periodic host frame path. A disabled trace only checks an atomic.
+void DrainHorizonKismetTrace();
+
 // Apply enabled instruction fixes using native trampolines or safe trap fallbacks.
 GuestInstructionPatchResult PatchGuestInstructions(
     uint64_t segment_addr, uint64_t segment_size, std::span<const uintptr_t> function_starts,

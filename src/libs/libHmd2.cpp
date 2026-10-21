@@ -10,6 +10,7 @@
 #include "libs/controller.h"
 #include "kernel/pthread.h"
 #include "libs/libs.h"
+#include "loader/guestInstructionPatcher.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
@@ -217,6 +218,7 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionBeginFrame(uint64_t frame) {
     if (GetReprojectionState() == nullptr) {
         return ERROR_REPROJECTION_NOT_INITIALIZED;
     }
+    Loader::DrainHorizonKismetTrace();
     g_last_virtual_frame.store(frame, std::memory_order_relaxed);
     return OK;
 }
