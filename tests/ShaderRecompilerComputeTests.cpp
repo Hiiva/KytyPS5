@@ -454,6 +454,20 @@ struct RenderExecutorTestAccess {
     return executor.QueuePanelGpuCompositeUvReadback(command, plan, std::move(completion));
   }
 
+  static const char *PlanPanelGpuCompositeGainsCapture(const RenderExecutor &executor,
+      const CommandBuffer &command, std::span<const RenderColorInfo> colors,
+      ImageId depth, const RenderState &rendering,
+      std::span<PreparedBindings *const> stages, PanelGpuScalarPlan &plan) {
+    return executor.PlanPanelGpuCompositeGainsCapture(
+        command, colors, depth, rendering, stages, plan);
+  }
+
+  static bool QueuePanelGpuCompositeGainsReadback(RenderExecutor &executor,
+      CommandBuffer &command, const PanelGpuScalarPlan &plan,
+      Common::UniqueFunction<void, bool, std::array<uint32_t, 2>> completion) {
+    return executor.QueuePanelGpuCompositeGainsReadback(command, plan, std::move(completion));
+  }
+
   static std::array<uint64_t, 5> PanelGpuScalarCaptureState(
       const RenderExecutor &executor) {
     return {executor.m_gpu_scalar_capture.index, executor.m_gpu_scalar_capture.misses,
@@ -16301,6 +16315,9 @@ public:
     constexpr uint64_t composite_guest = guest + 0x400;
     constexpr uint64_t composite_uv_guest = guest + 0x500;
     constexpr uint64_t composite_declared_bytes = 48;
+    constexpr uint64_t gains_guest = guest + 0x600;
+    constexpr uint64_t gains_declared_bytes = 64, gains_selected_offset = 4;
+    constexpr std::array<uint32_t, 2> gains_a{0x3fc00000u, 0x80000000u};
     constexpr std::array<uint32_t, 7> composite_a{
         0x3f400000u, 0x80000000u, 0x7fc05678u, 0x01234567u,
         0x3f000000u, 0x7f800000u, 0x3f800000u};
@@ -16344,6 +16361,8 @@ public:
         static_cast<uint32_t>(composite_guest >> 32u) | 0x00100000u, 3u, 0x0004dfacu}};
     ShaderBufferResource composite_uv_descriptor{{static_cast<uint32_t>(composite_uv_guest),
         static_cast<uint32_t>(composite_uv_guest >> 32u) | 0x00100000u, 3u, 0x0004dfacu}};
+    ShaderBufferResource gains_descriptor{{static_cast<uint32_t>(gains_guest),
+        static_cast<uint32_t>(gains_guest >> 32u) | 0x00100000u, 4u, 0x0004dfacu}};
     GraphicsCase fragment_case;
     std::optional<CompiledShader> compiled_fragment;
     if (RasterizationSupported()) {
@@ -16378,6 +16397,7 @@ public:
     owner->Fill(uv_native_offset + sizeof(uv_a), 4, right_guard);
     const auto composite_native_offset = native_offset + (composite_guest - guest);
     const auto composite_uv_native_offset = native_offset + (composite_uv_guest - guest);
+    const auto gains_native_offset = native_offset + (gains_guest - guest);
     const auto FillGuarded = [&](uint64_t offset, const auto &words) {
       owner->Fill(offset - 4, 4, left_guard);
       for (uint32_t i = 0; i < words.size(); ++i) {
@@ -16387,6 +16407,7 @@ public:
     };
     FillGuarded(composite_native_offset, composite_a);
     FillGuarded(composite_uv_native_offset, composite_uv_a);
+    FillGuarded(gains_native_offset + gains_selected_offset, gains_a);
     const auto unrelated_id = cache.FindBuffer(base + 0x8000, 16);
 
     using Plan = RenderExecutorTestAccess::PanelGpuScalarPlan;
@@ -16444,11 +16465,11 @@ public:
     Fixture composite_fixture;
     composite_fixture.program.stage = ShaderType::Pixel;
     composite_fixture.program.shader_hash = 0x8f4f493f4d30416dull;
-    composite_fixture.program.info.buffers.resize(4);
-    composite_fixture.snapshot.buffers.resize(4);
-    composite_fixture.prepared.buffer_sources.resize(4);
-    composite_fixture.prepared.buffers.resize(4);
-    composite_fixture.prepared.shader_data.resize(1);
+    composite_fixture.program.info.buffers.resize(5);
+    composite_fixture.snapshot.buffers.resize(5);
+    composite_fixture.prepared.buffer_sources.resize(5);
+    composite_fixture.prepared.buffers.resize(5);
+    composite_fixture.prepared.shader_data.resize(2);
     for (const auto index : {0u, 3u}) {
       auto &info = composite_fixture.program.info.buffers[index];
       info.descriptor_index = index;
@@ -16465,11 +16486,22 @@ public:
       composite_fixture.prepared.buffers[index] = {
           owner->Handle(), offset, composite_declared_bytes};
     }
+    auto &gains_info = composite_fixture.program.info.buffers[4];
+    gains_info.descriptor_index = 4;
+    gains_info.first_use_pc = 0x580;
+    gains_info.read = gains_info.scalar = true;
+    auto &gains_sharp = composite_fixture.snapshot.buffers[4];
+    gains_sharp.dword_count = 4;
+    std::copy_n(gains_descriptor.fields, 4, gains_sharp.dwords.begin());
+    composite_fixture.prepared.buffer_sources[4] = {
+        gains_guest, gains_declared_bytes, unrelated_id};
+    composite_fixture.prepared.buffers[4] = {
+        owner->Handle(), gains_native_offset, gains_declared_bytes};
     ShaderStageRuntime composite_runtime{
         &composite_fixture.program, &composite_fixture.snapshot};
     composite_fixture.prepared.runtime = &composite_runtime;
     std::array<PreparedBindings *, 1> composite_stages{&composite_fixture.prepared};
-    Plan composite_plan, composite_uv_plan;
+    Plan composite_plan, composite_uv_plan, gains_plan;
     Require(name, "exact composite controls plan",
         RenderExecutorTestAccess::PlanPanelGpuCompositeControlsCapture(
             executor, command, {}, {}, {}, composite_stages, composite_plan) == nullptr &&
@@ -16488,6 +16520,31 @@ public:
         composite_uv_plan.guest_address == composite_uv_guest &&
         composite_uv_plan.guest_size == composite_declared_bytes,
         "48-byte composite UV planner accepted the wrong extent or native owner");
+    Require(name, "exact composite gains plan",
+        RenderExecutorTestAccess::PlanPanelGpuCompositeGainsCapture(
+            executor, command, {}, {}, {}, composite_stages, gains_plan) == nullptr &&
+        gains_plan.native.buffer == owner->Handle() &&
+        gains_plan.native.offset == gains_native_offset &&
+        gains_plan.selected_offset == gains_native_offset + gains_selected_offset && !gains_plan.stream &&
+        gains_plan.guest_address == gains_guest && gains_plan.guest_size == gains_declared_bytes &&
+        gains_plan.packed_offset_word == 0,
+        "8-byte gains planner lost resource4, its selected byte4 offset, or second packed word");
+    {
+      // Resource4 uses byte0 of the next packed word, after the binding's base.
+      // Nonselected bytes and earlier words must not be mistaken for its offset.
+      auto shifted = composite_fixture;
+      shifted.program.bindings.memory_offset_dword = 2;
+      shifted.prepared.shader_data = {0xffffffffu, 0xffffffffu, 0x01020304u, 0xaabbcc00u};
+      ShaderStageRuntime shifted_runtime{&shifted.program, &shifted.snapshot};
+      shifted.prepared.runtime = &shifted_runtime;
+      std::array<PreparedBindings *, 1> shifted_stages{&shifted.prepared};
+      Require(name, "resource4 second packed word",
+          RenderExecutorTestAccess::PlanPanelGpuCompositeGainsCapture(
+              executor, command, {}, {}, {}, shifted_stages, gains_plan) == nullptr &&
+          gains_plan.packed_offset_word == 0xaabbcc00u &&
+          gains_plan.selected_offset == gains_native_offset + gains_selected_offset,
+          "resource4 used the first packed word, an unrelated byte, or ignored the binding base");
+    }
 
     RenderColorInfo color{};
     color.desc.type = BindingType::RenderTarget;
@@ -16751,6 +16808,70 @@ public:
       }
     }
 
+    const auto RejectGains = [&](const char *label, const char *expected, auto mutate) {
+      auto bad = composite_fixture;
+      ShaderStageRuntime bad_runtime{&bad.program, &bad.snapshot};
+      bad.prepared.runtime = &bad_runtime;
+      mutate(bad);
+      std::array<PreparedBindings *, 1> bad_stages{&bad.prepared};
+      Plan rejected = gains_plan;
+      const auto *reason = RenderExecutorTestAccess::PlanPanelGpuCompositeGainsCapture(
+          executor, command, bad.colors, {}, bad.rendering, bad_stages, rejected);
+      Require(name, label, reason && std::strcmp(reason, expected) == 0 &&
+          rejected.native.buffer == nullptr && rejected.guest_size == 0,
+          "invalid resource4 request retained a usable plan");
+      Require(name, "gains rejection preserves recording",
+          !RenderExecutorTestAccess::QueuePanelGpuCompositeGainsReadback(
+              executor, command, rejected,
+              [&](bool, std::array<uint32_t, 2>) { ++unexpected_callbacks; }) &&
+          scheduler.CurrentTick() == tick && command.Handle() == native_command &&
+          capture_state == RenderExecutorTestAccess::PanelGpuScalarCaptureState(executor) &&
+          cache.FindRegisteredBuffer(guest, declared_bytes) == owner &&
+          cache.HasGpuDirtyBytes(guest, declared_bytes),
+          "gains rejection queued work or changed source ownership");
+    };
+    RejectGains("gains missing second packed word", "missing-packed-offset",
+        [](auto &f) { f.prepared.shader_data.resize(1); });
+    RejectGains("gains nonzero selected packed byte", "nonzero-packed-offset",
+        [](auto &f) { f.prepared.shader_data[1] = 0x01000001u; });
+    RejectGains("gains exact native instruction", "recipe-mapping-or-access",
+        [](auto &f) { f.program.info.buffers[4].first_use_pc = 0x1d0; });
+    RejectGains("gains exact declared extent", "descriptor-or-resolved-range",
+        [](auto &f) { f.snapshot.buffers[4].dwords[2] = 3; });
+    RejectGains("gains registered owner offset", "unproved-native-owner",
+        [](auto &f) { f.prepared.buffers[4].offset += 4; });
+    RejectGains("gains attachment alias", "attachment-overlap", [&](auto &f) {
+      f.colors = {color};
+      f.colors[0].desc.info.metadata.range = {gains_guest + gains_selected_offset, 8};
+    });
+    for (const auto change : {0u, 1u, 2u, 3u}) {
+      auto invalid = gains_plan;
+      if (change == 0) invalid.selected_offset = invalid.native.offset;
+      if (change == 1) invalid.native.range = 48;
+      if (change == 2) invalid.owner_size -= 4;
+      if (change == 3) invalid.packed_offset_word |= 1u;
+      Require(name, "gains queue revalidates extent and selected packed byte",
+          !RenderExecutorTestAccess::QueuePanelGpuCompositeGainsReadback(
+              executor, command, invalid,
+              [&](bool, std::array<uint32_t, 2>) { ++unexpected_callbacks; }),
+          "gains queue accepted a changed selected offset, range, owner, or second-word byte0");
+    }
+    for (const auto *wrong : {&plan, &uv_plan, &composite_plan, &composite_uv_plan}) {
+      Require(name, "gains queue rejects other recipe kinds",
+          !RenderExecutorTestAccess::QueuePanelGpuCompositeGainsReadback(
+              executor, command, *wrong,
+              [&](bool, std::array<uint32_t, 2>) { ++unexpected_callbacks; }),
+          "8-byte gains queue accepted another recipe kind");
+    }
+    Require(name, "controls queue rejects gains kind",
+        !RenderExecutorTestAccess::QueuePanelGpuCompositeControlsReadback(
+            executor, command, gains_plan,
+            [&](bool, std::array<uint32_t, 7>) { ++unexpected_callbacks; }),
+        "controls queue accepted an 8-byte gains plan");
+    Require(name, "gains queue requires completion",
+        !RenderExecutorTestAccess::QueuePanelGpuCompositeGainsReadback(executor, command, gains_plan, {}),
+        "gains queue accepted an empty completion");
+
     uint32_t completed = 0, captured_bits = 0;
     uint32_t uv_completed = 0;
     std::array<uint32_t, 12> captured_uv{};
@@ -16760,6 +16881,9 @@ public:
     bool composite_ok = false, composite_uv_ok = false;
     std::array<uint32_t, 7> captured_composite{};
     std::array<uint32_t, 12> captured_composite_uv{};
+    uint32_t gains_completed = 0;
+    bool gains_ok = false;
+    std::array<uint32_t, 2> captured_gains{};
     Require(name, "production capture queue",
         RenderExecutorTestAccess::QueuePanelGpuScalarReadback(executor, command, plan,
             [&](bool success, uint32_t bits) {
@@ -16788,9 +16912,16 @@ public:
               captured_composite_uv = bits;
               ++composite_uv_completed;
             }), "production 48-byte composite UV readback was not queued");
+    Require(name, "production composite gains queue",
+        RenderExecutorTestAccess::QueuePanelGpuCompositeGainsReadback(
+            executor, command, gains_plan, [&](bool success, std::array<uint32_t, 2> bits) {
+              gains_ok = success;
+              captured_gains = bits;
+              ++gains_completed;
+            }), "production 8-byte gains readback was not queued");
     scheduler.PopPendingOperations();
     Require(name, "deferred capture", completed == 0 && uv_completed == 0 &&
-        composite_completed == 0 && composite_uv_completed == 0 && unexpected_callbacks == 0 &&
+        composite_completed == 0 && composite_uv_completed == 0 && gains_completed == 0 && unexpected_callbacks == 0 &&
         scheduler.CurrentTick() == tick, "capture completed or submitted before its GPU tick");
 
     ShaderProgram vertex_shader{}, pixel_shader{};
@@ -16882,12 +17013,13 @@ public:
     }
 
     Require(name, "draw preserves deferred tick", completed == 0 && uv_completed == 0 &&
-        composite_completed == 0 && composite_uv_completed == 0 && scheduler.CurrentTick() == tick,
+        composite_completed == 0 && composite_uv_completed == 0 && gains_completed == 0 && scheduler.CurrentTick() == tick,
         "fragment preparation or draw forced completion before the later GPU overwrite");
     owner->Fill(plan.selected_offset, 4, gpu_b);
     owner->Fill(uv_plan.selected_offset, sizeof(uv_a), gpu_b);
     owner->Fill(composite_plan.selected_offset, sizeof(composite_a), gpu_b);
     owner->Fill(composite_uv_plan.selected_offset, sizeof(composite_uv_a), gpu_b);
+    owner->Fill(gains_plan.selected_offset, sizeof(gains_a), gpu_b);
     Libs::Graphics::Buffer guards(m_runtime_context, scheduler,
         MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, 12);
     guards.CopyFrom(command, *owner, plan.selected_offset - 4, 0, 12,
@@ -16904,6 +17036,8 @@ public:
         MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(composite_a) + 8);
     Libs::Graphics::Buffer composite_uv_guards(m_runtime_context, scheduler,
         MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(composite_uv_a) + 8);
+    Libs::Graphics::Buffer gains_guards(m_runtime_context, scheduler,
+        MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(gains_a) + 8);
     const auto CopyCompositeGuards = [&](auto &destination, const auto &capture, uint64_t bytes) {
       destination.CopyFrom(command, *owner, capture.selected_offset - 4, 0, bytes + 8,
           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite, {},
@@ -16912,6 +17046,7 @@ public:
     };
     CopyCompositeGuards(composite_guards, composite_plan, sizeof(composite_a));
     CopyCompositeGuards(composite_uv_guards, composite_uv_plan, sizeof(composite_uv_a));
+    CopyCompositeGuards(gains_guards, gains_plan, sizeof(gains_a));
     uint32_t current_guest = 0;
     Require(name, "divergent guest backing", LibKernel::Memory::TryReadBacking(
         guest + scalar_offset, &current_guest, sizeof(current_guest)) && current_guest == guest_c,
@@ -16929,12 +17064,14 @@ public:
     };
     std::array<uint32_t, 7> current_composite_guest{};
     std::array<uint32_t, 12> current_composite_uv_guest{};
+    std::array<uint32_t, 2> current_gains_guest{};
     CheckCompositeGuest(composite_guest, current_composite_guest);
     CheckCompositeGuest(composite_uv_guest, current_composite_uv_guest);
+    CheckCompositeGuest(gains_guest + gains_selected_offset, current_gains_guest);
     BufferCacheTestAccess::RetireBuffer(cache, owner_id);
     Require(name, "retirement waits for GPU", !cache.FindRegisteredBuffer(guest, declared_bytes) &&
         BufferCacheTestAccess::IsBufferAllocated(cache, owner_id) && completed == 0 && uv_completed == 0 &&
-        composite_completed == 0 && composite_uv_completed == 0,
+        composite_completed == 0 && composite_uv_completed == 0 && gains_completed == 0,
         "native source was destroyed before queued GPU commands completed");
     Require(name, "retired plan cannot queue",
         !RenderExecutorTestAccess::QueuePanelGpuScalarReadback(executor, command, plan,
@@ -16954,6 +17091,11 @@ public:
             executor, command, composite_uv_plan,
             [&](bool, std::array<uint32_t, 12>) { ++unexpected_callbacks; }),
         "retired owner remained eligible for a composite UV capture");
+    Require(name, "retired composite gains cannot queue",
+        !RenderExecutorTestAccess::QueuePanelGpuCompositeGainsReadback(
+            executor, command, gains_plan,
+            [&](bool, std::array<uint32_t, 2>) { ++unexpected_callbacks; }),
+        "retired owner remained eligible for a gains capture");
     scheduler.Finish();
     scheduler.PopPendingOperations();
     guards.Invalidate(0, 12);
@@ -16981,6 +17123,9 @@ public:
     Require(name, "exact composite UV capture ordering",
         composite_uv_completed == 1 && composite_uv_ok && captured_composite_uv == composite_uv_a,
         "composite UV capture lost payload bits or observed guest C/later GPU B");
+    Require(name, "exact composite gains capture ordering",
+        gains_completed == 1 && gains_ok && captured_gains == gains_a,
+        "gains capture lost byte4 selection/signed-zero bits or observed guest C/later GPU B");
     const auto CheckCompositeGuards = [&](auto &download, auto &words) {
       download.Invalidate(0, sizeof(words));
       std::memcpy(words.data(), download.Mapped().data(), sizeof(words));
@@ -16992,8 +17137,10 @@ public:
     };
     std::array<uint32_t, 9> actual_composite_guards{};
     std::array<uint32_t, 14> actual_composite_uv_guards{};
+    std::array<uint32_t, 4> actual_gains_guards{};
     CheckCompositeGuards(composite_guards, actual_composite_guards);
     CheckCompositeGuards(composite_uv_guards, actual_composite_uv_guards);
+    CheckCompositeGuards(gains_guards, actual_gains_guards);
     Require(name, "retired source reclamation",
         !BufferCacheTestAccess::IsBufferAllocated(cache, owner_id),
         "retired source was retained after the completed tick");

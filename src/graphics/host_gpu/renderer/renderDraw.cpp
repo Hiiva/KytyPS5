@@ -1247,8 +1247,9 @@ const PanelGpuScalarCaptureOptions& GetPanelGpuScalarCaptureOptions() {
 		if (result.composite) {
 			LOGF("PanelProducer GPU composite capture enabled: ps=8f4f493f4d30416d resource=3 binding=3 "
 			     "byte_offset=0 bytes=28 timing=before-draw capture_frames=%u,%u max_captures=2 "
-			     "max_raw_bytes=152 max_decisions=64 cutoff_frame=4096 guest_reads=0 image-budget-unchanged=1 "
-			     "companion_recipe=8f4f493f4d30416d:0:0:48 primary-first=1\n",
+			     "max_raw_bytes=168 max_decisions=64 cutoff_frame=4096 guest_alias_reads=0 image-budget-unchanged=1 "
+			     "cpu_backing_bytes_per_decision=28 max_cpu_backing_bytes=1792 "
+			     "companion_recipe=8f4f493f4d30416d:0:0:48 gains_recipe=8f4f493f4d30416d:4:4:8 primary-first=1\n",
 			     result.milestones[0], result.milestones[1]);
 		} else {
 			LOGF("PanelProducer GPU scalar capture enabled: ps=83b1c2d863c50cf3 resource=1 binding=1 "
@@ -1549,11 +1550,13 @@ const RenderExecutor::PanelGpuScalarRecipe* RenderExecutor::GetPanelGpuScalarRec
 	static constexpr PanelGpuScalarRecipe hdr_uv {0x83b1c2d863c50cf3ull, 0u, 0x10u, 128u, 0u, 48u};
 	static constexpr PanelGpuScalarRecipe composite_controls {0x8f4f493f4d30416dull, 3u, 0x1d0u, 48u, 0u, 28u};
 	static constexpr PanelGpuScalarRecipe composite_uv {0x8f4f493f4d30416dull, 0u, 0x10u, 48u, 0u, 48u};
+	static constexpr PanelGpuScalarRecipe composite_gains {0x8f4f493f4d30416dull, 4u, 0x580u, 64u, 4u, 8u};
 	switch (kind) {
 	case PanelGpuScalarKind::CommonRgb: return &common_rgb;
 	case PanelGpuScalarKind::HdrUv: return &hdr_uv;
 	case PanelGpuScalarKind::CompositeControls: return &composite_controls;
 	case PanelGpuScalarKind::CompositeUv: return &composite_uv;
+	case PanelGpuScalarKind::CompositeGains: return &composite_gains;
 	default: return nullptr;
 	}
 }
@@ -1584,6 +1587,13 @@ const char* RenderExecutor::PlanPanelGpuCompositeUvCapture(
 	const RenderState& rendering, std::span<PreparedBindings* const> stages,
 	PanelGpuScalarPlan& plan) const {
 	return PlanPanelGpuCapture(PanelGpuScalarKind::CompositeUv, buffer, colors, depth, rendering, stages, plan);
+}
+
+const char* RenderExecutor::PlanPanelGpuCompositeGainsCapture(
+	const CommandBuffer& buffer, std::span<const RenderColorInfo> colors, ImageId depth,
+	const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	PanelGpuScalarPlan& plan) const {
+	return PlanPanelGpuCapture(PanelGpuScalarKind::CompositeGains, buffer, colors, depth, rendering, stages, plan);
 }
 
 const char* RenderExecutor::PlanPanelGpuCapture(
@@ -1645,10 +1655,10 @@ const char* RenderExecutor::PlanPanelGpuCapture(
 	std::memcpy(descriptor.fields, words.dwords.data(), sizeof(descriptor.fields));
 	const auto& source = pixel->buffer_sources[recipe->resource];
 	const auto& native = pixel->buffers[recipe->resource];
-	const auto offset_word = uint64_t {program.bindings.memory_offset_dword};
+	const auto offset_word = uint64_t {program.bindings.memory_offset_dword} + recipe->resource / 4u;
 	if (offset_word >= pixel->shader_data.size()) return "missing-packed-offset";
 	const uint32_t packed = pixel->shader_data[static_cast<size_t>(offset_word)];
-	if (((packed >> (8u * recipe->resource)) & 255u) != 0u) return "nonzero-packed-offset";
+	if (((packed >> (8u * (recipe->resource % 4u))) & 255u) != 0u) return "nonzero-packed-offset";
 	if ((descriptor.fields[1] & 0xffff0000u) != 0x00100000u || descriptor.fields[3] != 0x0004dfacu ||
 	    descriptor.GetSize() != recipe->declared_size || source.address != descriptor.Base48() ||
 	    source.size != recipe->declared_size ||
@@ -1747,6 +1757,18 @@ bool RenderExecutor::QueuePanelGpuCompositeUvReadback(
 	return QueuePanelGpuReadback(PanelGpuScalarKind::CompositeUv, buffer, plan, std::move(completion));
 }
 
+bool RenderExecutor::QueuePanelGpuCompositeGainsReadback(
+	CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
+	Common::UniqueFunction<void, bool, PanelGpuCompositeGainWords>&& completion) {
+	if (!completion || plan.kind != PanelGpuScalarKind::CompositeGains) return false;
+	return QueuePanelGpuReadback(PanelGpuScalarKind::CompositeGains, buffer, plan,
+	    [completion = std::move(completion)](bool success, PanelGpuScalarWords words) mutable {
+		    PanelGpuCompositeGainWords gains {};
+		    std::copy_n(words.begin(), gains.size(), gains.begin());
+		    completion(success, gains);
+	    });
+}
+
 bool RenderExecutor::QueuePanelGpuReadback(
 	PanelGpuScalarKind kind, CommandBuffer& buffer, const PanelGpuScalarPlan& plan,
 	Common::UniqueFunction<void, bool, PanelGpuScalarWords>&& completion) {
@@ -1755,7 +1777,7 @@ bool RenderExecutor::QueuePanelGpuReadback(
 	if (buffer.IsInvalid() || &buffer.GetContext() != &m_context || !completion ||
 	    plan.guest_size != recipe->declared_size || plan.native.range != recipe->declared_size ||
 	    (plan.native.offset & 3u) != 0u ||
-	    ((plan.packed_offset_word >> (8u * recipe->resource)) & 255u) != 0u)
+	    ((plan.packed_offset_word >> (8u * (recipe->resource % 4u))) & 255u) != 0u)
 		return false;
 	ShaderBufferResource descriptor {};
 	std::copy(plan.sharp.begin(), plan.sharp.end(), std::begin(descriptor.fields));
@@ -2005,7 +2027,7 @@ uint32_t RenderExecutor::CapturePanelGpuCompositeBeforeDraw(
 	const DrawEmitInfo& emit, const DrawRenderState& state, const RenderState& rendering,
 	std::span<PreparedBindings* const> stages) {
 	const auto& options = GetPanelGpuScalarCaptureOptions();
-	constexpr uint64_t max_raw_bytes = 152u;
+	constexpr uint64_t max_raw_bytes = 168u;
 	if (!options.enabled || !options.composite || m_gpu_scalar_capture.index >= options.milestones.size() ||
 	    !PanelScalarRangeFits(m_gpu_scalar_capture.bytes, 28u, max_raw_bytes) || m_gpu_scalar_decisions >= 64u ||
 	    !GuestGpu::IsGpuThread() || m_upstream_source_count == 0)
@@ -2028,42 +2050,75 @@ uint32_t RenderExecutor::CapturePanelGpuCompositeBeforeDraw(
 	                                                        rendering, stages, plan);
 	if (reason != nullptr) {
 		LOGF("PanelProducer GPU scalar decision: mode=composite frame=%u submit=%" PRIu64
-		     " milestone=%u decision=%u state=skipped reason=%s composite_uv_state=not-attempted\n",
+		     " milestone=%u decision=%u state=skipped reason=%s composite_uv_state=not-attempted "
+		     "composite_gains_state=not-attempted\n",
 		     frame, submit_id, milestone, m_gpu_scalar_decisions, reason);
 		return 0;
 	}
 	const uint32_t sequence = m_gpu_scalar_capture.index + 1u;
 	const auto tick = m_context.GetCommandScheduler().CurrentTick();
-	const auto queue_capture = [&](const PanelGpuScalarPlan& selected, bool uv) {
-		const auto kind = uv ? PanelGpuScalarKind::CompositeUv : PanelGpuScalarKind::CompositeControls;
-		if (selected.kind != kind) return false;
-		const uint32_t bytes = uv ? 48u : 28u;
-		const char* kind_name = uv ? "composite-uv" : "composite-controls";
-		const char* role = uv ? "scene-input13-UV-constants" : "scene-mix-distortion-bias-controls";
+	const auto queue_capture = [&](const PanelGpuScalarPlan& selected, PanelGpuScalarKind kind) {
+		const bool uv = kind == PanelGpuScalarKind::CompositeUv;
+		const bool gains = kind == PanelGpuScalarKind::CompositeGains;
+		if ((!uv && !gains && kind != PanelGpuScalarKind::CompositeControls) || selected.kind != kind) return false;
+		const auto* recipe = GetPanelGpuScalarRecipe(kind);
+		if (recipe == nullptr) return false;
+		const uint32_t bytes = recipe->selected_size;
+		const char* kind_name = gains ? "composite-gains" : uv ? "composite-uv" : "composite-controls";
+		const char* role = gains ? "overlay-channel-max-gain-inputs"
+		                        : uv ? "scene-input13-UV-constants" : "scene-mix-distortion-bias-controls";
 		const auto path = fmt::format("{}-scalar{}-{}-frame{}-submit{}-tick{}.bin",
 		                             options.prefix, sequence, kind_name, frame, submit_id, tick);
 		std::string metadata = fmt::format(
 		    "PanelGpuScalar sequence={} milestone={} frame={} submit={} tick={} timing=before-draw "
 		    "origin=gpu-buffer-copy kind={} role={} bytes={}",
 		    sequence, milestone, frame, submit_id, tick, kind_name, role, bytes);
-		if (uv) metadata += " primary_queued=1";
+		if (uv || gains) metadata += " primary_queued=1";
 		metadata += fmt::format(
 		    " stage={} ps=8f4f493f4d30416d resource={} binding={} first_pc={:x} source_images={:x}\n"
 		    "draw={} count={} instances={} vertex_offset={} first_vertex={} first_instance={}\n"
 		    "sharp={:08x},{:08x},{:08x},{:08x} packed_offset_word={:08x} "
-		    "guest={:016x} resolved_bytes={} native={:016x} offset={} range={} selected_byte_offset=0 "
-		    "selected_native_offset={} owner_size={} owner={}\n",
-		    selected.stage_index, uv ? 0u : 3u, uv ? 0u : 3u, uv ? 0x10u : 0x1d0u, match.images,
+		    "guest={:016x} resolved_bytes={} native={:016x} offset={} range={} selected_byte_offset={} "
+		    "selected_native_offset={} owner_size={} owner={}",
+		    selected.stage_index, recipe->resource, recipe->resource, recipe->first_pc, match.images,
 		    draw.Name(), draw.index_count, draw.instance_count, emit.vertex_offset, emit.first_vertex, emit.first_instance,
 		    selected.sharp[0], selected.sharp[1], selected.sharp[2], selected.sharp[3], selected.packed_offset_word,
 		    selected.guest_address, selected.guest_size, PanelNativeHandle(selected.native.buffer),
-		    selected.native.offset, selected.native.range, selected.selected_offset, selected.owner_size,
+		    selected.native.offset, selected.native.range, recipe->selected_offset, selected.selected_offset, selected.owner_size,
 		    selected.stream ? "stream" : "registered-cache");
-		metadata += uv
+		if (gains) metadata += " packed_offset_resource_word=1 packed_offset_byte=0";
+		metadata += "\n";
+		metadata += gains
+		    ? "interpretation=raw-dwords-authoritative captured_buffer_words=1,2 "
+		      "K=max(F4[1],F4[2]) material-identity-unproved=1\n"
+		    : uv
 		    ? "interpretation=raw-dwords-authoritative float_words=0,1,2,3,4,5,6,7,10,11 uint_words=8,9 "
 		      "remap-branches-and-distortion-unmeasured=1 sampled-RGB-unproved=1\n"
 		    : "interpretation=raw-dwords-authoritative float_words=0,4,6 remaining_words=uninterpreted "
 		      "t_word=0 distortion_mix_word=4 bias_word=6\n";
+		if (kind == PanelGpuScalarKind::CompositeControls) {
+			// Observe the separate backing alias without faulting the guest address or
+			// synchronizing GPU writes into it. The exact recipe was validated above.
+			// The existing 64-decision cap bounds this to at most 64 reads of 28 bytes,
+			// including unsuccessful GPU allocations. CPU writes may race this copy.
+			PanelGpuCompositeControlWords cpu_words {};
+			auto& cache = m_context.GetBufferCache();
+			const bool gpu_page_dirty = cache.IsRegionGpuModified(selected.guest_address, sizeof(cpu_words));
+			const bool gpu_exact_dirty = cache.HasGpuDirtyBytes(selected.guest_address, sizeof(cpu_words));
+			const bool cpu_read_ok = Libs::LibKernel::Memory::TryReadBacking(
+			    selected.guest_address, cpu_words.data(), sizeof(cpu_words));
+			metadata += fmt::format(
+			    "CpuBacking timing=cpu-backing-before-gpu-copy-recording origin=unsynchronized-guest-backing "
+			    "guest={:016x} selected_byte_offset=0 bytes=28 read_ok={} gpu_page_dirty={} gpu_exact_dirty={} "
+			    "atomic_against_cpu_writes=0 synchronization_performed=0",
+			    selected.guest_address, cpu_read_ok, gpu_page_dirty, gpu_exact_dirty);
+			if (cpu_read_ok) {
+				metadata += " dwords=";
+				for (uint32_t i = 0; i < cpu_words.size(); ++i)
+					metadata += fmt::format("{}{:08x}", i == 0 ? "" : ",", cpu_words[i]);
+			}
+			metadata += "\n";
+		}
 		auto completion = [path, metadata = std::move(metadata), sequence, frame, tick, bytes, kind_name]
 		                  (bool readback_ok, auto words) {
 			uint32_t written = 0;
@@ -2094,10 +2149,11 @@ uint32_t RenderExecutor::CapturePanelGpuCompositeBeforeDraw(
 			     " file=%s gpu_completed=1 readback_ok=%d saved=%d metadata=%d bytes=%u\n",
 			     sequence, kind_name, frame, tick, path.c_str(), readback_ok, saved, metadata_saved, written);
 		};
+		if (gains) return QueuePanelGpuCompositeGainsReadback(buffer, selected, std::move(completion));
 		if (uv) return QueuePanelGpuCompositeUvReadback(buffer, selected, std::move(completion));
 		return QueuePanelGpuCompositeControlsReadback(buffer, selected, std::move(completion));
 	};
-	const bool queued = queue_capture(plan, false);
+	const bool queued = queue_capture(plan, PanelGpuScalarKind::CompositeControls);
 	bool uv_queued = false;
 	const char* uv_reason = "primary-not-queued";
 	PanelGpuScalarPlan uv_plan;
@@ -2107,22 +2163,39 @@ uint32_t RenderExecutor::CapturePanelGpuCompositeBeforeDraw(
 		                                                rendering, stages, uv_plan)
 		                : "raw-byte-budget";
 		if (uv_reason == nullptr) {
-			uv_queued = queue_capture(uv_plan, true);
+			uv_queued = queue_capture(uv_plan, PanelGpuScalarKind::CompositeUv);
 			uv_reason = uv_queued ? "ok" : "owner-changed-or-allocation-failed";
+		}
+	}
+	bool gains_queued = false;
+	const char* gains_reason = "primary-not-queued";
+	PanelGpuScalarPlan gains_plan;
+	if (queued) {
+		gains_reason = PanelScalarRangeFits(m_gpu_scalar_capture.bytes + 28u + (uv_queued ? 48u : 0u), 8u, max_raw_bytes)
+		                   ? PlanPanelGpuCompositeGainsCapture(buffer, colors, state.depth_info.image_id,
+		                                                      rendering, stages, gains_plan)
+		                   : "raw-byte-budget";
+		if (gains_reason == nullptr) {
+			gains_queued = queue_capture(gains_plan, PanelGpuScalarKind::CompositeGains);
+			gains_reason = gains_queued ? "ok" : "owner-changed-or-allocation-failed";
 		}
 	}
 	LOGF("PanelProducer GPU scalar decision: mode=composite frame=%u submit=%" PRIu64
 	     " milestone=%u decision=%u sequence=%u state=%s reason=%s native=%016" PRIx64
 	     " selected_offset=%" PRIu64 " bytes=28 tick=%" PRIu64
 	     " composite_uv_state=%s composite_uv_reason=%s composite_uv_native=%016" PRIx64
-	     " composite_uv_selected_offset=%" PRIu64 " composite_uv_bytes=%u\n",
+	     " composite_uv_selected_offset=%" PRIu64 " composite_uv_bytes=%u"
+	     " composite_gains_state=%s composite_gains_reason=%s composite_gains_native=%016" PRIx64
+	     " composite_gains_selected_offset=%" PRIu64 " composite_gains_bytes=%u\n",
 	     frame, submit_id, milestone, m_gpu_scalar_decisions, sequence, queued ? "queued" : "skipped",
 	     queued ? "ok" : "owner-changed-or-allocation-failed", PanelNativeHandle(plan.native.buffer),
 	     plan.selected_offset, tick, uv_queued ? "queued" : "skipped", uv_reason,
-	     PanelNativeHandle(uv_plan.native.buffer), uv_plan.selected_offset, uv_queued ? 48u : 0u);
+	     PanelNativeHandle(uv_plan.native.buffer), uv_plan.selected_offset, uv_queued ? 48u : 0u,
+	     gains_queued ? "queued" : "skipped", gains_reason, PanelNativeHandle(gains_plan.native.buffer),
+	     gains_plan.selected_offset, gains_queued ? 8u : 0u);
 	if (!queued) return 0;
 	++m_gpu_scalar_capture.index;
-	m_gpu_scalar_capture.bytes += 28u + (uv_queued ? 48u : 0u);
+	m_gpu_scalar_capture.bytes += 28u + (uv_queued ? 48u : 0u) + (gains_queued ? 8u : 0u);
 	m_gpu_scalar_last_frame = frame;
 	return sequence;
 }
