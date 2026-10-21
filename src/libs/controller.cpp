@@ -1552,11 +1552,18 @@ int KYTY_SYSV_ABI PadVrControllerReadState(int handle, void* state_out) {
         buttons = ApplyVirtualSenseScript(buttons);
     }
     std::memcpy(bytes, &buttons, sizeof(buttons));
-    bytes[6] = static_cast<uint8_t>(std::clamp(trigger, 0, 255));
+    // Horizon's native Sense reader consumes the left/right trigger axes at
+    // +8/+9. The other hand's field stays zero from the record initialization.
+    // A keyboard or scripted digital trigger must be fully pressed.
+    const uint32_t trigger_button = side == 0 ? PAD_BUTTON_L2 : PAD_BUTTON_R2;
+    const size_t trigger_offset = side == 0 ? 8u : 9u;
+    bytes[trigger_offset] = static_cast<uint8_t>(
+        std::clamp(trigger > 32 ? trigger :
+                   (buttons & trigger_button) != 0 ? 255 : trigger, 0, 255));
     static std::array<std::atomic<uint32_t>, 2> previous_buttons {};
     if (previous_buttons[static_cast<size_t>(side)].exchange(buttons, std::memory_order_relaxed) != buttons) {
         LOGF("Virtual Sense %s buttons=0x%08x trigger=%d process_ms=%" PRIu64 "\n",
-             side == 0 ? "left" : "right", buttons, trigger,
+             side == 0 ? "left" : "right", buttons, bytes[trigger_offset],
              LibKernel::KernelGetProcessTime() / 1000u);
     }
     bytes[0x40] = 1; // Connected.

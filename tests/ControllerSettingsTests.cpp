@@ -1,6 +1,7 @@
 // Exercise the production controller with deterministic host output and time.
 #include <SDL3/SDL.h>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +24,7 @@ std::vector<Rumble>                rumble;
 std::vector<Rumble>                haptics;
 std::vector<std::array<Uint8, 32>> effects;
 bool                               haptics_handles_rumble = false;
+std::array<Uint8, 0x68>             vr_read_buffer {};
 } // namespace
 
 namespace Fake {
@@ -95,6 +97,13 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 	return now * 1000;
 }
 } // namespace Libs::LibKernel
+
+namespace Libs::Graphics {
+bool HostMemoryRangeIsReadable(uint64_t addr, uint64_t size) {
+	return addr == reinterpret_cast<uint64_t>(vr_read_buffer.data()) &&
+	       size == vr_read_buffer.size();
+}
+} // namespace Libs::Graphics
 
 namespace Loader::Timer {
 double GetTimeMs() {
@@ -191,6 +200,80 @@ void TestPadPortOwnership() {
 	Check(PadOpen(user, 0, 0, nullptr) == handle && PadReadState(handle, &data) == 0,
 	      "a closed port could not reopen");
 	Shutdown();
+}
+
+struct SenseSample {
+	uint32_t buttons;
+	uint8_t x, y;
+	float left_trigger, right_trigger;
+};
+
+SenseSample ReadSense(int handle) {
+	vr_read_buffer.fill(0xa5);
+	Check(PadVrControllerReadState(handle, vr_read_buffer.data()) == OK,
+	      "virtual Sense state read failed");
+	Check((vr_read_buffer[0x40] & 1u) != 0, "virtual Sense did not report connected");
+	uint32_t buttons = 0;
+	std::memcpy(&buttons, vr_read_buffer.data(), sizeof(buttons));
+	// Horizon's native input consumer (0x90110819f, 0x9011082fa/306) decodes
+	// sticks and named left/right trigger events from this independent layout.
+	return {buttons, vr_read_buffer[4], vr_read_buffer[5],
+	        vr_read_buffer[8] / 255.0f, vr_read_buffer[9] / 255.0f};
+}
+
+void TestVirtualSenseInput() {
+	Config::ConfigOptions options;
+	options.vr_enabled = true;
+	Config::Load(options);
+	{
+		Controller controller;
+		ResetInputState();
+		const int left = PadOpen(Config::GetUserId(), 3, 0, nullptr);
+		const int right = PadOpen(Config::GetUserId(), 4, 0, nullptr);
+		Check(left > 0 && right > 0 && left != right, "virtual Sense ports did not open independently");
+		auto check_triggers = [&](float expected_left, float expected_right) {
+			const auto l = ReadSense(left), r = ReadSense(right);
+			Check(std::fabs(l.left_trigger - expected_left) < 0.000001f &&
+			          l.right_trigger == 0.0f && r.left_trigger == 0.0f &&
+			          std::fabs(r.right_trigger - expected_right) < 0.000001f,
+			      "native Sense trigger events lost input or crossed hands");
+			Check(((l.buttons & 0x100u) != 0) == (expected_left > 0.0f) &&
+			          (l.buttons & 0x200u) == 0 && (r.buttons & 0x100u) == 0 &&
+			          ((r.buttons & 0x200u) != 0) == (expected_right > 0.0f),
+			      "Sense digital trigger states disagree with the analog events");
+		};
+		check_triggers(0.0f, 0.0f);
+		SetAxis(1, Axis::LeftX, 17);
+		SetAxis(1, Axis::LeftY, 34);
+		SetAxis(1, Axis::RightX, 201);
+		SetAxis(1, Axis::RightY, 219);
+		const auto l = ReadSense(left), r = ReadSense(right);
+		Check(l.x == 17 && l.y == 34 && r.x == 201 && r.y == 219,
+		      "virtual Sense sticks lost input or crossed hands");
+		for (bool down: {true, false}) {
+			SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_CROSS, down);
+			Check((ReadSense(left).buttons & 0x4000u) == 0 &&
+			          ((ReadSense(right).buttons & 0x4000u) != 0) == down,
+			      "native Cross press/release did not remain on the right Sense");
+		}
+		SetAxis(1, Axis::TriggerLeft, 102);
+		SetAxis(1, Axis::TriggerRight, 204);
+		check_triggers(0.4f, 0.8f);
+		SetAxis(1, Axis::TriggerLeft, 0);
+		check_triggers(0.0f, 0.8f);
+		SetAxis(1, Axis::TriggerRight, 0);
+		check_triggers(0.0f, 0.0f);
+		for (uint32_t button: {PAD_BUTTON_L2, PAD_BUTTON_R2}) {
+			SetButton(HOST_INPUT_CONTROLLER_ID, button, true);
+			check_triggers(button == PAD_BUTTON_L2 ? 1.0f : 0.0f,
+			               button == PAD_BUTTON_R2 ? 1.0f : 0.0f);
+			SetButton(HOST_INPUT_CONTROLLER_ID, button, false);
+			check_triggers(0.0f, 0.0f);
+		}
+		Check(PadClose(left) == OK && PadClose(right) == OK,
+		      "virtual Sense ports did not close");
+	}
+	Config::Load(Config::ConfigOptions {});
 }
 
 void TestSettingCycles() {
@@ -554,6 +637,7 @@ void TestTriggerEffectState() {
 int main() {
 	Config::Initialize();
 	TestPadPortOwnership();
+	TestVirtualSenseInput();
 	TestSettingCycles();
 	TestGlobalControllerLevels();
 	// Each following test initializes another controller and requires strong defaults.
