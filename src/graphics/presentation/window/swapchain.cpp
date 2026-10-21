@@ -1283,7 +1283,8 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info,
+                                         const ImageInfo* registered_preview) {
     KYTY_PROFILER_FUNCTION();
     EXIT_IF(buffer.IsInvalid());
     // Wait for a free presentation frame before taking the renderer lock:
@@ -1294,9 +1295,85 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
         case vk::Format::eB8G8R8A8Srgb: initial_format = vk::Format::eB8G8R8A8Unorm; break;
         default: break;
     }
+    const bool valid_registered_preview = registered_preview != nullptr &&
+        registered_preview->data.address != 0 && (registered_preview->data.address & 65535u) == 0 &&
+        registered_preview->extent.depth == 1u &&
+        registered_preview->guest_format == Prospero::BufferFormat::k8_8_8_8UNorm &&
+        registered_preview->pixel_format == vk::Format::eR8G8B8A8Unorm &&
+        registered_preview->tile_mode == Prospero::TileMode::kRenderTarget &&
+        registered_preview->extent.width >= 64u && registered_preview->extent.width <= 8192u &&
+        registered_preview->extent.height >= 64u && registered_preview->extent.height <= 8192u;
+    const auto& initial_info = valid_registered_preview ? *registered_preview : info;
     auto* frame = m_impl->frames.Acquire(
-        {info.extent.width, info.extent.height}, initial_format);
+        {initial_info.extent.width, initial_info.extent.height},
+        valid_registered_preview ? vk::Format::eR8G8B8A8Unorm : initial_format);
     Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+    if (registered_preview != nullptr) {
+        auto& cache = m_impl->renderer.GetTextureCache();
+        ImageId candidate_id {};
+        Image* selected = nullptr;
+        const bool found = valid_registered_preview &&
+            cache.FindRenderedPanelImage(*registered_preview, &candidate_id);
+        const char* state = valid_registered_preview ? "no-rendered-image" : "invalid-descriptor";
+        if (found) {
+            auto& image = cache.GetImage(candidate_id);
+            const auto& candidate = image.info;
+            if (candidate.guest_format == Prospero::BufferFormat::k8_8_8_8UNorm &&
+                candidate.tile_mode == Prospero::TileMode::kRenderTarget &&
+                candidate.type == Prospero::ImageType::kColor2D &&
+                candidate.resources.levels == 1u && candidate.resources.layers == 1u &&
+                candidate.samples == 1u && candidate.extent.depth == 1u &&
+                image.backing.format == vk::Format::eR8G8B8A8Unorm &&
+                image.backing.image_type == vk::ImageType::e2D &&
+                image.backing.mip_levels == 1u && image.backing.layers == 1u &&
+                image.backing.samples == 1u &&
+                image.backing.extent.width == registered_preview->extent.width &&
+                image.backing.extent.height == registered_preview->extent.height &&
+                (image.backing.usage & vk::ImageUsageFlagBits::eTransferSrc)) {
+                selected = &image;
+                state = "selected-layer1-left";
+            } else {
+                state = "incompatible-rendered-image";
+            }
+        }
+        static std::atomic<uint32_t> preview_calls {0};
+        static std::atomic<bool> logged_selection {false};
+        const bool first_selection = selected != nullptr &&
+            !logged_selection.exchange(true, std::memory_order_relaxed);
+        if (preview_calls.load(std::memory_order_relaxed) < 16384u) {
+            const auto call = preview_calls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (call <= 16384u && (first_selection || call <= 4u || (call & 255u) <= 1u)) {
+                LOGF("Hmd2 registered layer preview call=%u frame=%" PRIu64
+                     " layer=1 eye=left state=%s panel=%016" PRIx64
+                     " request=%016" PRIx64 " extent=%ux%u cache_id=%u\n",
+                     call, m_impl->window.loop.presented_frames.load(std::memory_order_relaxed),
+                     state, info.data.address, registered_preview->data.address,
+                     registered_preview->extent.width, registered_preview->extent.height,
+                     found ? candidate_id.index : 0u);
+            }
+        }
+        if (selected != nullptr) {
+            selected->usage.video_out = true;
+            cache.UpdateImage(candidate_id);
+            m_impl->TraceResolvedSurface(*registered_preview, candidate_id, *selected,
+                                        "registered-layer1-left");
+            frame->Configure(m_impl->window.graphic_ctx,
+                             {selected->backing.extent.width, selected->backing.extent.height},
+                             vk::Format::eR8G8B8A8Unorm);
+            frame->CopyFrom(buffer, *selected);
+            return *frame;
+        }
+        // The diagnostic has no matching colour image: retain the registered
+        // primary panel without trying unrelated experimental source selectors.
+        auto& panel = m_impl->ResolveSurface(info);
+        if (panel.backing.format == vk::Format::eUndefined) {
+            EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&panel));
+        }
+        frame->Configure(m_impl->window.graphic_ctx,
+                         {panel.backing.extent.width, panel.backing.extent.height}, initial_format);
+        frame->CopyFrom(buffer, panel);
+        return *frame;
+    }
     // Native PS VR2 reprojection normally fills a 4000x2040 panel buffer.
     // Without compositor hardware, allow an explicit desktop-only stereo
     // blit of the guest's observed 2000x2040 RGBA8 eye surfaces.

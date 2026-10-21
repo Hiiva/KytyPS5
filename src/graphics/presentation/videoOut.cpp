@@ -168,10 +168,19 @@ struct VideoOutBuffers {
 	const void* reserved[2];
 };
 
+[[nodiscard]] static bool RegisteredHmd2LayerPreviewEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("KYTY_VR_REGISTERED_LAYER_PREVIEW");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
 struct VideoOutBuffer {
 	int      group_index      = -1;
 	uint64_t data_address     = 0;
 	uint64_t metadata_address = 0;
+	Hmd2LayerDescriptor::Texture registered_layer1_left {};
 
 	[[nodiscard]] bool Occupied() const noexcept { return group_index >= 0; }
 };
@@ -1078,6 +1087,8 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 
 	const bool          special = IsSpecialBufferIndex(index);
 	Graphics::ImageInfo source_info;
+	Graphics::ImageInfo registered_preview_info {};
+	bool registered_preview_requested = false;
 	uint32_t            width   = 0;
 	uint32_t            height  = 0;
 	bool                current = false;
@@ -1103,6 +1114,19 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 					     request_id, index, surface.group_index);
 				}
 				source_info = cfg->groups[surface.group_index].ImageInfo(surface);
+				if (cfg->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN && Config::VrEnabled() &&
+				    RegisteredHmd2LayerPreviewEnabled()) {
+				    registered_preview_requested = true;
+				    const auto& preview = surface.registered_layer1_left;
+				    if (preview.address != 0) {
+				        // A lookup key only: the presenter must find a matching live GPU image.
+				        registered_preview_info.data.address = preview.address;
+				        registered_preview_info.extent = {preview.width, preview.height, 1};
+				        registered_preview_info.guest_format = Graphics::Prospero::BufferFormat::k8_8_8_8UNorm;
+				        registered_preview_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+				        registered_preview_info.tile_mode = Graphics::Prospero::TileMode::kRenderTarget;
+				    }
+				}
 				premultiplied_alpha =
 				    (cfg->groups[surface.group_index].attribute.option &
 				     VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED) != 0;
@@ -1119,7 +1143,8 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		}
 		return;
 	}
-	if (!special && cfg->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN && Config::VrEnabled()) {
+	if (!special && !registered_preview_requested &&
+		    cfg->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN && Config::VrEnabled()) {
 		Hmd2::ReprojectionPreviewSource preview {};
 		if (Hmd2::GetReprojectionPreviewSource(&preview)) {
 			// Mirror the guest's stereo 32-bit source as four 8-bit channels.
@@ -1149,7 +1174,8 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
 	} else {
-		frame = &m_presenter.PrepareFrame(buffer, source_info);
+		frame = &m_presenter.PrepareFrame(buffer, source_info,
+		                                        registered_preview_requested ? &registered_preview_info : nullptr);
 	}
 
 	Common::LockGuard lock(m_mutex);
@@ -1446,6 +1472,43 @@ KYTY_SYSV_ABI int VideoOutAddOutputModeEvent(LibKernel::EventQueue::KernelEqueue
 	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::OutputMode, udata);
 }
 
+// Copy the observed second registered colour layer while the guest wrapper
+// is live. Retain values per video-out buffer, never the caller's pointers.
+[[nodiscard]] static Hmd2LayerDescriptor::Texture ReadRegisteredLayer1Left(uint64_t registration) {
+    std::array<uint8_t, 16> wrapper {};
+    if (!Graphics::HostMemoryRangeIsReadable(registration, wrapper.size())) {
+        return {};
+    }
+    std::memcpy(wrapper.data(), reinterpret_cast<const void*>(registration), wrapper.size());
+    uint64_t layers = 0;
+    uint32_t count = 0;
+    std::memcpy(&layers, wrapper.data(), sizeof(layers));
+    std::memcpy(&count, wrapper.data() + 8u, sizeof(count));
+    constexpr uint64_t stride = 0x130u;
+    if (count < 2u || count > 4u || layers == 0 ||
+        layers > UINT64_MAX - count * stride ||
+        !Graphics::HostMemoryRangeIsReadable(layers, count * stride)) {
+        return {};
+    }
+    std::array<uint8_t, Hmd2LayerDescriptor::kLayerBytes> raw {};
+    std::memcpy(raw.data(), reinterpret_cast<const void*>(layers + stride), raw.size());
+    Hmd2LayerDescriptor::Layer layer {};
+    if (!Hmd2LayerDescriptor::Decode(raw, &layer)) {
+        return {};
+    }
+    const auto supported = [](const Hmd2LayerDescriptor::Texture& texture) {
+        return texture.format == 56u && texture.tile_mode == 27u &&
+            texture.image_type == 9u && !texture.compressed &&
+            (texture.address & 65535u) == 0 && texture.width <= 8192u &&
+            texture.height <= 8192u;
+    };
+    if (!supported(layer.left) || !supported(layer.right) ||
+        layer.left.width != layer.right.width || layer.left.height != layer.right.height) {
+        return {};
+    }
+    return layer.left;
+}
+
 // Horizon registers two colour layers per buffer through a {pointer,count}
 // wrapper (RVA 0x10e9c7e/0x10e9c96, second buffer 0x10e9db1/0x10e9dc4).
 // Their native stride is 0x130; only the type and two TSharp prefixes are decoded.
@@ -1570,9 +1633,22 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 			     buffers[i].reserved[1]);
 		}
         uint64_t data_address = reinterpret_cast<uint64_t>(buffers[i].data);
+        Hmd2LayerDescriptor::Texture registered_layer1_left {};
         const auto metadata_address = reinterpret_cast<uint64_t>(buffers[i].metadata);
         if (category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HMD2) {
             TraceRegisteredHmd2Layers(handle, set_index, buffer_index_start + i, data_address);
+            if (RegisteredHmd2LayerPreviewEnabled()) {
+                registered_layer1_left = ReadRegisteredLayer1Left(data_address);
+                static std::atomic<uint32_t> preview_logs {0};
+                if (preview_logs.fetch_add(1u, std::memory_order_relaxed) < 16u) {
+                    LOGF("Hmd2 registered layer preview register handle=%d set=%d buffer=%d"
+                         " layer=1 eye=left state=%s gpu=%016" PRIx64 " extent=%ux%u\n",
+                         handle, set_index, buffer_index_start + i,
+                         registered_layer1_left.address != 0 ? "valid-descriptor" : "invalid-descriptor",
+                         registered_layer1_left.address, registered_layer1_left.width,
+                         registered_layer1_left.height);
+                }
+            }
             // Category 16 passes one small eye descriptor per registration.
             // Each descriptor points to a packed 40-bit GPU image address in
             // the upper 40 bits of its first QWORD.
@@ -1620,6 +1696,7 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 		    .group_index      = set_index,
 		    .data_address     = data_address,
 		    .metadata_address = metadata_address,
+		    .registered_layer1_left = registered_layer1_left,
 		});
 		(void)group.ImageInfo(registrations.back());
 	}
