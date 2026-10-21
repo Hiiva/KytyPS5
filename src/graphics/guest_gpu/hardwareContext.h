@@ -353,6 +353,12 @@ struct AaMaskControl {
 	uint8_t observed = 0; // Bits 0/1: AA mask words; bit 2: shader exclusion mask.
 };
 
+// Diagnostic retention only; consumers must not infer hardware behavior from these values.
+struct RawObservedRegister {
+	uint32_t value = 0;
+	bool observed = false;
+};
+
 struct DepthShaderControl {
 	uint32_t other_bits                  = 0;
 	uint8_t  conservative_z_export_value = 0;
@@ -852,6 +858,10 @@ public:
 	void SetAaSampleControl(const AaSampleControl& control) { m_aa_sample_control = control; }
 	[[nodiscard]] const AaMaskControl& GetAaMaskControl() const { return m_aa_mask_control; }
 	void SetAaMaskControl(const AaMaskControl& control) { m_aa_mask_control = control; }
+	[[nodiscard]] const RawObservedRegister& GetStereoControl() const { return m_stereo_control; }
+	void SetStereoControl(uint32_t value) { m_stereo_control = {value, true}; }
+	[[nodiscard]] const RawObservedRegister& GetStereoX() const { return m_stereo_x; }
+	void SetStereoX(uint32_t value) { m_stereo_x = {value, true}; }
 	[[nodiscard]] const AaConfig& GetAaConfig() const { return m_aa_config; }
 	void                          SetAaConfig(const AaConfig& config) { m_aa_config = config; }
 
@@ -927,6 +937,8 @@ private:
 	AaSampleControl m_aa_sample_control;
 	AaMaskControl   m_aa_mask_control;
 	AaConfig        m_aa_config;
+	RawObservedRegister m_stereo_control;
+	RawObservedRegister m_stereo_x;
 
 	uint32_t m_shader_stages = 0;
 
@@ -974,6 +986,8 @@ public:
 
 	[[nodiscard]] const GeControl& GetGeControl() const { return m_ge_cntl; }
 	void                           SetGeControl(const GeControl& control) { m_ge_cntl = control; }
+	[[nodiscard]] const RawObservedRegister& GetStereoControl() const { return m_stereo_control; }
+	void SetStereoControl(uint32_t value) { m_stereo_control = {value, true}; }
 	[[nodiscard]] const GeUserVgprEn& GetGeUserVgprEn() const { return m_ge_user_vgpr_en; }
 	void SetGeUserVgprEn(const GeUserVgprEn& en) { m_ge_user_vgpr_en = en; }
 	[[nodiscard]] const GdsOaState&   GetGdsOaState() const { return m_gds_oa; }
@@ -1002,6 +1016,7 @@ private:
 	GeControl    m_ge_cntl;
 	GeUserVgprEn m_ge_user_vgpr_en;
 	GdsOaState   m_gds_oa;
+	RawObservedRegister m_stereo_control;
 };
 
 class Shader {

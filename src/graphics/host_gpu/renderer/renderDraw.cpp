@@ -1035,6 +1035,57 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 
 namespace {
 
+struct PanelUpstreamOptions {
+	bool enabled = false;
+	uint64_t parent_ps_hash = 0;
+	std::array<uint32_t, 2> capture_frames {2048u, 3072u};
+};
+
+const PanelUpstreamOptions& GetPanelUpstreamOptions() {
+	static const PanelUpstreamOptions options = [] {
+		PanelUpstreamOptions result;
+		const char* enabled = std::getenv("KYTY_VR_PANEL_UPSTREAM_TRACE");
+		if (enabled == nullptr || std::strcmp(enabled, "1") != 0) return result;
+		const auto disabled = [&](const char* reason) {
+			LOGF("PanelProducer upstream disabled: reason=%s existing-producer-diagnostic-unchanged\n", reason);
+			return result;
+		};
+		const char* hash = std::getenv("KYTY_VR_PANEL_UPSTREAM_PARENT_PS_HASH");
+		if (hash == nullptr || std::strlen(hash) != 16u) return disabled("parent-hash-must-be-16-hex-digits");
+		for (uint32_t i = 0; i < 16u; ++i) {
+			const char c = hash[i];
+			const uint32_t digit = c >= '0' && c <= '9' ? c - '0'
+			    : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16u;
+			if (digit >= 16u) return disabled("parent-hash-must-be-16-hex-digits");
+			result.parent_ps_hash = (result.parent_ps_hash << 4u) | digit;
+		}
+		const auto read_frame = [](const char* name, uint32_t& frame) {
+			const char* value = std::getenv(name);
+			if (value == nullptr) return true;
+			if (*value == '\0') return false;
+			uint32_t parsed = 0;
+			for (; *value != '\0'; ++value) {
+				if (*value < '0' || *value > '9') return false;
+				parsed = parsed * 10u + static_cast<uint32_t>(*value - '0');
+				if (parsed > 4096u) return false;
+			}
+			frame = parsed;
+			return parsed != 0;
+		};
+		if (!read_frame("KYTY_VR_PANEL_UPSTREAM_CAPTURE_FIRST_FRAME", result.capture_frames[0]) ||
+		    !read_frame("KYTY_VR_PANEL_UPSTREAM_CAPTURE_SECOND_FRAME", result.capture_frames[1]) ||
+		    result.capture_frames[0] >= result.capture_frames[1]) return disabled("capture-frames-require-0<first<second<=4096");
+		result.enabled = true;
+		LOGF("PanelProducer upstream enabled: depth=1 parent_ps=%016" PRIx64
+		     " primary_slots=0:8 upstream_slots=8:4 recursive_promotion=0 capture_frames=%u,%u "
+		     "capture_budget=reuse-producer-2sets-64MiB-per-set-128MiB-total discovery_windows=8x3frames "
+		     "uncovered=pre-discovery-writes,cache-color-materialization,cpu-uploads,depth-transfer-shortcuts,non-front-dynamic-mip-views\n",
+		     result.parent_ps_hash, result.capture_frames[0], result.capture_frames[1]);
+		return result;
+	}();
+	return options;
+}
+
 template <typename Handle>
 uint64_t PanelNativeHandle(Handle handle) {
 	using Native = typename Handle::CType;
@@ -1227,7 +1278,7 @@ void RenderExecutor::ObservePanelSources(const CommandBuffer& buffer,
 				    (old.data.address == image->info.data.address && old.native != image->backing.image)) slot = n;
 			}
 			if (unchanged) continue;
-			if (slot >= m_panel_sources.size()) {
+			if (slot >= PanelPrimaryWatchCapacity) {
 				if (m_panel_source_logs++ < 16u) LOGF("PanelProducer watch limit: cap=8 new_guest=0x%016" PRIx64 "\n", image->info.data.address);
 				continue;
 			}
@@ -1257,15 +1308,143 @@ void RenderExecutor::ObservePanelSources(const CommandBuffer& buffer,
 	}
 }
 
+void RenderExecutor::LogPanelUpstreamSkip(uint32_t frame, uint32_t reason_bit, const char* reason) {
+	++m_upstream_skipped;
+	if ((m_upstream_skip_reasons & reason_bit) != 0) return;
+	m_upstream_skip_reasons |= reason_bit;
+	LOGF("PanelProducer upstream skipped: frame=%u reason=%s skipped=%u reason_mask=0x%x\n",
+	     frame, reason, m_upstream_skipped, m_upstream_skip_reasons);
+}
+
+void RenderExecutor::ObservePanelUpstreamSources(const CommandBuffer& buffer,
+	    std::span<PreparedBindings* const> stages, uint32_t parent_mask) {
+	const auto& options = GetPanelUpstreamOptions();
+	parent_mask &= PanelPrimaryWatchMask;
+	if (!options.enabled || parent_mask == 0) return;
+	const auto frame = static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum());
+	const PreparedBindings* pixel = nullptr;
+	for (const auto* stage: stages) {
+		if (stage->runtime->program->stage == ShaderType::Pixel &&
+		    stage->runtime->program->shader_hash == options.parent_ps_hash) pixel = stage;
+	}
+	if (pixel == nullptr) {
+		LogPanelUpstreamSkip(frame, 1u << 0u, "parent-pixel-hash-filter");
+		return;
+	}
+	auto& cache = m_context.GetTextureCache();
+	const auto& program = *pixel->runtime->program;
+	const auto& snapshot = *pixel->runtime->resources;
+	const auto count = std::min({pixel->images.size(), program.info.images.size(), snapshot.images.size()});
+	uint32_t sampled = 0;
+	for (uint32_t i = 0; i < count; ++i) {
+		const auto& resource = program.info.images[i];
+		if (!resource.read || resource.written || resource.resource_class != ShaderRecompiler::IR::ImageResourceClass::Sampled)
+			continue;
+		++sampled;
+		const auto& binding = pixel->images[i];
+		const auto* image = cache.m_slot_images.try_get(binding.image_id);
+		if (image == nullptr || !image->registered || image->backing.image == nullptr || image->info.data.Empty()) {
+			LogPanelUpstreamSkip(frame, 1u << 1u, "missing-or-unregistered-native-source");
+			continue;
+		}
+		if (binding.mip_views.size() > 1u) {
+			LogPanelUpstreamSkip(frame, 1u << 2u, "dynamic-mip-views-not-promoted");
+			continue;
+		}
+		const auto found = std::find_if(image->views.begin(), image->views.end(),
+		    [&](const auto& native) { return native.view == binding.image_view; });
+		if (found == image->views.end()) {
+			LogPanelUpstreamSkip(frame, 1u << 3u, "actual-bound-view-not-found");
+			continue;
+		}
+		const auto& view = found->info;
+		if ((MatchPanelSourceImage(binding.image_id, view) & PanelPrimaryWatchMask) != 0) {
+			LogPanelUpstreamSkip(frame, 1u << 4u, "source-already-primary-no-cycle");
+			continue;
+		}
+		uint32_t slot = PanelPrimaryWatchCapacity + m_upstream_source_count;
+		uint32_t stale = UINT32_MAX;
+		uint32_t oldest = PanelPrimaryWatchCapacity;
+		bool same_identity = false;
+		for (uint32_t n = PanelPrimaryWatchCapacity; n < PanelSourceLimit(); ++n) {
+			const auto& old = m_panel_sources[n];
+			if (old.native == image->backing.image && old.image_id == binding.image_id &&
+			    old.view.aspect == view.aspect && old.view.base_level == view.base_level &&
+			    old.view.level_count == view.level_count && old.view.base_layer == view.base_layer &&
+			    old.view.layer_count == view.layer_count) {
+				slot = n;
+				same_identity = true;
+				break;
+			}
+			const auto* current = cache.m_slot_images.try_get(old.image_id);
+			if (current == nullptr || !current->registered || current->backing.image != old.native || current->info.data != old.data)
+				stale = n;
+			if (old.last_observed_frame < m_panel_sources[oldest].last_observed_frame) oldest = n;
+		}
+		const char* action = same_identity ? "refresh-association" : "learn";
+		if (!same_identity && stale != UINT32_MAX) {
+			slot = stale;
+			action = "replace-stale";
+		} else if (!same_identity && slot >= m_panel_sources.size()) {
+			slot = oldest;
+			action = "replace-oldest-full-pool";
+			LogPanelUpstreamSkip(frame, 1u << 5u, "child-pool-full-replacing-exact-observed-binding");
+		}
+		auto& watch = m_panel_sources[slot];
+		const uint32_t parents = same_identity ? watch.parent_mask | parent_mask : parent_mask;
+		if (same_identity && watch.data == image->info.data && watch.stencil == image->info.stencil &&
+		    watch.metadata == image->info.metadata.range && watch.view == view && watch.parent_mask == parents) {
+			watch.last_observed_frame = frame;
+			continue;
+		}
+		const auto replaced_native = watch.native;
+		const auto replaced_id = watch.image_id;
+		watch = {binding.image_id, image->backing.image, view, image->info.data, image->info.stencil,
+		         image->info.metadata.range, parents, frame};
+		if (slot == PanelPrimaryWatchCapacity + m_upstream_source_count) ++m_upstream_source_count;
+		if (!same_identity) {
+			if (m_upstream_discovery_count < m_upstream_discovery_frames.size()) {
+				m_upstream_discovery_frames[m_upstream_discovery_count++] = frame;
+			} else {
+				LogPanelUpstreamSkip(frame, 1u << 6u, "discovery-window-cap-fixed-milestones-remain");
+			}
+		}
+		if (m_upstream_watch_logs++ < 32u) {
+			const auto& words = snapshot.images[i].dwords;
+			LOGF("PanelProducer watch: slot=%u frame=%u ancestry=1 parent_mask=0x%x parent_mask_kind=historical-primary-slots "
+			     "observed_parent_mask=0x%x parent_ps=%016" PRIx64
+			     " action=%s old_id=%u old_native=0x%016" PRIx64 " id=%u native=0x%016" PRIx64
+			     " sampled_view=0x%016" PRIx64 " guest=0x%016" PRIx64 " bytes=%" PRIu64
+			     " metadata=0x%016" PRIx64 " meta_bytes=%" PRIu64 " stencil=0x%016" PRIx64 " stencil_bytes=%" PRIu64
+			     " aspect=0x%x mip=%u:%u layer=%u:%u view_fmt=%u image=%u binding=%u "
+			     "tsharp=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			     slot, frame, parents, parent_mask, options.parent_ps_hash, action, replaced_id.index, PanelNativeHandle(replaced_native),
+			     binding.image_id.index, PanelNativeHandle(image->backing.image), PanelNativeHandle(binding.image_view),
+			     image->info.data.address, image->info.data.size, image->info.metadata.range.address, image->info.metadata.range.size,
+			     image->info.stencil.address, image->info.stencil.size, static_cast<uint32_t>(view.aspect), view.base_level,
+			     view.level_count, view.base_layer, view.layer_count, static_cast<uint32_t>(view.format), i, resource.descriptor_index,
+			     words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+		} else if (m_upstream_watch_logs == 33u) {
+			LOGF("PanelProducer upstream watch log limit: cap=32 later-slot-identities-unreported\n");
+		}
+	}
+	if (sampled == 0) LogPanelUpstreamSkip(frame, 1u << 7u, "filtered-parent-has-no-readonly-sampled-input");
+}
+
 uint32_t RenderExecutor::MatchPanelSourceImage(ImageId id, const ImageViewInfo& view) const {
 	auto& cache = m_context.GetTextureCache();
 	const auto* image = cache.m_slot_images.try_get(id);
-	if (image == nullptr) return 0;
+	// New ancestry evidence cannot use an image already unregistered for deferred deletion.
+	// Keep the original direct-bound-image diagnostic behavior when this option is unset.
+	const bool require_registered = GetPanelUpstreamOptions().enabled;
+	if (image == nullptr || (require_registered && !image->registered)) return 0;
 	uint32_t matches = 0;
-	for (uint32_t i = 0; i < m_panel_source_count; ++i) {
+	for (uint32_t i = 0; i < PanelSourceLimit(); ++i) {
 		const auto& watch = m_panel_sources[i];
+		if (watch.native == nullptr) continue;
 		const auto* current = cache.m_slot_images.try_get(watch.image_id);
-		if (current == nullptr || current->backing.image != watch.native || current->info.data != watch.data ||
+		if (current == nullptr || (require_registered && !current->registered) ||
+		    current->backing.image != watch.native || current->info.data != watch.data ||
 		    image->backing.image != watch.native || !(view.aspect & watch.view.aspect)) continue;
 		if (uint64_t {view.base_level} < uint64_t {watch.view.base_level} + watch.view.level_count &&
 		    uint64_t {watch.view.base_level} < uint64_t {view.base_level} + view.level_count &&
@@ -1279,8 +1458,9 @@ uint32_t RenderExecutor::MatchPanelSourceRange(GuestRange range, bool metadata) 
 	if (range.Empty()) return 0;
 	auto& cache = m_context.GetTextureCache();
 	uint32_t matches = 0;
-	for (uint32_t i = 0; i < m_panel_source_count; ++i) {
+	for (uint32_t i = 0; i < PanelSourceLimit(); ++i) {
 		const auto& watch = m_panel_sources[i];
+		if (watch.native == nullptr) continue;
 		const auto* current = cache.m_slot_images.try_get(watch.image_id);
 		if (current == nullptr || !current->registered || current->backing.image != watch.native ||
 		    current->info.data != watch.data) continue;
@@ -1329,14 +1509,41 @@ RenderExecutor::PanelProducerMatch RenderExecutor::MatchPanelProducerWrites(
 }
 
 bool RenderExecutor::TracePanelProducerWindow(const CommandBuffer& buffer, uint32_t frame, const PanelProducerMatch& match) {
+	const auto& upstream = GetPanelUpstreamOptions();
 	if (frame != m_producer_frame) {
 		if (m_producer_window) LOGF("PanelProducer window end: frame=%u matched=%u emitted=%u truncated=%u unattributed=%u\n",
 		    m_producer_frame, m_producer_matches, m_producer_emitted, m_producer_matches - m_producer_emitted, m_producer_unattributed);
+		if (m_producer_window && upstream.enabled) {
+			LOGF("PanelProducer upstream window end: frame=%u native_writers=%u child_watches=%u "
+			     "capture_sets=%u capture_bytes=%" PRIu64 " skipped=%u reason_mask=0x%x\n",
+			     m_producer_frame, m_producer_upstream_native_matches, m_upstream_source_count,
+			     m_producer_capture.index, m_producer_capture.bytes, m_upstream_skipped, m_upstream_skip_reasons);
+		}
 		m_producer_frame = frame;
 		m_producer_matches = m_producer_emitted = m_producer_unattributed = 0;
+		m_producer_upstream_native_matches = 0;
 		m_producer_window = frame > m_producer_first_frame && frame - m_producer_first_frame <= 2u;
 		for (const uint32_t selected: {128u, 256u, 512u, 1024u, 1536u, 2048u}) m_producer_window |= frame == selected;
-		if (m_producer_window) LOGF("PanelProducer window begin: frame=%u watches=%u cap=64\n", frame, m_panel_source_count);
+		if (upstream.enabled) {
+			for (const auto selected: upstream.capture_frames) m_producer_window |= frame == selected;
+			// Discovery happens after this frame's input may already have been written.
+			// Arm bounded complete later frames; do not imply earlier writers were observed.
+			for (uint32_t i = 0; i < m_upstream_discovery_count; ++i) {
+				const auto discovered = m_upstream_discovery_frames[i];
+				m_producer_window |= frame > discovered && frame - discovered <= 3u;
+			}
+		}
+		if (m_producer_window) {
+			LOGF("PanelProducer window begin: frame=%u watches=%u cap=64\n",
+			     frame, m_panel_source_count + m_upstream_source_count);
+			if (upstream.enabled) {
+				LOGF("PanelProducer upstream window begin: frame=%u primary_watches=%u child_watches=%u "
+				     "capture_set=%u next_capture_frame=%u discovery_windows=%u\n", frame,
+				     m_panel_source_count, m_upstream_source_count, m_producer_capture.index,
+				     m_producer_capture.index < upstream.capture_frames.size()
+				         ? upstream.capture_frames[m_producer_capture.index] : 0u, m_upstream_discovery_count);
+			}
+		}
 	}
 	if (match.unattributed_writes && ++m_producer_unattributed == 1u && m_producer_window) {
 		const auto debug = buffer.GetDebugSnapshot();
@@ -1344,6 +1551,7 @@ bool RenderExecutor::TracePanelProducerWindow(const CommandBuffer& buffer, uint3
 		     frame, debug.submit_id, debug.op);
 	}
 	if (!match.Any()) return false;
+	if ((match.images & PanelUpstreamWatchMask) != 0) ++m_producer_upstream_native_matches;
 	++m_producer_order;
 	++m_producer_matches;
 	if (!m_producer_window || m_producer_emitted >= 64u) return false;
@@ -1358,14 +1566,26 @@ void RenderExecutor::TracePanelProducerDraw(uint64_t submit_id, CommandBuffer& b
 	const auto frame = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
 	if (frame > 4096u) return;
 	const auto colors = std::span {state.color_info, state.color_count};
-	const auto match = MatchPanelProducerWrites(colors, stages);
+	auto match = MatchPanelProducerWrites(colors, stages);
+	const auto& upstream = GetPanelUpstreamOptions();
+	// Only an exact native write to a primary watch can teach one upstream level.
+	// Observe every such draw before sparse trace/capture selection, never child writes.
+	if (upstream.enabled && (match.images & PanelPrimaryWatchMask) != 0) {
+		ObservePanelUpstreamSources(buffer, stages, match.images & PanelPrimaryWatchMask);
+		// Replacing a child slot must not leave this record with its previous occupant's mask.
+		match = MatchPanelProducerWrites(colors, stages);
+	}
 	const bool trace_due = TracePanelProducerWindow(buffer, frame, match);
 	static const std::string prefix = [] {
 		const char* value = std::getenv("KYTY_VR_PANEL_PRODUCER_CAPTURE_PREFIX");
 		return value != nullptr && std::strlen(value) <= 2048 ? std::string(value) : std::string {};
 	}();
-	constexpr std::array<uint32_t, 2> milestones {128u, 1024u};
-	const bool capture_due = match.images != 0 && !prefix.empty() && m_producer_capture.index < milestones.size() &&
+	const std::array<uint32_t, 2> milestones = upstream.enabled
+	    ? upstream.capture_frames : std::array<uint32_t, 2> {128u, 1024u};
+	const uint32_t capture_images = upstream.enabled ? match.images & PanelUpstreamWatchMask : match.images;
+	// Reuse the same pending sets and byte budget. Clears/no-input/ineligible draws do
+	// not consume a set; a later eligible native child writer can still provide it.
+	const bool capture_due = capture_images != 0 && !prefix.empty() && m_producer_capture.index < milestones.size() &&
 	                         frame >= milestones[m_producer_capture.index];
 	if (!trace_due && !capture_due) return;
 	const auto& hw = buffer.GetRegisters();
@@ -1388,11 +1608,23 @@ void RenderExecutor::TracePanelProducerDraw(uint64_t submit_id, CommandBuffer& b
 	    emit.vertex_offset, emit.first_vertex, emit.first_instance, hw.GetRenderTargetMask(), hw.GetShaderRegisters().m_cbShaderMask,
 	    hw.GetColorControl().mode, hw.GetColorControl().op, clear, state.ps_active,
 	    buffer.GetShaders().GetVs().es_regs.data_addr, buffer.GetShaders().GetVs().gs_regs.data_addr, buffer.GetShaders().GetPs().ps_regs.data_addr);
+	if (upstream.enabled) {
+		record += fmt::format("PanelProducer ancestry call={} primary_images={:x} upstream_images={:x} "
+		    "capture_depth=1 parent_ps={:016x}\n", m_producer_order,
+		    match.images & PanelPrimaryWatchMask, match.images & PanelUpstreamWatchMask, upstream.parent_ps_hash);
+	}
 	record += fmt::format("PanelProducer coverage call={} viewport0_scale={},{},{} offset={},{},{} scissor0={},{},{},{} "
 	    "cull={}/{} depth_test={} depth_write={} depth_compare={} stencil_test={} clip_disable={}\n",
 	    m_producer_order, viewport.xscale, viewport.yscale, viewport.zscale, viewport.xoffset, viewport.yoffset, viewport.zoffset,
 	    scissor.left, scissor.top, scissor.right, scissor.bottom, mode.cull_front, mode.cull_back, depth.depth_test_enable,
 	    depth.depth_write_enable, static_cast<uint32_t>(depth.depth_compare_op), depth.stencil_test_enable, hw.GetClipControl().clip_disable);
+	const auto& pa_stereo = hw.GetStereoControl();
+	const auto& pa_stereo_x = hw.GetStereoX();
+	const auto& ge_stereo = buffer.GetUserConfig().GetStereoControl();
+	record += fmt::format("PanelProducer stereo call={} pa_stereo={:08x}/{} pa_stereo_x={:08x}/{} "
+	    "ge_stereo={:08x}/{} raw_only=1\n", m_producer_order,
+	    pa_stereo.value, pa_stereo.observed, pa_stereo_x.value, pa_stereo_x.observed,
+	    ge_stereo.value, ge_stereo.observed);
 	for (const auto& color: colors) {
 		const auto& blend = hw.GetBlendControl(color.target_slot);
 		const auto& metadata = color.desc.info.metadata;
@@ -1440,7 +1672,7 @@ void RenderExecutor::TracePanelProducerShortcut(const CommandBuffer& buffer, con
 	// A successful ClearImageFromBuffer selects exactly one native image for this
 	// complete guest range. A mere overlapping buffer write is kept as an alias above.
 	if (std::strcmp(operation, "compute-buffer-clear") == 0) {
-		for (uint32_t i = 0; i < m_panel_source_count; ++i) {
+		for (uint32_t i = 0; i < PanelSourceLimit(); ++i) {
 			const auto& watch = m_panel_sources[i];
 			if ((match.buffer_aliases & (1u << i)) != 0 && watch.data == range)
 				match.images |= MatchPanelSourceImage(watch.image_id, watch.view);

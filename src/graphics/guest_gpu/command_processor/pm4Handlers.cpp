@@ -2031,6 +2031,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		if (pfunc == nullptr) {
 			// Temporary boot probe, NOT correct stereo emulation.
 			if (cmd_offset == Pm4::PA_STEREO_CNTL || cmd_offset == Pm4::PA_STATE_STEREO_X) {
+			    if (cmd_offset == Pm4::PA_STEREO_CNTL) {
+			        cp.GetCtx().SetStereoControl(value);
+			    } else {
+			        cp.GetCtx().SetStereoX(value);
+			    }
 			    static std::atomic<uint32_t> stereo_log_mask {0};
 			    const uint32_t bit = cmd_offset == Pm4::PA_STEREO_CNTL ? 1u : 2u;
 			    if ((stereo_log_mask.fetch_or(bit, std::memory_order_relaxed) & bit) == 0u) {
@@ -3965,6 +3970,7 @@ void GraphicsInitJmpTablesUcIndirect() {
 	};
 
 	g_hw_uc_indirect_func[Pm4::GE_STEREO_CNTL] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+		cp.GetUcfg().SetStereoControl(value);
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 16) {
 			LOGF("warning: ignoring indirect uc reg GE_STEREO_CNTL at 0x%" PRIx32

@@ -222,7 +222,13 @@ private:
 		GuestRange data;
 		GuestRange stencil;
 		GuestRange metadata;
+		uint32_t parent_mask = 0;
+		uint32_t last_observed_frame = 0;
 	};
+	static constexpr uint32_t PanelPrimaryWatchCapacity = 8;
+	static constexpr uint32_t PanelUpstreamWatchCapacity = 4;
+	static constexpr uint32_t PanelPrimaryWatchMask = (1u << PanelPrimaryWatchCapacity) - 1u;
+	static constexpr uint32_t PanelUpstreamWatchMask = ((1u << PanelUpstreamWatchCapacity) - 1u) << PanelPrimaryWatchCapacity;
 	struct PanelProducerMatch {
 		uint32_t images = 0;
 		uint32_t buffer_aliases = 0;
@@ -237,6 +243,12 @@ private:
 	                        uint32_t milestone, PanelCaptureState& capture);
 	[[nodiscard]] static bool PanelProducerTraceEnabled();
 	void ObservePanelSources(const CommandBuffer& buffer, std::span<PreparedBindings* const> stages);
+	void ObservePanelUpstreamSources(const CommandBuffer& buffer, std::span<PreparedBindings* const> stages,
+	                                uint32_t parent_mask);
+	void LogPanelUpstreamSkip(uint32_t frame, uint32_t reason_bit, const char* reason);
+	[[nodiscard]] uint32_t PanelSourceLimit() const {
+		return m_upstream_source_count == 0 ? m_panel_source_count : PanelPrimaryWatchCapacity + m_upstream_source_count;
+	}
 	[[nodiscard]] uint32_t MatchPanelSourceImage(ImageId id, const ImageViewInfo& view) const;
 	[[nodiscard]] uint32_t MatchPanelSourceRange(GuestRange range, bool metadata) const;
 	[[nodiscard]] PanelProducerMatch MatchPanelProducerWrites(
@@ -275,15 +287,22 @@ private:
 	uint32_t                             m_panel_trace_draws = 0;
 	PanelCaptureState                    m_panel_capture;
 	PanelCaptureState                    m_producer_capture;
-	std::array<PanelSourceWatch, 8>        m_panel_sources {};
+	std::array<PanelSourceWatch, PanelPrimaryWatchCapacity + PanelUpstreamWatchCapacity> m_panel_sources {};
 	uint32_t                             m_panel_source_count = 0;
 	uint32_t                             m_panel_source_logs = 0;
+	uint32_t                             m_upstream_source_count = 0;
+	uint32_t                             m_upstream_watch_logs = 0;
+	uint32_t                             m_upstream_skip_reasons = 0;
+	uint32_t                             m_upstream_skipped = 0;
+	std::array<uint32_t, 8>               m_upstream_discovery_frames {};
+	uint32_t                             m_upstream_discovery_count = 0;
 	uint32_t                             m_producer_first_frame = UINT32_MAX;
 	uint32_t                             m_producer_frame = UINT32_MAX;
 	uint32_t                             m_producer_order = 0;
 	uint32_t                             m_producer_matches = 0;
 	uint32_t                             m_producer_emitted = 0;
 	uint32_t                             m_producer_unattributed = 0;
+	uint32_t                             m_producer_upstream_native_matches = 0;
 	bool                                 m_producer_window = false;
 
 	friend class CommandProcessor;
