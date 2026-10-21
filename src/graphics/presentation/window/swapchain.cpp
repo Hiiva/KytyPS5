@@ -75,6 +75,45 @@ size_t PreviewSeriesIndex(uint64_t frame) {
                                          kPreviewSeriesFrames),
                     ids.size() - 1u);
 }
+
+int WriteDiagnosticPng(const std::string& path, uint32_t width, uint32_t height,
+                       vk::Format format, const uint8_t* raw, bool opaque = false) {
+    const auto bytes = static_cast<uint64_t>(width) * height * 4u;
+    std::vector<uint8_t> rgba(static_cast<size_t>(bytes));
+    if (format == vk::Format::eA2B10G10R10UnormPack32 ||
+        format == vk::Format::eA2R10G10B10UnormPack32) {
+        for (size_t i = 0; i < rgba.size(); i += 4) {
+            uint32_t word = 0;
+            std::memcpy(&word, raw + i, 4);
+            const uint32_t lo = (word & 0x3ffu) * 255u / 1023u;
+            const uint32_t mid = ((word >> 10u) & 0x3ffu) * 255u / 1023u;
+            const uint32_t hi = ((word >> 20u) & 0x3ffu) * 255u / 1023u;
+            rgba[i] = static_cast<uint8_t>(
+                format == vk::Format::eA2B10G10R10UnormPack32 ? lo : hi);
+            rgba[i + 1] = static_cast<uint8_t>(mid);
+            rgba[i + 2] = static_cast<uint8_t>(
+                format == vk::Format::eA2B10G10R10UnormPack32 ? hi : lo);
+            rgba[i + 3] = 255;
+        }
+    } else if (format == vk::Format::eB8G8R8A8Unorm ||
+               format == vk::Format::eB8G8R8A8Srgb) {
+        for (size_t i = 0; i < rgba.size(); i += 4) {
+            rgba[i] = raw[i + 2];
+            rgba[i + 1] = raw[i + 1];
+            rgba[i + 2] = raw[i];
+            rgba[i + 3] = raw[i + 3];
+        }
+    } else {
+        std::memcpy(rgba.data(), raw, rgba.size());
+    }
+    if (opaque) {
+        for (size_t i = 3; i < rgba.size(); i += 4) {
+            rgba[i] = 255;
+        }
+    }
+    return stbi_write_png(path.c_str(), static_cast<int>(width), static_cast<int>(height),
+                          4, rgba.data(), static_cast<int>(width * 4u));
+}
 } // namespace
 struct Presenter::Frame {
 	VulkanImage   image;
@@ -350,6 +389,7 @@ public:
 	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
 	uint64_t Submit(CommandScheduler& scheduler);
+	void     FinishPresentCapture(CommandScheduler& scheduler, uint64_t tick);
 	[[nodiscard]] Status Present();
 
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
@@ -360,6 +400,8 @@ public:
 private:
 	void Destroy();
 	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer);
+	void RecordPresentCapture(vk::CommandBuffer command);
+	void ReleasePresentCapture();
 
 	WindowContext&   m_window;
 	vk::SwapchainKHR m_handle = nullptr;
@@ -378,6 +420,16 @@ private:
 	vk::Sampler                    m_overlay_sampler     = nullptr;
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
+	bool                           m_present_capture_supported = false;
+	bool                           m_present_capture_warned    = false;
+	bool                           m_present_capture_done      = false;
+	size_t                         m_present_capture_index     = 0;
+	VkBuffer                       m_present_capture_buffer    = VK_NULL_HANDLE;
+	VmaAllocation                  m_present_capture_allocation = nullptr;
+	std::string                    m_present_capture_path;
+	vk::Extent2D                   m_present_capture_extent {};
+	vk::Format                     m_present_capture_format = vk::Format::eUndefined;
+	uint64_t                       m_present_capture_frame  = 0;
 };
 
 struct Presenter::Impl {
@@ -510,6 +562,18 @@ void Swapchain::Create() {
 	create_info.imageArrayLayers = 1;
 	create_info.imageUsage =
 	    vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst;
+	m_present_capture_supported = false;
+	if (const char* capture = std::getenv("KYTY_TEST_PRESENT_CAPTURE");
+	    capture != nullptr && capture[0] != '\0') {
+		m_present_capture_supported = static_cast<bool>(
+		    surface.capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eTransferSrc);
+		if (m_present_capture_supported) {
+			create_info.imageUsage |= vk::ImageUsageFlagBits::eTransferSrc;
+		} else if (!m_present_capture_warned) {
+			m_present_capture_warned = true;
+			LOGF("Present frame capture unavailable: surface lacks transfer-source usage\n");
+		}
+	}
 	create_info.imageSharingMode = vk::SharingMode::eExclusive;
 	create_info.preTransform     = transform;
 	create_info.compositeAlpha   = composite;
@@ -579,7 +643,7 @@ Swapchain::~Swapchain() {
 
 void Swapchain::Destroy() {
 	if (m_handle == nullptr && m_image_acquired.empty() && m_render_complete.empty() &&
-	    m_image_views.empty()) {
+	    m_image_views.empty() && m_present_capture_buffer == VK_NULL_HANDLE) {
 		return;
 	}
 	auto& graphics = m_window.graphic_ctx;
@@ -588,6 +652,7 @@ void Swapchain::Destroy() {
 		Common::LockGuard queue_lock(graphics.queue_mutex);
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
 	}
+	ReleasePresentCapture();
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
 	}
@@ -927,6 +992,197 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 		                           &to_present);
 	}
+	RecordPresentCapture(vk_command);
+}
+
+void Swapchain::RecordPresentCapture(vk::CommandBuffer command) {
+	if (!m_present_capture_supported) {
+		return;
+	}
+	const char* filename = std::getenv("KYTY_TEST_PRESENT_CAPTURE");
+	if (filename == nullptr || filename[0] == '\0') {
+		return;
+	}
+	const auto index = m_window.loop.presented_frames.load(std::memory_order_relaxed);
+	std::string capture_path(filename);
+	if (const char* points = std::getenv("KYTY_TEST_CAPTURE_POINTS");
+	    points != nullptr && points[0] != '\0') {
+		static const std::vector<uint64_t> thresholds = [] {
+			std::vector<uint64_t> values;
+			const char* next = std::getenv("KYTY_TEST_CAPTURE_POINTS");
+			while (next != nullptr && *next != '\0' && values.size() < 12u) {
+				char* end = nullptr;
+				const auto threshold = std::strtoull(next, &end, 10);
+				if (end == next || threshold < 1u || threshold > 100000u) {
+					break;
+				}
+				values.push_back(threshold);
+				next = *end == ',' ? end + 1 : end;
+				if (*end == '\0') {
+					break;
+				}
+			}
+			return values;
+		}();
+		if (m_present_capture_index >= thresholds.size() ||
+		    index < thresholds[m_present_capture_index]) {
+			return;
+		}
+		const std::string suffix = "-f" + std::to_string(thresholds[m_present_capture_index++]);
+		const auto dot = capture_path.rfind(".png");
+		capture_path.insert(dot == std::string::npos ? capture_path.size() : dot, suffix);
+	} else {
+		if (m_present_capture_done) {
+			return;
+		}
+		uint64_t threshold = 600u;
+		if (const char* requested = std::getenv("KYTY_TEST_CAPTURE_AFTER_FRAMES");
+		    requested != nullptr && requested[0] != '\0') {
+			const auto number = std::strtoull(requested, nullptr, 10);
+			if (number >= 1u && number <= 100000u) {
+				threshold = number;
+			}
+		}
+		if (index < threshold) {
+			return;
+		}
+		m_present_capture_done = true;
+	}
+
+	switch (m_format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32: break;
+		default:
+			LOGF("Present frame capture: unsupported format=%d\n", static_cast<int>(m_format));
+			return;
+	}
+	const auto width = m_extent.width;
+	const auto height = m_extent.height;
+	const uint64_t bytes = static_cast<uint64_t>(width) * height * 4u;
+	if (width == 0 || height == 0 || width > 8192u || height > 8192u ||
+	    bytes > 256u * 1024u * 1024u) {
+		LOGF("Present frame capture: unsuitable extent=%ux%u\n", width, height);
+		return;
+	}
+	EXIT_IF(m_present_capture_buffer != VK_NULL_HANDLE);
+	auto& graphics = m_window.graphic_ctx;
+	VkBufferCreateInfo buffer_info {};
+	buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	buffer_info.size = bytes;
+	buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VmaAllocationCreateInfo allocation_info {};
+	allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+	allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+	allocation_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+	VkBuffer native_buffer = VK_NULL_HANDLE;
+	VmaAllocation allocation = nullptr;
+	if (vmaCreateBuffer(graphics.allocator, &buffer_info, &allocation_info,
+	                    &native_buffer, &allocation, nullptr) != VK_SUCCESS) {
+		LOGF("Present frame capture: failed to allocate staging buffer\n");
+		return;
+	}
+	m_present_capture_buffer = native_buffer;
+	m_present_capture_allocation = allocation;
+	m_present_capture_path = std::move(capture_path);
+	m_present_capture_extent = m_extent;
+	m_present_capture_format = m_format;
+	m_present_capture_frame = index;
+
+	// The image is still acquired here. Read back the crop and all overlays in
+	// the same submission, then restore the layout expected by vkQueuePresentKHR.
+	vk::ImageMemoryBarrier2 to_copy {};
+	to_copy.srcStageMask = vk::PipelineStageFlagBits2::eTransfer |
+	                       vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+	to_copy.srcAccessMask = vk::AccessFlagBits2::eTransferWrite |
+	                        vk::AccessFlagBits2::eColorAttachmentWrite;
+	to_copy.dstStageMask = vk::PipelineStageFlagBits2::eTransfer;
+	to_copy.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+	to_copy.oldLayout = vk::ImageLayout::ePresentSrcKHR;
+	to_copy.newLayout = vk::ImageLayout::eTransferSrcOptimal;
+	to_copy.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_copy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_copy.image = m_images[m_image_index];
+	to_copy.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers = &to_copy;
+	command.pipelineBarrier2(dependency);
+
+	const vk::Buffer buffer = native_buffer;
+	vk::BufferImageCopy copy {};
+	copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.imageExtent = {width, height, 1};
+	command.copyImageToBuffer(m_images[m_image_index], vk::ImageLayout::eTransferSrcOptimal,
+	                          buffer, 1, &copy);
+
+	vk::BufferMemoryBarrier2 to_host {};
+	to_host.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+	to_host.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	to_host.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+	to_host.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_host.buffer = buffer;
+	to_host.size = bytes;
+	vk::ImageMemoryBarrier2 to_present = to_copy;
+	to_present.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+	to_present.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
+	to_present.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	to_present.dstAccessMask = vk::AccessFlagBits2::eMemoryRead;
+	to_present.oldLayout = vk::ImageLayout::eTransferSrcOptimal;
+	to_present.newLayout = vk::ImageLayout::ePresentSrcKHR;
+	dependency.pImageMemoryBarriers = &to_present;
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers = &to_host;
+	command.pipelineBarrier2(dependency);
+}
+
+void Swapchain::FinishPresentCapture(CommandScheduler& scheduler, uint64_t tick) {
+	if (m_present_capture_buffer == VK_NULL_HANDLE) {
+		return;
+	}
+	scheduler.Wait(tick);
+	auto& graphics = m_window.graphic_ctx;
+	void* mapped = nullptr;
+	const auto map_result = vmaMapMemory(graphics.allocator, m_present_capture_allocation, &mapped);
+	if (map_result == VK_SUCCESS) {
+		const auto invalidate_result = vmaInvalidateAllocation(
+		    graphics.allocator, m_present_capture_allocation, 0, VK_WHOLE_SIZE);
+		if (mapped != nullptr && invalidate_result == VK_SUCCESS) {
+			// The window displays opaque RGB; do not let guest alpha hide the PNG.
+			const int ok = WriteDiagnosticPng(m_present_capture_path,
+			                                  m_present_capture_extent.width,
+			                                  m_present_capture_extent.height,
+			                                  m_present_capture_format,
+			                                  static_cast<const uint8_t*>(mapped), true);
+			LOGF("Present frame capture: file=%s extent=%ux%u format=%d success=%d frame=%" PRIu64
+			     " host_ms=%" PRIu64 "\n", m_present_capture_path.c_str(),
+			     m_present_capture_extent.width, m_present_capture_extent.height,
+			     static_cast<int>(m_present_capture_format), ok, m_present_capture_frame,
+			     static_cast<uint64_t>(SDL_GetTicks()));
+		} else {
+			LOGF("Present frame capture: could not invalidate host buffer\n");
+		}
+		vmaUnmapMemory(graphics.allocator, m_present_capture_allocation);
+	} else {
+		LOGF("Present frame capture: could not map host buffer\n");
+	}
+	ReleasePresentCapture();
+}
+
+void Swapchain::ReleasePresentCapture() {
+	if (m_present_capture_buffer != VK_NULL_HANDLE) {
+		vmaDestroyBuffer(m_window.graphic_ctx.allocator, m_present_capture_buffer,
+		                 m_present_capture_allocation);
+	}
+	m_present_capture_buffer = VK_NULL_HANDLE;
+	m_present_capture_allocation = nullptr;
+	m_present_capture_path.clear();
 }
 
 uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
@@ -1298,38 +1554,9 @@ void Presenter::Impl::CaptureFrameIfRequested(Presenter::Frame* frame) {
     const auto map_result = vmaMapMemory(graphics.allocator, allocation, &mapped);
     if (map_result == VK_SUCCESS && mapped != nullptr) {
         vmaInvalidateAllocation(graphics.allocator, allocation, 0, VK_WHOLE_SIZE);
-        std::vector<uint8_t> rgba(static_cast<size_t>(bytes));
         const auto* raw = static_cast<const uint8_t*>(mapped);
         const auto fmt = frame->image.format;
-        if (fmt == vk::Format::eA2B10G10R10UnormPack32 ||
-            fmt == vk::Format::eA2R10G10B10UnormPack32) {
-            for (size_t i = 0; i < rgba.size(); i += 4) {
-                uint32_t word = 0;
-                std::memcpy(&word, raw + i, 4);
-                const uint32_t lo = (word & 0x3ffu) * 255u / 1023u;
-                const uint32_t mid = ((word >> 10u) & 0x3ffu) * 255u / 1023u;
-                const uint32_t hi = ((word >> 20u) & 0x3ffu) * 255u / 1023u;
-                rgba[i] = static_cast<uint8_t>(
-                    fmt == vk::Format::eA2B10G10R10UnormPack32 ? lo : hi);
-                rgba[i + 1] = static_cast<uint8_t>(mid);
-                rgba[i + 2] = static_cast<uint8_t>(
-                    fmt == vk::Format::eA2B10G10R10UnormPack32 ? hi : lo);
-                rgba[i + 3] = 255;
-            }
-        } else if (fmt == vk::Format::eB8G8R8A8Unorm ||
-                   fmt == vk::Format::eB8G8R8A8Srgb) {
-            for (size_t i = 0; i < rgba.size(); i += 4) {
-                rgba[i] = raw[i + 2];
-                rgba[i + 1] = raw[i + 1];
-                rgba[i + 2] = raw[i];
-                rgba[i + 3] = raw[i + 3];
-            }
-        } else {
-            std::memcpy(rgba.data(), raw, rgba.size());
-        }
-        const int ok = stbi_write_png(capture_path.c_str(), static_cast<int>(width),
-                                      static_cast<int>(height), 4, rgba.data(),
-                                      static_cast<int>(width * 4u));
+        const int ok = WriteDiagnosticPng(capture_path, width, height, fmt, raw);
         LOGF("Hidden frame capture: file=%s extent=%ux%u format=%d success=%d frame=%" PRIu64 " host_ms=%" PRIu64 "\n",
              capture_path.c_str(), width, height, static_cast<int>(fmt), ok,
              index, static_cast<uint64_t>(SDL_GetTicks()));
@@ -1361,6 +1588,7 @@ void Presenter::Impl::Present() {
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);
 			const auto tick = swapchain.Submit(present_scheduler);
+			swapchain.FinishPresentCapture(present_scheduler, tick);
 			CaptureFrameIfRequested(layers[0].frame);
 			for (const auto& layer: layers) {
 				if (layer.frame != nullptr) {
